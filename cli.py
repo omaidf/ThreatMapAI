@@ -390,11 +390,12 @@ def init(device: str, gpu_ids: str):
             
             if cuda_available:
                 if gpu_count > 1:
-                    info_msg("\nMulti-GPU setup detected! For best performance:")
-                    info_msg(f"python -m cli analyze --gpu-ids {','.join(str(i) for i in selected_gpus)} --distributed")
+                    info_msg("\nMulti-GPU setup detected with automatic optimization enabled!")
+                    info_msg(f"The system will automatically use all {gpu_count} GPUs with distributed processing")
+                    info_msg("Simply run: python -m cli analyze")
                 else:
                     info_msg("\nSingle GPU setup detected. For best performance:")
-                    info_msg("python -m cli analyze --device cuda")
+                    info_msg("python -m cli analyze")
             elif memory_gb > 32 and cpu_count >= 8:
                 info_msg("\nHigh-performance CPU setup detected. For best performance:")
                 info_msg("python -m cli analyze --device cpu")
@@ -545,8 +546,9 @@ def clean_previous_run(output_dir: str, force_clean: bool = False, clear_embeddi
 @click.option('--reuse-embeddings', is_flag=True, help='Reuse existing embeddings without asking')
 @click.option('--device', type=click.Choice(['auto', 'cpu', 'cuda']), default='auto',
               help='Device to use for embeddings (auto, cpu, cuda)')
-@click.option('--gpu-id', type=int, help='Specific GPU ID to use for embeddings')
-@click.option('--distributed', is_flag=True, help='Use distributed processing for multi-GPU setups')
+@click.option('--gpu-id', type=int, help='Specific GPU ID to use for embeddings (for single-GPU use)')
+@click.option('--distributed', is_flag=True, 
+              help='Force distributed processing for multi-GPU setups (automatically enabled when multiple GPUs are available)')
 @click.option('--memory-limit', type=float, help='Limit GPU memory usage (in GB)')
 @click.option('--suppress-warnings', is_flag=True, default=True, help='Suppress non-critical warnings')
 def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, clean: bool, 
@@ -597,6 +599,10 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
         # Set environment variables
         os.environ["OUTPUT_DIR"] = output_dir
         
+        # Determine optimal GPU configuration
+        selected_gpu_ids = None
+        use_distributed = distributed  # Start with user preference
+        
         # Force GPU usage when available (unless explicitly set to CPU)
         if device != 'cpu':
             # Check if GPU is available
@@ -611,20 +617,32 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
                     # Get number of available GPUs
                     gpu_count = torch.cuda.device_count()
                     
-                    # For multi-GPU setups, enable distributed mode if requested
-                    if distributed and gpu_count > 1:
-                        os.environ["DISTRIBUTED"] = "true"
-                        info_msg(f"Using distributed processing across {gpu_count} GPUs")
-                    
-                    # Set specific GPU ID if provided
-                    if gpu_id is not None:
-                        if gpu_id < gpu_count:
-                            os.environ["GPU_IDS"] = str(gpu_id)
-                            info_msg(f"Using specific GPU: {gpu_id}")
+                    # For multi-GPU setups, automatically enable distributed mode 
+                    # unless user specifically provided a single GPU ID
+                    if gpu_count > 1:
+                        # Auto-determine if distributed should be enabled
+                        if gpu_id is None:  # If no specific GPU was requested
+                            use_distributed = True  # Enable by default for multiple GPUs
+                            selected_gpu_ids = list(range(gpu_count))
+                            info_msg(f"Multi-GPU setup detected: automatically using all {gpu_count} GPUs with distributed processing")
+                            os.environ["DISTRIBUTED"] = "true"
+                            os.environ["GPU_IDS"] = ",".join(str(id) for id in selected_gpu_ids)
                         else:
-                            warning_msg(f"GPU {gpu_id} not available (only {gpu_count} GPUs detected)")
-                            warning_msg(f"Using default GPU 0 instead")
-                            os.environ["GPU_IDS"] = "0"
+                            # User specified a specific GPU, use only that one
+                            if gpu_id < gpu_count:
+                                selected_gpu_ids = [gpu_id]
+                                info_msg(f"Using specific GPU {gpu_id} as requested (out of {gpu_count} available)")
+                                os.environ["GPU_IDS"] = str(gpu_id)
+                            else:
+                                warning_msg(f"GPU {gpu_id} not available (only {gpu_count} GPUs detected)")
+                                warning_msg(f"Using default GPU 0 instead")
+                                selected_gpu_ids = [0]
+                                os.environ["GPU_IDS"] = "0"
+                    else:
+                        # Single GPU setup
+                        info_msg(f"Single GPU detected: using GPU 0")
+                        selected_gpu_ids = [0]
+                        os.environ["GPU_IDS"] = "0"
                     
                     # Set memory limit if provided
                     if memory_limit:
@@ -714,7 +732,8 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
                     device_param = None  # Auto-detect
                 else:
                     device_param = device
-                embedding_store = create_embedding_store(try_load=False, device=device_param, gpu_id=gpu_id)
+                embedding_store = create_embedding_store(try_load=False, device=device_param, 
+                                                         gpu_id=selected_gpu_ids[0] if selected_gpu_ids else None)
                 # Explicitly clear any existing data
                 if embedding_store:
                     embedding_store.clear()
@@ -725,7 +744,8 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
                     device_param = None  # Auto-detect
                 else:
                     device_param = device
-                embedding_store = create_embedding_store(try_load=use_existing, device=device_param, gpu_id=gpu_id)
+                embedding_store = create_embedding_store(try_load=use_existing, device=device_param, 
+                                                         gpu_id=selected_gpu_ids[0] if selected_gpu_ids else None)
             progress.update(1)
             
             # Initialize the repository analyzer directly, not in a subprocess
@@ -741,22 +761,13 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
             analyzer_config = {
                 'repo_path': repository_url if local else None,
                 'embedding_store': embedding_store,
+                'distributed': use_distributed,
+                'gpu_ids': selected_gpu_ids,
             }
             
-            # Add multi-GPU configuration if distributed mode is enabled
-            if distributed:
-                analyzer_config['distributed'] = True
-                # Get GPU IDs from environment or use all available
-                gpu_ids_str = os.environ.get("GPU_IDS", "")
-                if gpu_ids_str:
-                    try:
-                        analyzer_config['gpu_ids'] = [int(id.strip()) for id in gpu_ids_str.split(',')]
-                    except ValueError:
-                        warning_msg(f"Invalid GPU IDs format: {gpu_ids_str}, using default")
-                
-                # Add memory limit if specified
-                if memory_limit:
-                    analyzer_config['memory_limit'] = memory_limit
+            # Add memory limit if specified
+            if memory_limit:
+                analyzer_config['memory_limit'] = memory_limit
             
             analyzer = RepositoryAnalyzer(**analyzer_config)
             
@@ -798,20 +809,14 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
                 if device != 'auto':
                     llm_config['device'] = device
                 
-                # Add GPU ID if specified
-                if gpu_id is not None:
-                    llm_config['gpu_id'] = gpu_id
-                
-                # Add distributed configuration if enabled
-                if distributed:
+                # Add distributed configuration and GPU IDs
+                if use_distributed:
                     llm_config['distributed'] = True
-                    # Pass GPU IDs from environment or use all available
-                    gpu_ids_str = os.environ.get("GPU_IDS", "")
-                    if gpu_ids_str:
-                        try:
-                            llm_config['gpu_ids'] = [int(id.strip()) for id in gpu_ids_str.split(',')]
-                        except ValueError:
-                            warning_msg(f"Invalid GPU IDs format: {gpu_ids_str}, using default")
+                    if selected_gpu_ids:
+                        llm_config['gpu_ids'] = selected_gpu_ids
+                elif selected_gpu_ids and len(selected_gpu_ids) == 1:
+                    # Single GPU mode
+                    llm_config['gpu_id'] = selected_gpu_ids[0]
                 
                 # Add memory limit if specified
                 if memory_limit:
@@ -822,13 +827,12 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
                 
                 # Log hardware configuration
                 if hasattr(processor, 'device') and processor.device == 'cuda':
-                    if hasattr(processor, 'gpu_id') and processor.gpu_id is not None:
+                    if hasattr(processor, 'distributed') and processor.distributed:
+                        info_msg(f"LLM running in distributed mode across GPUs: {selected_gpu_ids}")
+                    elif hasattr(processor, 'gpu_id') and processor.gpu_id is not None:
                         info_msg(f"LLM running on GPU {processor.gpu_id}")
                     else:
                         info_msg("LLM running on GPU")
-                    
-                    if hasattr(processor, 'distributed') and processor.distributed:
-                        info_msg("Using distributed processing across multiple GPUs")
                 elif hasattr(processor, 'device'):
                     info_msg(f"LLM running on {processor.device}")
                 

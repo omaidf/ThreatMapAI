@@ -47,18 +47,56 @@ class RepositoryAnalyzer:
     using tree-sitter for accurate AST parsing.
     """
     
-    def __init__(self, repo_path: Optional[str] = None, embedding_store: Optional[EmbeddingStore] = None):
+    def __init__(self, repo_path: Optional[str] = None, embedding_store: Optional[EmbeddingStore] = None,
+                 distributed: bool = None, gpu_ids: Optional[List[int]] = None, memory_limit: Optional[float] = None):
         """
         Initialize the repository analyzer.
         
         Args:
             repo_path: Path to the repository (local or temporary)
             embedding_store: EmbeddingStore for storing file embeddings (optional)
+            distributed: Whether to use distributed processing (multi-GPU) when available
+            gpu_ids: List of specific GPU IDs to use if multiple GPUs are available
+            memory_limit: Memory limit per GPU in GB
         """
         self.repo_path = Path(repo_path) if repo_path else Path(tempfile.mkdtemp())
         self.parser = None
         self.languages = {}
         self.embedding_store = embedding_store
+        
+        # GPU configuration
+        self.gpu_ids = gpu_ids
+        self.distributed = distributed
+        self.memory_limit = memory_limit
+        
+        # Check for available GPUs and configure distributed processing if not explicitly set
+        if self.distributed is None:
+            # Auto-detect if distributed processing should be enabled
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    gpu_count = torch.cuda.device_count()
+                    if gpu_count > 1:
+                        # Automatically enable distributed processing for multi-GPU setups
+                        self.distributed = True
+                        info_msg(f"Auto-enabling distributed processing for {gpu_count} GPUs")
+                        
+                        # If no specific GPUs were provided, use all available GPUs
+                        if self.gpu_ids is None:
+                            self.gpu_ids = list(range(gpu_count))
+                            info_msg(f"Using all available GPUs: {self.gpu_ids}")
+                            
+                            # Set environment variables for other components
+                            os.environ["DISTRIBUTED"] = "true"
+                            os.environ["GPU_IDS"] = ",".join(str(gpu_id) for gpu_id in self.gpu_ids)
+                            
+                            # Also set environment variable for distributed to ensure other components use it 
+                            from utils.env_utils import update_env_file
+                            update_env_file("DISTRIBUTED", "true")
+                            update_env_file("GPU_IDS", ",".join(str(gpu_id) for gpu_id in self.gpu_ids))
+            except ImportError:
+                # PyTorch not available, cannot use distributed processing
+                self.distributed = False
         
         # Initialize the parser but defer language loading until after repo clone
         self.parser = tree_sitter.Parser()

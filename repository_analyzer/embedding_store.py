@@ -56,12 +56,13 @@ class EmbeddingStore:
     - Semantic search for related code
     """
     
-    def __init__(self, device: Optional[str] = None):
+    def __init__(self, device: Optional[str] = None, gpu_id: Optional[int] = None):
         """
         Initialize the embedding store.
         
         Args:
             device: Force device to use ('cpu', 'cuda', or None for auto-detection)
+            gpu_id: Specific GPU ID to use when multiple GPUs are available (ignored if device is 'cpu')
         """
         self.output_dir = Path(get_env_variable("OUTPUT_DIR", "output"))
         check_output_directory(str(self.output_dir))
@@ -72,6 +73,9 @@ class EmbeddingStore:
         self.index = None
         self.file_mapping = []  # Changed from dictionary to list for consistency
         self.use_gpu_for_faiss = False
+        
+        # Store the GPU ID
+        self.gpu_id = gpu_id if gpu_id is not None else 0
         
         # Auto-detect GPU if device not specified
         gpu_available, gpu_memory = detect_gpu()
@@ -88,7 +92,7 @@ class EmbeddingStore:
             # Auto-detect: use GPU if available and has sufficient memory (>2GB)
             self.device = 'cuda' if gpu_available and gpu_memory and gpu_memory > 2 else 'cpu'
         
-        info_msg(f"Using device: {self.device}")
+        info_msg(f"Using device: {self.device}{f' (GPU {self.gpu_id})' if self.device == 'cuda' else ''}")
         
         # Configure resources based on device
         if self.device == 'cpu':
@@ -105,6 +109,17 @@ class EmbeddingStore:
                 if hasattr(torch, 'set_num_interop_threads'):
                     torch.set_num_interop_threads(1)
             except:
+                pass
+        elif self.device == 'cuda' and gpu_id is not None:
+            # Set specific GPU device if specified
+            try:
+                import torch
+                if torch.cuda.is_available() and gpu_id < torch.cuda.device_count():
+                    torch.cuda.set_device(gpu_id)
+                    info_msg(f"Set active GPU to device {gpu_id}")
+                else:
+                    warning_msg(f"Requested GPU {gpu_id} is not available")
+            except ImportError:
                 pass
         
         # Initialize the embedding model
@@ -126,24 +141,33 @@ class EmbeddingStore:
             model_name = 'all-MiniLM-L6-v2'  # This is a small, efficient model (384 dimensions)
             
             try:
+                # Set the specific CUDA device if needed
+                device_str = self.device
+                if self.device == 'cuda' and gpu_id is not None:
+                    device_str = f"cuda:{gpu_id}"
+                
                 # Load model with selected device
-                self.model = SentenceTransformer(model_name, device=self.device)
+                self.model = SentenceTransformer(model_name, device=device_str)
                 
                 # Configure model based on device
                 if self.device == 'cpu' and hasattr(self.model, 'max_seq_length'):
                     self.model.max_seq_length = min(self.model.max_seq_length, 256)  # Limit sequence length
                 
                 self.vector_size = self.model.get_sentence_embedding_dimension()
-                info_msg(f"Embedding model initialized with dimension {self.vector_size} on {self.device}")
+                info_msg(f"Embedding model initialized with dimension {self.vector_size} on {device_str}")
             except Exception as model_e:
                 # Fallback to a simpler model
                 warning_msg(f"Failed to load {model_name}: {str(model_e)}, trying alternative model")
                 try:
-                    self.model = SentenceTransformer('paraphrase-MiniLM-L3-v2', device=self.device)
+                    device_str = self.device
+                    if self.device == 'cuda' and gpu_id is not None:
+                        device_str = f"cuda:{gpu_id}"
+                    
+                    self.model = SentenceTransformer('paraphrase-MiniLM-L3-v2', device=device_str)
                     if self.device == 'cpu' and hasattr(self.model, 'max_seq_length'):
                         self.model.max_seq_length = min(self.model.max_seq_length, 256)  # Limit sequence length
                     self.vector_size = self.model.get_sentence_embedding_dimension()
-                    info_msg(f"Loaded fallback embedding model with dimension {self.vector_size} on {self.device}")
+                    info_msg(f"Loaded fallback embedding model with dimension {self.vector_size} on {device_str}")
                 except Exception as e2:
                     # Create a dummy embedding model that returns zeros
                     warning_msg(f"Failed to load embedding model: {str(e2)}")
@@ -197,9 +221,9 @@ class EmbeddingStore:
                         self.gpu_resources = faiss.StandardGpuResources()
                         
                         # Convert CPU index to GPU index
-                        self.index = faiss.index_cpu_to_gpu(self.gpu_resources, 0, cpu_index)
+                        self.index = faiss.index_cpu_to_gpu(self.gpu_resources, self.gpu_id, cpu_index)
                         self.use_gpu_for_faiss = True
-                        info_msg("Successfully moved FAISS index to GPU")
+                        info_msg(f"Successfully moved FAISS index to GPU {self.gpu_id}")
                     else:
                         warning_msg("FAISS GPU support not available, using CPU index")
                         self.index = cpu_index
@@ -279,14 +303,14 @@ class EmbeddingStore:
                             info_msg(f"FAISS detected {num_gpus} GPUs")
                     
                     if gpu_available and hasattr(faiss, 'StandardGpuResources'):
-                        info_msg("Using GPU acceleration for FAISS index")
+                        info_msg(f"Using GPU {self.gpu_id} acceleration for FAISS index")
                         
                         # Create GPU resources
                         self.gpu_resources = faiss.StandardGpuResources()
                         
                         # Configure GPU index
                         gpu_config = faiss.GpuIndexFlatConfig()
-                        gpu_config.device = 0  # Use first GPU
+                        gpu_config.device = self.gpu_id  # Use specified GPU
                         gpu_config.useFloat16 = True  # Use half-precision for memory efficiency
                         
                         # Create GPU index
@@ -334,8 +358,15 @@ class EmbeddingStore:
             if not hasattr(self, 'model') or self.model is None:
                 try:
                     from sentence_transformers import SentenceTransformer
-                    self.model = SentenceTransformer('all-MiniLM-L6-v2', device=self.device)
+                    
+                    # Set the specific CUDA device if needed
+                    device_str = self.device
+                    if self.device == 'cuda' and hasattr(self, 'gpu_id'):
+                        device_str = f"cuda:{self.gpu_id}"
+                    
+                    self.model = SentenceTransformer('all-MiniLM-L6-v2', device=device_str)
                     self.vector_size = self.model.get_sentence_embedding_dimension()
+                    info_msg(f"Reinitialized model on {device_str}")
                 except Exception as e:
                     logger.warning(f"Failed to initialize SentenceTransformer: {str(e)}")
                     self.model = None
@@ -403,13 +434,32 @@ class EmbeddingStore:
                     result = np.vstack(all_embeddings)
                 else:
                     # Use GPU acceleration with batch processing
+                    # Set appropriate batch size based on GPU memory
+                    batch_size = 32  # Default batch size for GPU
+                    
+                    # Try to determine optimal batch size based on GPU memory
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            # Get GPU memory info - adjust batch size based on total memory
+                            prop = torch.cuda.get_device_properties(self.gpu_id)
+                            total_mem = prop.total_memory / (1024**3)  # Convert to GB
+                            
+                            # Rough heuristic: more memory = larger batches
+                            if total_mem > 16:  # High-end GPU
+                                batch_size = 64
+                            elif total_mem < 8:  # Smaller GPU
+                                batch_size = 16
+                    except:
+                        pass  # Stick with default batch size
+                    
                     # Still disable progress bar to avoid tqdm issues
                     result = self.model.encode(
                         texts,
                         show_progress_bar=False,
                         convert_to_tensor=False,
                         normalize_embeddings=False,
-                        batch_size=32  # Larger batch size for GPU
+                        batch_size=batch_size
                     )
                 
                 # Normalize manually if needed (L2 normalization)
