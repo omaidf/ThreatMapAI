@@ -877,58 +877,55 @@ Pay special attention to:
                 num_files = len(self.embedding_store.file_mapping)
                 logger.info(f"Found {num_files} unique files in embedding store")
                 
-                # For large repositories, limit the number of files to analyze
-                max_files = 200 if large_repo else 500
-                
-                if num_files > max_files:
-                    logger.info(f"Limiting file list from {num_files} to {max_files} files for architecture analysis")
-                
-                # Get important files for analysis
+                # With 100K context window, don't limit files - use all of them
                 file_list = []
                 
-                # First, add entry points
-                for entry_point in entry_points[:20]:  # Limit to 20 entry points
+                # Add all entry points
+                for entry_point in entry_points:
                     file_list.append(entry_point)
                 
-                # Then add other important files
-                if len(file_list) < max_files:
-                    # Look for security-related files
-                    security_files = self.embedding_store.search_by_file_path("*security*") + \
-                                   self.embedding_store.search_by_file_path("*auth*") + \
-                                   self.embedding_store.search_by_file_path("*login*") + \
-                                   self.embedding_store.search_by_file_path("*user*") + \
-                                   self.embedding_store.search_by_file_path("*password*") + \
-                                   self.embedding_store.search_by_file_path("*credential*")
-                    # Add unique security files
-                    for sec_file in security_files:
-                        if sec_file not in file_list and len(file_list) < max_files:
-                            file_list.append(sec_file)
+                # Add all security-related files
+                security_files = self.embedding_store.search_by_file_path("*security*") + \
+                               self.embedding_store.search_by_file_path("*auth*") + \
+                               self.embedding_store.search_by_file_path("*login*") + \
+                               self.embedding_store.search_by_file_path("*user*") + \
+                               self.embedding_store.search_by_file_path("*password*") + \
+                               self.embedding_store.search_by_file_path("*credential*")
+                # Add unique security files
+                for sec_file in security_files:
+                    if sec_file not in file_list:
+                        file_list.append(sec_file)
                 
-                # Add core/model files if still under limit
-                if len(file_list) < max_files:
-                    model_files = self.embedding_store.search_by_file_path("*model*") + \
-                                self.embedding_store.search_by_file_path("*database*") + \
-                                self.embedding_store.search_by_file_path("*schema*") + \
-                                self.embedding_store.search_by_file_path("*repository*")
-                    # Add unique model files
-                    for model_file in model_files:
-                        if model_file not in file_list and len(file_list) < max_files:
-                            file_list.append(model_file)
+                # Add all core/model files
+                model_files = self.embedding_store.search_by_file_path("*model*") + \
+                            self.embedding_store.search_by_file_path("*database*") + \
+                            self.embedding_store.search_by_file_path("*schema*") + \
+                            self.embedding_store.search_by_file_path("*repository*")
+                # Add unique model files
+                for model_file in model_files:
+                    if model_file not in file_list:
+                        file_list.append(model_file)
                 
-                # If still under limit, add some API/controller files
-                if len(file_list) < max_files:
-                    api_files = self.embedding_store.search_by_file_path("*api*") + \
-                              self.embedding_store.search_by_file_path("*controller*") + \
-                              self.embedding_store.search_by_file_path("*service*") + \
-                              self.embedding_store.search_by_file_path("*route*")
-                    # Add unique API files
-                    for api_file in api_files:
-                        if api_file not in file_list and len(file_list) < max_files:
-                            file_list.append(api_file)
+                # Add all API/controller files
+                api_files = self.embedding_store.search_by_file_path("*api*") + \
+                          self.embedding_store.search_by_file_path("*controller*") + \
+                          self.embedding_store.search_by_file_path("*service*") + \
+                          self.embedding_store.search_by_file_path("*route*")
+                # Add unique API files
+                for api_file in api_files:
+                    if api_file not in file_list:
+                        file_list.append(api_file)
+                
+                # Add remaining files from the embedding store
+                for file_path, data in self.embedding_store.file_mapping.items():
+                    if file_path not in file_list:
+                        file_list.append(file_path)
+                
+                logger.info(f"Using all {len(file_list)} files for architecture analysis with 100K context window")
             else:
-                # If no embedding store, use component paths
-                file_list = [c["path"] for c in components[:min(max_files, len(components))]]
-                
+                # If no embedding store, use all component paths
+                file_list = [c["path"] for c in components]
+            
             # Determine technology stack
             tech_stack = self._determine_tech_stack(file_types)
             
@@ -966,8 +963,8 @@ Pay special attention to:
             # Analyze components with RAG for dynamic context
             logger.info("Analyzing components with dynamic RAG")
                 
-            # For large repositories, prioritize components to analyze
-            max_components = 100 if large_repo else 200
+            # With 100K context window, we can analyze more components
+            max_components = 500 if large_repo else 1000  # Previously 100/200
             priority_components = []
             
             # Define priority patterns based on security relevance
@@ -1176,16 +1173,17 @@ Pay special attention to:
             Dictionary with architecture information
         """
         try:
-            # Limit the number of files to consider to prevent token explosion
-            max_files_to_check = 50  # Significantly reduced from original
+            # With 100K context window, we can analyze many more files
+            # We'll still apply a high limit to prevent extremely rare cases of enormous repos
+            max_files_to_check = 10000  # Previously 500, now much higher for 100K context
             
             if len(file_list) > max_files_to_check:
-                logger.warning(f"Too many files ({len(file_list)}), limiting architecture analysis to {max_files_to_check} files")
+                logger.warning(f"Extremely large repository with {len(file_list)} files, limiting architecture analysis to {max_files_to_check} files")
                 
                 # Include a good mix of files - first prioritize entry points
                 limited_files = []
-                # Add entry points first
-                for entry in entry_points[:10]:  # Limit to 10 entry points max
+                # Include all entry points 
+                for entry in entry_points:
                     if entry not in limited_files:
                         limited_files.append(entry)
                         
@@ -1209,27 +1207,76 @@ Pay special attention to:
                 
                 file_list = limited_files
             
-            # Limit entry points
-            if len(entry_points) > 5:
-                entry_points = entry_points[:5]
-                
-            # Limit file relationships to prevent token explosion
+            # Use all entry points without limiting
+            
+            # Include all file relationships without limiting
             simplified_relationships = {}
             if file_relationships:
-                # Only include relationships for files in our limited list
+                # Only include relationships for files in our file list
                 for file in file_list:
                     if file in file_relationships:
-                        # Limit to top 5 related files
-                        related = [f for f in file_relationships[file] if f in file_list][:5]
+                        # With 100K context, we can include many more related files
+                        related = [f for f in file_relationships[file] if f in file_list]
                         if related:
                             simplified_relationships[file] = related
             
-            # Start with a smaller architecture exploration prompt
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", """You are an expert in software architecture and security analysis.
+            # Initialize results to build incrementally
+            description = ""
+            security_boundaries = []
+            boundary_files = {}
+            
+            # Process files in batches, focusing on high priority files first
+            for batch_idx in range(0, len(file_list), 100):
+                batch_end = min(batch_idx + 100, len(file_list))
+                current_batch = file_list[batch_idx:batch_end]
+                
+                logger.info(f"Processing architecture batch {batch_idx//100 + 1}: files {batch_idx+1}-{batch_end} of {len(file_list)}")
+                
+                # For all batches after the first, we have reduced analysis scope
+                # to preserve important discoveries while adding new files
+                is_first_batch = (batch_idx == 0)
+                
+                # Limit entry points for non-first batches
+                batch_entry_points = entry_points if is_first_batch else entry_points[:3]
+                
+                # Limit file relationships for current batch
+                batch_relationships = {}
+                if file_relationships:
+                    # Only include relationships for files in this batch
+                    for file in current_batch:
+                        if file in file_relationships:
+                            # For first batch, include more relationships
+                            rel_limit = 5 if is_first_batch else 3
+                            related = [f for f in file_relationships[file] if f in current_batch][:rel_limit]
+                            if related:
+                                batch_relationships[file] = related
+                
+                # Format batch data for prompt
+                file_list_formatted = "\n".join([f"- {file}" for file in current_batch])
+                entry_points_formatted = "\n".join([f"- {ep}" for ep in batch_entry_points])
+                
+                # Format file relationships
+                relationships_formatted = []
+                for file, related in batch_relationships.items():
+                    if related:  # Only include files with actual relationships
+                        related_str = ", ".join(related)
+                        relationships_formatted.append(f"- {file} -> {related_str}")
+                
+                # Limit relationships to prevent token explosion
+                if len(relationships_formatted) > 20:
+                    relationships_formatted = relationships_formatted[:20]
+                    relationships_formatted.append("- ... (additional relationships omitted)")
+                    
+                relationships_text = "\n".join(relationships_formatted)
+                
+                # Create the prompt - modified for incremental analysis
+                system_prompt = """You are an expert in software architecture and security analysis.
 Your task is to identify the architecture layers and security boundaries in a codebase.
-Be concise and focus on the most important security boundaries."""),
-                ("human", """
+Be concise and focus on the most important security boundaries."""
+
+                # Modify human prompt based on whether this is the first batch
+                if is_first_batch:
+                    human_prompt = """
 I need you to analyze the architecture of a software project.
 
 Technology stack: {tech_stack}
@@ -1259,117 +1306,160 @@ SECURITY_BOUNDARIES:
 FILES_BY_BOUNDARY:
 - <boundary name>: <comma-separated file list>
 - <boundary name>: <comma-separated file list>
-""")
-            ])
-            
-            # Format file list and entry points for prompt
-            file_list_formatted = "\n".join([f"- {file}" for file in file_list[:max_files_to_check]])
-            entry_points_formatted = "\n".join([f"- {ep}" for ep in entry_points])
-            
-            # Format file relationships
-            relationships_formatted = []
-            for file, related in simplified_relationships.items():
-                if related:  # Only include files with actual relationships
-                    related_str = ", ".join(related)
-                    relationships_formatted.append(f"- {file} -> {related_str}")
-            
-            # Limit relationships to prevent token explosion
-            if len(relationships_formatted) > 20:
-                relationships_formatted = relationships_formatted[:20]
-                relationships_formatted.append("- ... (additional relationships omitted)")
+"""
+                else:
+                    # For subsequent batches, include previous findings and focus on new files
+                    human_prompt = """
+I need you to continue analyzing the architecture of a software project. 
+I've already analyzed some files and identified initial boundaries. Now I need you to look at additional files.
+
+Technology stack: {tech_stack}
+
+Previous findings:
+{previous_description}
+
+Previously identified security boundaries:
+{previous_boundaries}
+
+Additional files to analyze:
+{file_list}
+
+Some important file relationships:
+{file_relationships}
+
+Please:
+1. Update or refine the architecture description if needed
+2. Assign these additional files to existing boundaries or create new boundaries if necessary
+
+Return your analysis in this format:
+DESCRIPTION:
+<1-2 sentence updated description>
+
+SECURITY_BOUNDARIES:
+- <boundary name>: <description>
+- <boundary name>: <description>
+
+FILES_BY_BOUNDARY:
+- <boundary name>: <comma-separated file list>
+- <boundary name>: <comma-separated file list>
+"""
+
+                # Prepare the prompt based on batch
+                prompt_template = system_prompt if is_first_batch else system_prompt
                 
-            relationships_text = "\n".join(relationships_formatted)
-            
-            # Check token count for inputs and truncate if necessary
-            combined_input = (
-                f"Technology stack: {tech_stack}\n\n"
-                f"Key entry points:\n{entry_points_formatted}\n\n"
-                f"Key files:\n{file_list_formatted}\n\n"
-                f"File relationships:\n{relationships_text}"
-            )
-            
-            # Calculate token count for input
-            token_count = self._get_token_count(combined_input)
-            max_tokens = self.max_context_size - 1000  # Reserve 1000 tokens for prompt instructions and output
-            
-            if token_count > max_tokens:
-                # Calculate how much to reduce by
-                reduction_factor = max_tokens / token_count
+                # Format the prompt parameters for this batch
+                if is_first_batch:
+                    prompt = ChatPromptTemplate.from_messages([
+                        ("system", system_prompt),
+                        ("human", human_prompt)
+                    ])
+                    
+                    chain = prompt | self.llm | StrOutputParser()
+                    result = chain.invoke({
+                        "tech_stack": tech_stack,
+                        "entry_points": entry_points_formatted,
+                        "file_list": file_list_formatted,
+                        "file_relationships": relationships_text
+                    })
+                else:
+                    # Format previous security boundaries for the prompt
+                    previous_boundaries_text = "\n".join([f"- {b['name']}: {b['description']}" for b in security_boundaries])
+                    
+                    prompt = ChatPromptTemplate.from_messages([
+                        ("system", system_prompt),
+                        ("human", human_prompt)
+                    ])
+                    
+                    chain = prompt | self.llm | StrOutputParser()
+                    result = chain.invoke({
+                        "tech_stack": tech_stack,
+                        "previous_description": description,
+                        "previous_boundaries": previous_boundaries_text,
+                        "file_list": file_list_formatted,
+                        "file_relationships": relationships_text
+                    })
                 
-                # First reduce file list
-                new_file_count = int(len(file_list) * reduction_factor * 0.7)  # Add 30% margin
-                if new_file_count < len(file_list):
-                    file_list = file_list[:new_file_count]
-                    file_list_formatted = "\n".join([f"- {file}" for file in file_list])
+                # Parse the result
+                batch_description = self._extract_section(result, "DESCRIPTION")
                 
-                # Then reduce relationship list if still too long
-                combined_input = (
-                    f"Technology stack: {tech_stack}\n\n"
-                    f"Key entry points:\n{entry_points_formatted}\n\n"
-                    f"Key files:\n{file_list_formatted}\n\n"
-                    f"File relationships:\n{relationships_text}"
-                )
+                # Update overall description if meaningful
+                if batch_description and (not description or len(batch_description) > 10):
+                    description = batch_description
                 
-                token_count = self._get_token_count(combined_input)
-                if token_count > max_tokens:
-                    # Further limit relationships
-                    new_rel_count = int(len(relationships_formatted) * max_tokens / token_count * 0.7)
-                    if new_rel_count < len(relationships_formatted):
-                        relationships_formatted = relationships_formatted[:new_rel_count] 
-                        relationships_formatted.append("- ... (additional relationships omitted)")
-                        relationships_text = "\n".join(relationships_formatted)
-            
-            # Create chain and invoke
-            chain = prompt | self.llm | StrOutputParser()
-            result = chain.invoke({
-                "tech_stack": tech_stack,
-                "entry_points": entry_points_formatted,
-                "file_list": file_list_formatted,
-                "file_relationships": relationships_text
-            })
-            
-            # Parse the result
-            description = self._extract_section(result, "DESCRIPTION")
-            
-            # Extract security boundaries section
-            boundaries_section = self._extract_section(result, "SECURITY_BOUNDARIES")
-            security_boundaries = []
-            
-            # Parse security boundaries
-            if boundaries_section:
-                boundary_lines = boundaries_section.split("\n")
-                for line in boundary_lines:
-                    line = line.strip()
-                    if line.startswith("- "):
-                        line = line[2:]  # Remove the "- " prefix
-                        if ":" in line:
-                            boundary_name, boundary_desc = line.split(":", 1)
-                            security_boundaries.append({
-                                "name": boundary_name.strip(),
-                                "description": boundary_desc.strip(),
-                                "files": []  # Will fill this later
-                            })
-            
-            # Parse files by boundary
-            files_by_boundary_section = self._extract_section(result, "FILES_BY_BOUNDARY")
-            if files_by_boundary_section:
-                boundary_files_lines = files_by_boundary_section.split("\n")
-                for line in boundary_files_lines:
-                    line = line.strip()
-                    if line.startswith("- "):
-                        line = line[2:]  # Remove the "- " prefix
-                        if ":" in line:
-                            boundary_name, file_list_str = line.split(":", 1)
-                            boundary_name = boundary_name.strip()
-                            
-                            # Find the boundary in our list
-                            for boundary in security_boundaries:
-                                if boundary["name"] == boundary_name:
-                                    # Parse comma-separated file list
-                                    file_names = [f.strip() for f in file_list_str.split(",")]
-                                    # Add files to boundary
-                                    boundary["files"] = file_names
-                                    break
+                # Extract security boundaries section
+                boundaries_section = self._extract_section(result, "SECURITY_BOUNDARIES")
+                
+                # Parse security boundaries
+                if boundaries_section and is_first_batch:
+                    # For first batch, use the boundaries as-is
+                    boundary_lines = boundaries_section.split("\n")
+                    for line in boundary_lines:
+                        line = line.strip()
+                        if line.startswith("- "):
+                            line = line[2:]  # Remove the "- " prefix
+                            if ":" in line:
+                                boundary_name, boundary_desc = line.split(":", 1)
+                                security_boundaries.append({
+                                    "name": boundary_name.strip(),
+                                    "description": boundary_desc.strip(),
+                                    "files": []  # Will fill this later
+                                })
+                elif boundaries_section and not is_first_batch:
+                    # For subsequent batches, merge with existing boundaries
+                    boundary_lines = boundaries_section.split("\n")
+                    for line in boundary_lines:
+                        line = line.strip()
+                        if line.startswith("- "):
+                            line = line[2:]  # Remove the "- " prefix
+                            if ":" in line:
+                                boundary_name, boundary_desc = line.split(":", 1)
+                                boundary_name = boundary_name.strip()
+                                
+                                # Check if this boundary already exists
+                                existing = False
+                                for boundary in security_boundaries:
+                                    if boundary["name"] == boundary_name:
+                                        existing = True
+                                        # Update description if new one is more detailed
+                                        if len(boundary_desc.strip()) > len(boundary["description"]):
+                                            boundary["description"] = boundary_desc.strip()
+                                        break
+                                
+                                # If not found, add as new boundary
+                                if not existing:
+                                    security_boundaries.append({
+                                        "name": boundary_name.strip(),
+                                        "description": boundary_desc.strip(),
+                                        "files": []  # Will fill this later
+                                    })
+                
+                # Parse files by boundary
+                files_by_boundary_section = self._extract_section(result, "FILES_BY_BOUNDARY")
+                if files_by_boundary_section:
+                    boundary_files_lines = files_by_boundary_section.split("\n")
+                    for line in boundary_files_lines:
+                        line = line.strip()
+                        if line.startswith("- "):
+                            line = line[2:]  # Remove the "- " prefix
+                            if ":" in line:
+                                boundary_name, file_list_str = line.split(":", 1)
+                                boundary_name = boundary_name.strip()
+                                
+                                # Find the boundary in our list
+                                for boundary in security_boundaries:
+                                    if boundary["name"] == boundary_name:
+                                        # Parse comma-separated file list
+                                        new_files = [f.strip() for f in file_list_str.split(",")]
+                                        
+                                        # Add to existing files, avoiding duplicates
+                                        existing_files = boundary["files"]
+                                        for new_file in new_files:
+                                            if new_file and new_file not in existing_files:
+                                                existing_files.append(new_file)
+                                        
+                                        # Update the boundary
+                                        boundary["files"] = existing_files
+                                        break
             
             # Create architecture result
             architecture = {
@@ -1384,7 +1474,7 @@ FILES_BY_BOUNDARY:
                 architecture["security_boundaries"] = [{
                     "name": "Default Boundary",
                     "description": "Default security boundary for all components",
-                    "files": file_list[:30]  # Limit to 30 files
+                    "files": file_list[:30]  # Limit to 30 files for default boundary
                 }]
                 
             return architecture

@@ -911,10 +911,11 @@ class RepositoryAnalyzer:
                     break
             
             # For large repositories, we'll use a more selective approach
-            max_files_to_process = 1000 if is_large_repo else 5000
-            max_files_per_extension = 200 if is_large_repo else 1000
+            # With 100K context window, we can set these limits much higher
+            max_files_to_process = 50000 if is_large_repo else 100000  # Essentially unlimited
+            max_files_per_extension = 10000 if is_large_repo else 20000  # Essentially unlimited
             
-            logger.info(f"Repository size: approx. {total_files_approx} files. Max files to process: {max_files_to_process}")
+            logger.info(f"Repository size: approx. {total_files_approx} files. Using 100K context window to process up to {max_files_to_process} files")
             
             # Track directories and their files
             dir_structure = {}

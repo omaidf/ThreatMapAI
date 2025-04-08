@@ -7,6 +7,22 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Progress bar function
+show_progress() {
+    local total=$1
+    local step=$2
+    local width=50
+    local percent=$((step * 100 / total))
+    local completed=$((width * step / total))
+    local remaining=$((width - completed))
+    local bar=$(printf "%${completed}s" | tr ' ' '=')
+    local empty=$(printf "%${remaining}s" | tr ' ' ' ')
+    printf "\r[%s%s] %d%% - %s" "$bar" "$empty" "$percent" "$3"
+    if [ $step -eq $total ]; then
+        printf "\n"
+    fi
+}
+
 # Define output functions
 print_status() { echo -e "${BLUE}[INFO]${NC} $1"; }
 print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
@@ -131,10 +147,13 @@ verify_installation() {
     # Simpler verification that just tests imports of core packages
     python -c "
 import sys
+import importlib
+import traceback
+
 all_passed = True
 critical_packages = [
     'click', 'langchain', 'langchain_core', 'langchain_community', 
-    'tree_sitter', 'requests', 'tqdm', 'xmltodict', 'importlib.metadata', 'faiss',
+    'tree_sitter', 'requests', 'tqdm', 'xmltodict', 'importlib.metadata',
     'huggingface_hub', 'joblib'
 ]
 
@@ -142,9 +161,33 @@ for pkg in critical_packages:
     try:
         __import__(pkg)
         print(f'✓ {pkg}')
-    except ImportError:
-        print(f'✗ {pkg}')
+    except ImportError as e:
+        print(f'✗ {pkg} - {str(e)}')
         all_passed = False
+
+# Special check for sentence_transformers - critical for embeddings
+try:
+    import sentence_transformers
+    print(f'✓ sentence_transformers {sentence_transformers.__version__}')
+except ImportError as e:
+    print(f'✗ sentence_transformers - {str(e)}')
+    print('  → This is critical for embeddings functionality')
+    all_passed = False
+except Exception as e:
+    print(f'⚠ sentence_transformers - imports but has issues: {str(e)}')
+    print('  → May have limited functionality')
+
+# Special check for faiss - critical for vector search
+try:
+    import faiss
+    print(f'✓ faiss-cpu')
+except ImportError as e:
+    print(f'✗ faiss-cpu - {str(e)}')
+    print('  → This is critical for vector search functionality')
+    all_passed = False
+except Exception as e:
+    print(f'⚠ faiss-cpu - imports but has issues: {str(e)}')
+    print('  → May have limited functionality')
 
 # Check optional packages
 optional_packages = [
@@ -159,59 +202,215 @@ for pkg_name, import_name, description in optional_packages:
     except ImportError:
         print(f'○ {pkg_name} - not installed ({description})')
 
+# Special check for torch with GPU support
+try:
+    import torch
+    gpu_available = torch.cuda.is_available() if hasattr(torch, 'cuda') else False
+    mps_available = torch.backends.mps.is_available() if hasattr(torch.backends, 'mps') else False
+    
+    if gpu_available:
+        device_count = torch.cuda.device_count()
+        device_name = torch.cuda.get_device_name(0) if device_count > 0 else 'Unknown'
+        print(f'✓ torch with CUDA support - {device_name} ({device_count} devices)')
+    elif mps_available:
+        print(f'✓ torch with MPS support (Apple Silicon)')
+    else:
+        print(f'✓ torch (CPU only)')
+except ImportError:
+    print('○ torch - not installed')
+except Exception as e:
+    print(f'⚠ torch - imports but has issues: {str(e)}')
+
 sys.exit(0 if all_passed else 1)
 "
     return $?
 }
 
+install_deps_in_batches() {
+    # This function installs dependencies in smaller batches to avoid hanging
+    local req_file=$1
+    
+    print_status "Installing dependencies in batches to prevent hanging..."
+    
+    # Count lines in requirements file
+    local total_lines=$(grep -v "^#" "$req_file" | grep -v "^$" | wc -l | tr -d ' ')
+    
+    # If requirements file is empty or missing, return
+    if [ "$total_lines" -eq 0 ]; then
+        print_warning "Requirements file is empty or missing"
+        return 1
+    fi
+    
+    # Split into smaller batches (about 5 packages per batch)
+    local batch_size=5
+    local batches=$((total_lines / batch_size + 1))
+    
+    print_status "Found $total_lines packages, installing in $batches batches"
+    
+    # Process each batch
+    for ((i=1; i<=batches; i++)); do
+        local start_line=$(( (i-1) * batch_size + 1 ))
+        
+        # Extract batch of dependencies
+        local deps=$(grep -v "^#" "$req_file" | grep -v "^$" | sed -n "${start_line},+$((batch_size-1))p")
+        
+        # Skip if empty
+        if [ -z "$deps" ]; then
+            continue
+        fi
+        
+        # Install this batch
+        print_status "Installing batch $i/$batches..."
+        echo "$deps" | xargs pip install -q --no-cache-dir >/dev/null 2>&1 || {
+            print_warning "Some packages in batch $i failed, continuing anyway"
+        }
+        
+        # Show progress
+        show_progress $batches $i "Installing dependency batch $i/$batches"
+    done
+    
+    return 0
+}
+
+fix_sentence_transformers() {
+    print_status "Applying fix for sentence_transformers..."
+    
+    # First check if we can import it at all
+    if python -c "import sentence_transformers" 2>/dev/null; then
+        print_status "sentence_transformers seems to be installed correctly"
+        return 0
+    fi
+    
+    print_warning "sentence_transformers issues detected, applying fixes..."
+    
+    # Fix 1: Try reinstalling with explicit dependencies
+    print_status "Fix 1: Reinstalling with explicit dependencies..."
+    pip install -q --no-cache-dir --force-reinstall -U transformers torch numpy scipy >/dev/null 2>&1
+    pip install -q --no-cache-dir --force-reinstall -U sentence-transformers >/dev/null 2>&1
+    
+    # Try importing again
+    if python -c "import sentence_transformers" 2>/dev/null; then
+        print_success "Fix 1 succeeded!"
+        return 0
+    fi
+    
+    # Fix 2: Try with a specific version
+    print_status "Fix 2: Trying specific version..."
+    pip install -q --no-cache-dir --force-reinstall "sentence-transformers==2.2.2" >/dev/null 2>&1
+    
+    # Try importing again
+    if python -c "import sentence_transformers" 2>/dev/null; then
+        print_success "Fix 2 succeeded!"
+        return 0
+    fi
+    
+    # Fix 3: Try building from source
+    print_status "Fix 3: Building from source..."
+    pip install -q --no-cache-dir git+https://github.com/UKPLab/sentence-transformers.git >/dev/null 2>&1
+    
+    # Final check
+    if python -c "import sentence_transformers" 2>/dev/null; then
+        print_success "Fix 3 succeeded!"
+        return 0
+    fi
+    
+    print_error "All fixes failed for sentence_transformers"
+    return 1
+}
+
 install_dependencies() {
     print_status "Installing Python dependencies..."
     
+    # Define total steps for progress tracking
+    local total_steps=9  # Increased to 9 to account for transformer fixes
+    local current_step=0
+    
     # Upgrade pip first
-    python -m pip install --upgrade pip || {
+    current_step=$((current_step + 1))
+    show_progress $total_steps $current_step "Upgrading pip"
+    python -m pip install --upgrade pip >/dev/null 2>&1 || {
         print_error "Failed to upgrade pip"
         return 1
     }
     
     # Install build tools
-    print_status "Installing basic build tools..."
-    pip install -q wheel setuptools build || {
+    current_step=$((current_step + 1))
+    show_progress $total_steps $current_step "Installing build tools"
+    pip install -q wheel setuptools build >/dev/null 2>&1 || {
         print_error "Failed to install build tools"
         return 1
     }
     
-    # Install all dependencies in one go to avoid redundancy
-    print_status "Installing all dependencies..."
-    pip install -q --no-cache-dir -r requirements.txt || {
-        print_warning "Some requirements failed to install. Continuing with critical packages..."
-    }
+    # Install all dependencies in batches to avoid hanging
+    current_step=$((current_step + 1))
+    show_progress $total_steps $current_step "Installing dependencies in batches"
+    
+    if [ -f "requirements.txt" ]; then
+        install_deps_in_batches "requirements.txt" || {
+            print_warning "Batch installation failed, will try critical packages individually"
+        }
+    else
+        print_warning "requirements.txt not found, skipping batch installation"
+    fi
     
     # Install critical packages separately to ensure they're installed
-    print_status "Installing critical packages..."
-    pip install -q --no-cache-dir click python-dotenv requests colorama tqdm langchain langchain-core langchain-community pydantic huggingface_hub joblib || {
+    current_step=$((current_step + 1))
+    show_progress $total_steps $current_step "Installing critical packages"
+    pip install -q --no-cache-dir click python-dotenv requests colorama tqdm langchain langchain-core langchain-community pydantic huggingface_hub joblib >/dev/null 2>&1 || {
         print_error "Failed to install critical packages"
         return 1
     }
     
+    # Install sentence-transformers prerequisites
+    current_step=$((current_step + 1))
+    show_progress $total_steps $current_step "Installing transformers & torch (for sentence-transformers)"
+    pip install -q --no-cache-dir transformers torch torchvision >/dev/null 2>&1 || {
+        print_warning "Failed to install transformers prerequisites"
+    }
+    
+    # Install sentence-transformers specifically - this is critical for embeddings
+    current_step=$((current_step + 1))
+    show_progress $total_steps $current_step "Installing sentence-transformers"
+    pip install -q --no-cache-dir sentence-transformers >/dev/null 2>&1 || {
+        print_warning "Failed to install sentence-transformers. Trying alternative method..."
+        pip install -q --no-cache-dir "sentence-transformers>=2.2.2" >/dev/null 2>&1 || {
+            print_error "Failed to install sentence-transformers. Embedding functionality will be limited."
+        }
+    }
+    
+    # Apply fixes for sentence-transformers if needed
+    current_step=$((current_step + 1))
+    show_progress $total_steps $current_step "Fixing sentence-transformers issues"
+    fix_sentence_transformers || {
+        print_warning "Could not fully resolve sentence-transformers issues. Some functionality may be limited."
+    }
+    
     # Install accelerate for model loading
-    print_status "Installing accelerate for model loading..."
-    pip install -q --no-cache-dir accelerate || {
+    current_step=$((current_step + 1))
+    show_progress $total_steps $current_step "Installing accelerate for model loading"
+    pip install -q --no-cache-dir accelerate >/dev/null 2>&1 || {
         print_warning "Failed to install accelerate. Model loading might encounter issues."
     }
     
-    # Install bitsandbytes for 8-bit quantization
-    print_status "Installing bitsandbytes for model quantization..."
-    pip install -q --no-cache-dir bitsandbytes || {
-        print_warning "Failed to install bitsandbytes. Model loading will use more memory."
-    }
-    
     # Install tree-sitter versions specifically
-    print_status "Installing tree-sitter with compatible versions..."
-    pip install -q --no-cache-dir --force-reinstall tree-sitter==0.20.1 tree-sitter-languages==1.8.0 || {
+    current_step=$((current_step + 1))
+    show_progress $total_steps $current_step "Installing tree-sitter"
+    pip install -q --no-cache-dir --force-reinstall tree-sitter==0.20.1 tree-sitter-languages==1.8.0 >/dev/null 2>&1 || {
         print_error "Failed to install tree-sitter"
         return 1
     }
     
+    # Install faiss for vector search
+    current_step=$((current_step + 1))
+    show_progress $total_steps $current_step "Installing faiss for vector search"
+    pip install -q --no-cache-dir faiss-cpu >/dev/null 2>&1 || {
+        print_warning "Failed to install faiss-cpu, trying alternative method..."
+        pip install -q --no-cache-dir -U "faiss-cpu>=1.7.3" >/dev/null 2>&1 || {
+            print_error "Failed to install faiss-cpu. Vector search functionality will be limited."
+        }
+    }
+    
+    print_success "All dependencies installed!"
     return 0
 }
 
@@ -227,7 +426,7 @@ handle_git_support() {
 
     if [[ "$INSTALL_GIT" =~ ^[Yy][Ee][Ss]$ ]]; then
         print_status "Installing Git support..."
-        pip install -q --no-cache-dir dulwich==0.21.6 && print_success "Git support installed!" || print_warning "Failed to install Git support"
+        pip install -q --no-cache-dir dulwich==0.21.6 >/dev/null 2>&1 && print_success "Git support installed!" || print_warning "Failed to install Git support"
     else
         print_status "Skipping Git support. You'll only be able to analyze local repositories."
     fi
@@ -261,9 +460,18 @@ setup_venv() {
 
 # Main execution starts here
 print_status "Starting setup..."
+echo "================================================================="
+printf "          ${GREEN}AI Threat Map${NC} - ${BLUE}Installation${NC}\n"
+echo "================================================================="
+echo ""
+
+# Setup steps tracker
+TOTAL_SETUP_STEPS=8
+CURRENT_STEP=0
 
 # Check for Python
-print_status "Checking for Python..."
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $TOTAL_SETUP_STEPS $CURRENT_STEP "Checking Python installation"
 if command -v python3.11 &> /dev/null; then
     PYTHON_CMD="python3.11"
     print_success "Python 3.11 is installed!"
@@ -285,44 +493,45 @@ else
 fi
 
 # Check for pip
-print_status "Checking for pip..."
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $TOTAL_SETUP_STEPS $CURRENT_STEP "Checking pip installation"
 check_command pip3 || exit 1
 print_success "pip3 is installed!"
 
 # Setup virtual environment
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $TOTAL_SETUP_STEPS $CURRENT_STEP "Setting up virtual environment"
 setup_venv || exit 1
 
 # Install dependencies
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $TOTAL_SETUP_STEPS $CURRENT_STEP "Installing dependencies"
 install_dependencies || {
     print_error "Failed to install critical dependencies. Exiting."
     exit 1
 }
 
 # Handle Git support
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $TOTAL_SETUP_STEPS $CURRENT_STEP "Configuring Git support"
 handle_git_support
 
 # Create required directories
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $TOTAL_SETUP_STEPS $CURRENT_STEP "Creating directories"
 create_directories
 
-# Detect architecture
+# Detect architecture and setup environment
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $TOTAL_SETUP_STEPS $CURRENT_STEP "Detecting architecture & setting up environment"
 MODEL_VARIANT=$(detect_architecture)
-
-# Prompt for Hugging Face token
 TOKEN_INFO=$(prompt_for_hf_token)
 read HF_TOKEN_SET HF_TOKEN <<< "$TOKEN_INFO"
-
-# Setup .env file
 setup_env_file "$MODEL_VARIANT" "$HF_TOKEN" "$HF_TOKEN_SET"
 
-# Information about model download
-print_status "Model download is now handled directly by the Python code using huggingface_hub"
-print_status "No models will be downloaded during setup - they'll be downloaded as needed during runtime"
-if [ "$HF_TOKEN_SET" != "true" ]; then
-    print_warning "You need to set your Hugging Face token before downloading models:"
-    print_status "  python -m cli set_token"
-fi
-
-# Initialize the framework only if we have basic dependencies installed
+# Initialize the framework
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $TOTAL_SETUP_STEPS $CURRENT_STEP "Initializing framework"
 print_status "Initializing the framework..."
 python -m cli init 2>/dev/null || print_warning "Framework initialization encountered issues, but we can continue"
 
@@ -336,7 +545,11 @@ if [ $? -ne 0 ]; then
 fi
 
 # Final success message and instructions
-print_success "Setup completed successfully!"
+echo ""
+echo "================================================================="
+printf "      ${GREEN}✓ Setup completed successfully!${NC}\n"
+echo "================================================================="
+echo ""
 print_status "You can now run the tool with: python -m cli analyze <repository_url>"
 print_status ""
 print_status "IMPORTANT: To use AI Threat Map in the future, you must first activate the virtual environment:"
