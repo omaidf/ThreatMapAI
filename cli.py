@@ -29,12 +29,15 @@ from utils import (
     success_msg, error_msg, warning_msg, info_msg, 
     get_env_variable, update_env_file,
     detect_architecture, get_default_model_path, validate_model_path,
-    download_model, set_token_interactive, test_model_loading, check_model_file
+    set_token_interactive, test_model_loading, check_model_file
 )
+# Import download_model from model_config (not model_utils) to ensure consistency
+from utils.model_config import download_model
 from utils.file_utils import (
     check_output_directory, clean_previous_run, check_required_files,
     check_dependencies
 )
+# Explicitly import diagram utilities with clear source
 from utils.diagram_utils import (
     find_diagrams, start_server_and_open_diagrams, view_diagrams
 )
@@ -298,18 +301,6 @@ def create_embedding_store(try_load: bool = True, device: Optional[str] = None, 
         error_msg(f"Failed to initialize embedding store: {str(e)}")
         return None
 
-def find_diagrams(output_dir: str) -> List[Path]:
-    """Find Mermaid diagram files in the output directory."""
-    from pathlib import Path  # Ensure Path is imported here
-    diagram_files = []
-    output_path = Path(output_dir)
-    
-    if output_path.exists() and output_path.is_dir():
-        for file in output_path.glob("**/*.mmd"):
-            diagram_files.append(file)
-    
-    return diagram_files
-
 @click.group()
 def cli():
     """AI Threat Model Map Generator CLI."""
@@ -554,156 +545,6 @@ def init(device: str, gpu_ids: str):
     except Exception as e:
         error_msg(f"Failed to initialize framework: {str(e)}")
 
-def clean_previous_run(output_dir: str, force_clean: bool = False, clear_embeddings: bool = False) -> None:
-    """
-    Clean up data from previous runs while preserving model files.
-    
-    Args:
-        output_dir: Directory containing output files
-        force_clean: Force cleaning even without confirmation
-        clear_embeddings: Whether to also clear the embedding store
-    """
-    from pathlib import Path  # Ensure Path is imported here
-    output_path = Path(output_dir)
-    
-    # Check if output directory exists and has previous run files
-    if not output_path.exists():
-        return
-        
-    # Files to check for previous runs
-    previous_run_indicators = [
-        "analysis_results.json",
-        "threat_model.json",
-        "class_diagram.mmd",
-        "flow_diagram.mmd",
-        "threat_diagram.mmd",
-        "threat_analysis_report.html"
-    ]
-    
-    # Check for embedding store files
-    embedding_files = [
-        "embeddings.index",
-        "embeddings_mapping.json"
-    ]
-    
-    # Check for output files
-    found_files = []
-    for indicator in previous_run_indicators:
-        file_path = output_path / indicator
-        if file_path.exists():
-            found_files.append(indicator)
-    
-    # Check for embedding files separately
-    found_embeddings = []
-    for emb_file in embedding_files:
-        file_path = output_path / emb_file
-        if file_path.exists():
-            found_embeddings.append(emb_file)
-    
-    # Count embeddings if they exist
-    embedding_count = 0
-    if found_embeddings and len(found_embeddings) == 2:  # Both embedding files need to exist
-        try:
-            with open(output_path / "embeddings_mapping.json", 'r') as f:
-                embedding_data = json.load(f)
-                embedding_count = len(embedding_data)
-        except Exception:
-            pass
-    
-    if not found_files and not found_embeddings:
-        return
-    
-    # Ask for confirmation if not forced
-    if not force_clean:
-        if found_files:
-            info_msg(f"Found {len(found_files)} files from previous run in {output_dir}:")
-            for file in found_files:
-                click.echo(f"  - {file}")
-            
-            # Ask about cleaning output files
-            if not click.confirm("Do you want to clean up these output files before running a new analysis?", default=True):
-                info_msg("Output files will be preserved and may be overwritten during analysis")
-            else:
-                # Clean output files
-                with tqdm(total=len(found_files), desc="Cleaning previous run files") as progress:
-                    for indicator in previous_run_indicators:
-                        file_path = output_path / indicator
-                        if file_path.exists():
-                            file_path.unlink()
-                            progress.update(1)
-                success_msg(f"Cleaned {len(found_files)} files from previous run")
-        
-        # Handle embeddings separately with more options
-        if found_embeddings and len(found_embeddings) == 2:
-            info_msg(f"Found existing embedding store with {embedding_count} entries")
-            
-            # Don't ask if clear_embeddings was explicitly set
-            if clear_embeddings:
-                info_msg("Will clear embedding store as requested via --clear-embeddings")
-            else:
-                # Give more options for embeddings
-                action = click.prompt(
-                    "What would you like to do with the existing embeddings?",
-                    type=click.Choice(["keep", "clear", "ignore"], case_sensitive=False),
-                    default="keep"
-                )
-                
-                if action.lower() == "keep":
-                    info_msg("Keeping existing embeddings for reuse")
-                    clear_embeddings = False
-                elif action.lower() == "clear":
-                    info_msg("Will clear existing embeddings before analysis")
-                    clear_embeddings = True
-                else:  # ignore
-                    info_msg("Ignoring embeddings - you'll be asked again during analysis")
-                    clear_embeddings = False
-    else:
-        # Force clean all output files
-        if found_files:
-            with tqdm(total=len(found_files), desc="Cleaning previous run files") as progress:
-                for indicator in previous_run_indicators:
-                    file_path = output_path / indicator
-                    if file_path.exists():
-                        file_path.unlink()
-                        progress.update(1)
-            success_msg(f"Cleaned {len(found_files)} files from previous run")
-    
-    # Clean embedding store if requested
-    if clear_embeddings and found_embeddings:
-        try:
-            # Import required modules explicitly
-            import sys
-            import json
-            import faiss
-            import pathlib  # Add pathlib module
-            from pathlib import Path  # Import Path class
-            
-            # Check if Python is shutting down
-            if sys is None or sys.meta_path is None:
-                info_msg("Skipping embedding store clearing during Python shutdown")
-                return
-                
-            # Initialize and clear the embedding store
-            info_msg("Clearing embedding store contents...")
-            embedding_store = create_embedding_store(try_load=False)  # Don't load existing data
-            if embedding_store:
-                # First manually delete the embedding files to avoid issues
-                for emb_file in embedding_files:
-                    file_path = output_path / emb_file
-                    if file_path.exists():
-                        try:
-                            file_path.unlink()
-                            info_msg(f"Deleted {emb_file}")
-                        except Exception as file_error:
-                            warning_msg(f"Failed to delete {emb_file}: {str(file_error)}")
-                
-                # Then clear the store's internal state
-                embedding_store.clear()
-                success_msg("Embedding store cleared successfully")
-        except Exception as e:
-            warning_msg(f"Failed to clear embedding store: {str(e)}")
-            warning_msg("Continuing without clearing embeddings")
-
 @cli.command()
 @click.argument('repository_url', required=False)
 @click.option('--output-dir', default='output', callback=validate_output_dir,
@@ -836,9 +677,8 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
         if not model_path_obj.exists():
             logger.warning(f"CodeLlama model not found at {model_path}")
             if click.confirm("Model not found. Would you like to download it now?"):
-                # Import and use the download_model function explicitly
-                from utils.model_utils import download_model as download_model_util
-                downloaded_path = download_model_util(model_path=model_path, force=True)
+                # Use the correct download_model function
+                downloaded_path = download_model(model_path=model_path, force=True)
                 if not downloaded_path:
                     error_msg("Failed to download model. Please try again or check your internet connection.")
                     return
@@ -865,15 +705,60 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
             
             progress.update(1)
             
-            # Clean up analyzer
-            analyzer = None
+            # Import and initialize analyzer
+            info_msg("Initializing repository analyzer...")
+            from repository_analyzer.analyzer import RepositoryAnalyzer
+            analyzer = RepositoryAnalyzer(embedding_store=embedding_store)
             
-            # Force garbage collection
-            import gc
-            gc.collect()
+            # Import processor for LLM-based analysis
+            info_msg("Initializing LLM processor...")
+            from llm_processor.processor import LLMProcessor
+            processor = LLMProcessor(model_path=model_path)
+            progress.update(1)
             
-            # Convert to HTML and start server
+            # Analyze repository
+            info_msg(f"Analyzing repository: {repository_url}")
+            analysis_results = analyzer.analyze_repository(
+                repository_url, 
+                local=local, 
+                output_dir=output_dir
+            )
+            progress.update(1)
+            
+            # Generate threat model
+            info_msg("Generating threat model from analysis results...")
+            threat_model = processor.generate_threat_model(analysis_results)
+            
+            # Save threat model
+            with open(os.path.join(output_dir, "threat_model.json"), "w") as f:
+                json.dump(threat_model, f, indent=4)
+                
+            # Generate visualizations
+            info_msg("Generating visualizations...")
+            from visualizer.visualizer import ThreatModelVisualizer
+            visualizer = ThreatModelVisualizer()
+            diagrams = visualizer.generate_visualizations_from_dir(output_dir)
+            progress.update(1)
+            
+            # Show generated files
+            info_msg("Analysis completed. Generated files:")
+            for file_name in os.listdir(output_dir):
+                if file_name.endswith(('.json', '.mmd', '.html')):
+                    info_msg(f"  - {file_name}")
+            
+            # Start server and open diagrams in browser
+            diagram_paths = []
+            for diagram_type, path in diagrams.items():
+                if path and os.path.exists(path):
+                    # Make sure we're using string paths
+                    diagram_paths.append(str(path))
+                    
             info_msg(f"Analysis completed. Results saved to {output_dir}")
+            
+            # Start server and open diagrams in browser if diagrams were generated
+            if diagram_paths:
+                info_msg("Starting diagram viewer server...")
+                start_server_and_open_diagrams(diagram_paths, output_dir)
             
             # Keep the server running until user presses Ctrl+C
             try:
@@ -918,40 +803,6 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
 
 @cli.command()
 @click.option('--output-dir', default='output', callback=validate_output_dir,
-              help='Output directory for analysis results')
-def report(output_dir: str):
-    """Generate a comprehensive security report from analysis results."""
-    import webbrowser
-    import pathlib  # Add pathlib import
-    from pathlib import Path  # Import Path explicitly 
-    from visualizer.visualizer import ThreatModelVisualizer
-    
-    try:
-        info_msg(f"Generating report from {output_dir}")
-        
-        with tqdm(total=2, desc="Generating report") as progress:
-            visualizer = ThreatModelVisualizer()
-            progress.update(1)
-            
-            # Check if threat model exists
-            threat_model_path = Path(output_dir) / "threat_model.json"
-            if not threat_model_path.exists():
-                warning_msg(f"Threat model file not found at {threat_model_path}, using default model")
-            
-            # Generate report
-            report_path = visualizer.generate_report_from_dir(output_dir)
-            progress.update(1)
-            
-            success_msg(f"Report generated at {report_path}")
-            
-            # Open the report in a browser
-            info_msg(f"Opening report in browser: {report_path}")
-            webbrowser.open(f"file://{os.path.abspath(report_path)}")
-    except Exception as e:
-        error_msg(f"Error: {str(e)}")
-
-@cli.command()
-@click.option('--output-dir', default='output', callback=validate_output_dir,
               help='Directory containing analysis results')
 def visualize(output_dir: str):
     """Generate visualizations from analysis results."""
@@ -979,8 +830,9 @@ def visualize(output_dir: str):
             diagram_paths = []
             for diagram_type, path in diagrams.items():
                 success_msg(f"{diagram_type}: {path}")
-                if path and Path(path).exists():
-                    diagram_paths.append(path)
+                if path and os.path.exists(path):
+                    # Make sure we're using string paths
+                    diagram_paths.append(str(path))
             
             progress.update(1)
         
@@ -1644,6 +1496,40 @@ def configure_gpu(force_gpu: bool, force_cpu: bool, gpu_ids: str, memory_limit: 
                 info_msg("The system will run slower but is fully functional in CPU-only mode")
     except Exception as e:
         error_msg(f"Error configuring GPU settings: {str(e)}")
+
+@cli.command()
+@click.option('--output-dir', default='output', callback=validate_output_dir,
+              help='Output directory for analysis results')
+def report(output_dir: str):
+    """Generate a comprehensive security report from analysis results."""
+    import webbrowser
+    import pathlib  # Add pathlib import
+    from pathlib import Path  # Import Path explicitly 
+    from visualizer.visualizer import ThreatModelVisualizer
+    
+    try:
+        info_msg(f"Generating report from {output_dir}")
+        
+        with tqdm(total=2, desc="Generating report") as progress:
+            visualizer = ThreatModelVisualizer()
+            progress.update(1)
+            
+            # Check if threat model exists
+            threat_model_path = Path(output_dir) / "threat_model.json"
+            if not threat_model_path.exists():
+                warning_msg(f"Threat model file not found at {threat_model_path}, using default model")
+            
+            # Generate report
+            report_path = visualizer.generate_report_from_dir(output_dir)
+            progress.update(1)
+            
+            success_msg(f"Report generated at {report_path}")
+            
+            # Open the report in a browser
+            info_msg(f"Opening report in browser: {report_path}")
+            webbrowser.open(f"file://{os.path.abspath(report_path)}")
+    except Exception as e:
+        error_msg(f"Error: {str(e)}")
 
 def main():
     """Main entry point for the CLI."""
