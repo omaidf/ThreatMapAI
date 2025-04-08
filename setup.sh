@@ -216,7 +216,10 @@ verify_installation() {
     
     if [[ "$NUMPY_VERSION" == 2.* ]]; then
         print_warning "NumPy version $NUMPY_VERSION may cause issues with faiss. Downgrading to 1.x recommended."
-        if click.confirm("Would you like to downgrade NumPy to 1.24.3 for compatibility?", default=True); then
+        read -p "Would you like to downgrade NumPy to 1.24.3 for compatibility? (yes/no, default: yes): " DOWNGRADE_NUMPY
+        DOWNGRADE_NUMPY=${DOWNGRADE_NUMPY:-yes}
+        
+        if [[ "$DOWNGRADE_NUMPY" =~ ^[Yy][Ee][Ss]$ ]]; then
             "$PYTHON_CMD" -m pip install "numpy==1.24.3" && \
             print_success "Downgraded NumPy to 1.24.3" || \
             print_error "Failed to downgrade NumPy"
