@@ -248,6 +248,7 @@ class LLMProcessor:
                         warning_msg("bitsandbytes not found or incompatible, attempting to install latest version")
                         try:
                             import subprocess
+                            import sys  # Add missing sys import
                             subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "bitsandbytes"])
                             import bitsandbytes as bnb
                             from transformers import BitsAndBytesConfig
@@ -398,6 +399,9 @@ class LLMProcessor:
             
             # Figure out how many tokens we can keep
             instruction_tokens = self._get_token_count(instructions)
+            if instruction_tokens <= 0:
+                instruction_tokens = 1  # Avoid division by zero
+                
             remaining_tokens = available_tokens - instruction_tokens - 20  # Additional buffer
             
             if remaining_tokens <= 0:

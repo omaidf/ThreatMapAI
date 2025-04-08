@@ -41,10 +41,10 @@ class RepositoryRequest(BaseModel):
 
 @app.post("/analyze")
 async def analyze_repository(request: RepositoryRequest):
+    repo_path = request.local_path or "temp_repo"  # Define repo_path before try block
+    
     try:
         # Initialize components
-        repo_path = request.local_path or "temp_repo"
-        
         # Ensure output directory exists
         output_dir = os.getenv("OUTPUT_DIR", "output")
         check_output_directory(output_dir)

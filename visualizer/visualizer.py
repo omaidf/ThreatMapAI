@@ -142,8 +142,11 @@ No threats identified.
             if not template_file.exists():
                 raise VisualizerError(f"Report template not found: {template_file}")
                 
+            # Convert Path objects to strings to avoid platform-specific path issues
+            template_dir_str = str(self.template_dir)
+            
             self.env = jinja2.Environment(
-                loader=jinja2.FileSystemLoader(str(self.template_dir)),
+                loader=jinja2.FileSystemLoader(template_dir_str),
                 autoescape=True
             )
             

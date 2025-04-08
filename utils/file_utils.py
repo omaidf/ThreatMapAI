@@ -133,12 +133,17 @@ def clean_previous_run(output_dir: str, force_clean: bool = False, clear_embeddi
     # Clean output files
     if found_files:
         with tqdm(total=len(found_files), desc="Cleaning previous run files") as progress:
+            cleaned_count = 0
             for indicator in ANALYSIS_RESULT_FILES:
                 file_path = output_path / indicator
                 if file_path.exists():
-                    file_path.unlink()
+                    try:
+                        file_path.unlink()
+                        cleaned_count += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to delete file {file_path}: {str(e)}")
                     progress.update(1)
-        success_msg(f"Cleaned {len(found_files)} files from previous run")
+        success_msg(f"Cleaned {cleaned_count} files from previous run")
     
     # Clean embedding store if requested
     if clear_embeddings and found_embeddings:

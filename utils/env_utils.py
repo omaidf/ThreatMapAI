@@ -82,14 +82,20 @@ def update_env_file(key: str, value: str, env_path: str = ".env") -> bool:
     """
     try:
         env_file = Path(env_path)
-        env_vars = {}
         
         # Read existing file if it exists
         if env_file.exists():
-            with open(env_file, 'r') as f:
-                lines = f.readlines()
+            try:
+                with open(env_file, 'r') as f:
+                    lines = f.readlines()
+            except Exception as e:
+                logger.warning(f"Failed to read .env file: {str(e)}")
+                lines = []
         else:
+            # File doesn't exist, create an empty file
             lines = []
+            # Ensure parent directories exist
+            env_file.parent.mkdir(parents=True, exist_ok=True)
         
         # Update or add the variable
         key_found = False
@@ -110,8 +116,12 @@ def update_env_file(key: str, value: str, env_path: str = ".env") -> bool:
             lines.append(f"{key}={value}\n")
         
         # Write back to file
-        with open(env_file, 'w') as f:
-            f.writelines(lines)
+        try:
+            with open(env_file, 'w') as f:
+                f.writelines(lines)
+        except Exception as e:
+            logger.error(f"Failed to write to .env file: {str(e)}")
+            return False
         
         # Update the current environment
         os.environ[key] = value
