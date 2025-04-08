@@ -84,8 +84,12 @@ class LLMProcessor:
             model_info = get_model_info()
             model_ctx_size = model_info.get("context_length", 4096)
             
-            # Detect GPU capabilities
-            gpu_config = detect_gpu_capabilities()
+            # Get environment variable for force GPU usage (override auto-detection)
+            force_gpu = os.environ.get("FORCE_GPU", "").lower() in ["true", "1", "yes"]
+            force_cpu = os.environ.get("FORCE_CPU", "").lower() in ["true", "1", "yes"]
+            
+            # Detect GPU capabilities with forced settings if specified
+            gpu_config = detect_gpu_capabilities(force_gpu=force_gpu, force_cpu=force_cpu)
             
             # First try to use LlamaCpp, which is better for GGUF files
             info_msg("Loading model using LlamaCpp (better for GGUF files)")
@@ -111,9 +115,36 @@ class LLMProcessor:
                 max_tokens = int(get_env_variable("LLM_MAX_TOKENS", "1024"))
                 top_p = float(get_env_variable("LLM_TOP_P", "0.95"))
                 
+                # Detect architecture (x86 vs ARM)
+                is_arm = False
+                try:
+                    import platform
+                    machine = platform.machine().lower()
+                    is_arm = "arm" in machine or "aarch" in machine
+                except:
+                    pass
+                
+                # Set environment variables to help CUDA detection in llama.cpp
+                if n_gpu_layers > 0 and gpu_config['use_gpu']:
+                    # Force CUDA detection on with environment variables
+                    os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use first GPU by default
+                    
+                    # Unset CPU-specific environment variables that might interfere
+                    for env_var in ["LLAMA_CLBLAST", "LLAMA_METAL", "LLAMA_CPU_ONLY"]:
+                        if env_var in os.environ:
+                            del os.environ[env_var]
+                
                 # Log GPU usage
-                if n_gpu_layers > 0:
-                    success_msg(f"Using GPU acceleration: {gpu_config['gpu_info']} with {n_gpu_layers} layers")
+                if n_gpu_layers > 0 and gpu_config['use_gpu']:
+                    if is_arm:
+                        # For ARM architectures, Metal might be better than CUDA
+                        success_msg(f"Using GPU acceleration: {gpu_config['gpu_info']} with {n_gpu_layers} layers")
+                        # Consider adding Metal-specific options on ARM if needed
+                    else:
+                        # For x86 architectures with NVIDIA GPUs
+                        success_msg(f"Using GPU acceleration: {gpu_config['gpu_info']} with {n_gpu_layers} layers")
+                        # Make sure CUDA is enabled in llama-cpp-python
+                        os.environ["LLAMA_CUBLAS"] = "1"
                 else:
                     warning_msg("Running on CPU only (no GPU acceleration)")
                 
@@ -133,6 +164,8 @@ class LLMProcessor:
                     verbose=True,
                     f16_kv=True,  # Use half-precision for key/value cache
                     streaming=False,  # Disable streaming for now as it can cause issues
+                    seed=42,  # Set a fixed seed for reproducibility
+                    use_mlock=True  # Use mlock to keep the model in memory
                 )
                 
                 success_msg("Successfully loaded model using LlamaCpp")

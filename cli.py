@@ -986,6 +986,69 @@ def gpu_info():
     except Exception as e:
         error_msg(f"Error checking GPU information: {str(e)}")
 
+@cli.command()
+@click.option('--force-gpu', is_flag=True, help='Force GPU usage for LLM (overrides detection)')
+@click.option('--force-cpu', is_flag=True, help='Force CPU usage for LLM (overrides detection)')
+def configure_gpu(force_gpu: bool, force_cpu: bool):
+    """Configure GPU usage for LLaMA model and embeddings."""
+    try:
+        from utils.model_utils import detect_gpu_capabilities
+        
+        # Can't force both CPU and GPU
+        if force_gpu and force_cpu:
+            error_msg("Cannot force both CPU and GPU at the same time")
+            return
+            
+        # Detect current settings
+        current_gpu = os.environ.get("FORCE_GPU", "").lower() in ["true", "1", "yes"]
+        current_cpu = os.environ.get("FORCE_CPU", "").lower() in ["true", "1", "yes"]
+        
+        # Check current GPU capabilities
+        gpu_config = detect_gpu_capabilities(force_gpu=force_gpu, force_cpu=force_cpu)
+        
+        if force_gpu:
+            # Set environment variable to force GPU
+            os.environ["FORCE_GPU"] = "true"
+            if "FORCE_CPU" in os.environ:
+                del os.environ["FORCE_CPU"]
+                
+            # Also update the .env file if it exists
+            from utils.env_utils import update_env_file
+            update_env_file("FORCE_GPU", "true")
+            update_env_file("FORCE_CPU", "")
+            
+            success_msg("GPU acceleration FORCED ON for LLM")
+            if not gpu_config['use_gpu']:
+                warning_msg("WARNING: No GPU detected but forcing GPU acceleration. This may cause errors.")
+        elif force_cpu:
+            # Set environment variable to force CPU
+            os.environ["FORCE_CPU"] = "true"
+            if "FORCE_GPU" in os.environ:
+                del os.environ["FORCE_GPU"]
+                
+            # Also update the .env file if it exists
+            from utils.env_utils import update_env_file
+            update_env_file("FORCE_CPU", "true")
+            update_env_file("FORCE_GPU", "")
+            
+            success_msg("GPU acceleration FORCED OFF for LLM (using CPU only)")
+        else:
+            # No change, just display current status
+            if current_gpu:
+                info_msg("Current setting: GPU acceleration FORCED ON")
+            elif current_cpu:
+                info_msg("Current setting: GPU acceleration FORCED OFF (CPU only)")
+            else:
+                info_msg("Current setting: AUTO-DETECT GPU")
+                
+            if gpu_config['use_gpu']:
+                success_msg(f"GPU detected: {gpu_config['gpu_info']}")
+                success_msg(f"Will use {gpu_config['n_gpu_layers']} GPU layers for LLM")
+            else:
+                info_msg("No GPU detected or GPU not available. Using CPU.")
+    except Exception as e:
+        error_msg(f"Error configuring GPU settings: {str(e)}")
+
 def main():
     """Main entry point for the CLI."""
     try:

@@ -155,6 +155,9 @@ class EmbeddingStore:
             self.vector_size = 384 
             self.model = None
             info_msg("ℹ️ Embedding store will use dummy embeddings")
+            
+        # Set up FAISS index
+        self._setup_index()
     
     def load(self) -> bool:
         """
@@ -173,8 +176,33 @@ class EmbeddingStore:
             with open(self.mapping_path, 'r') as f:
                 self.file_mapping = json.load(f)
             
-            # Load index
-            self.index = faiss.read_index(str(self.index_path))
+            # Load index - always load as CPU index first
+            cpu_index = faiss.read_index(str(self.index_path))
+            
+            # Move to GPU if needed
+            if self.device == 'cuda' and self.gpu_available:
+                try:
+                    # Check if GPU version of FAISS is available
+                    if hasattr(faiss, 'StandardGpuResources') and hasattr(faiss, 'index_cpu_to_gpu'):
+                        # Create GPU resources
+                        self.gpu_resources = faiss.StandardGpuResources()
+                        
+                        # Convert CPU index to GPU index
+                        self.index = faiss.index_cpu_to_gpu(self.gpu_resources, 0, cpu_index)
+                        self.use_gpu_for_faiss = True
+                        info_msg("Successfully moved FAISS index to GPU")
+                    else:
+                        warning_msg("FAISS GPU support not available, using CPU index")
+                        self.index = cpu_index
+                        self.use_gpu_for_faiss = False
+                except Exception as e:
+                    warning_msg(f"Failed to move index to GPU: {str(e)}")
+                    self.index = cpu_index
+                    self.use_gpu_for_faiss = False
+            else:
+                # Use CPU index
+                self.index = cpu_index
+                self.use_gpu_for_faiss = False
             
             info_msg(f"Loaded {len(self.file_mapping)} embeddings from {self.index_path}")
             return True
@@ -198,12 +226,67 @@ class EmbeddingStore:
             with open(self.mapping_path, 'w') as f:
                 json.dump(self.file_mapping, f, indent=2)
             
-            # Save index
-            faiss.write_index(self.index, str(self.index_path))
+            # If using GPU index, we need to convert back to CPU for saving
+            if hasattr(self, 'use_gpu_for_faiss') and self.use_gpu_for_faiss:
+                try:
+                    cpu_index = faiss.index_gpu_to_cpu(self.index)
+                    faiss.write_index(cpu_index, str(self.index_path))
+                except Exception as e:
+                    warning_msg(f"Failed to convert GPU index to CPU for saving: {str(e)}")
+                    warning_msg("Attempting to save index directly")
+                    faiss.write_index(self.index, str(self.index_path))
+            else:
+                # Save index directly if it's already a CPU index
+                faiss.write_index(self.index, str(self.index_path))
             
             success_msg(f"Saved {len(self.file_mapping)} embeddings to {self.index_path}")
         except Exception as e:
             error_msg(f"Failed to save embeddings: {str(e)}")
+    
+    def _setup_index(self) -> None:
+        """Set up the FAISS index, using GPU if available."""
+        # Create a new index based on vector size
+        try:
+            # Check if we should use GPU for FAISS
+            self.use_gpu_for_faiss = self.device == 'cuda' and self.gpu_available
+            
+            # Create a flat L2 index first (CPU version)
+            cpu_index = faiss.IndexFlatL2(self.vector_size)
+            
+            if self.use_gpu_for_faiss:
+                try:
+                    # Import required FAISS GPU components
+                    import faiss.contrib.torch_utils  # For PyTorch compatibility
+                    
+                    # Check if GPU version of FAISS is available
+                    if hasattr(faiss, 'StandardGpuResources'):
+                        info_msg("Using GPU acceleration for FAISS index")
+                        
+                        # Create GPU resources
+                        self.gpu_resources = faiss.StandardGpuResources()
+                        
+                        # Configure GPU index
+                        gpu_config = faiss.GpuIndexFlatConfig()
+                        gpu_config.device = 0  # Use first GPU
+                        gpu_config.useFloat16 = True  # Use half-precision for memory efficiency
+                        
+                        # Create GPU index
+                        self.index = faiss.GpuIndexFlatL2(self.gpu_resources, self.vector_size, gpu_config)
+                        return
+                    else:
+                        warning_msg("FAISS GPU support not available, falling back to CPU index")
+                except Exception as e:
+                    warning_msg(f"Failed to initialize GPU index for FAISS: {str(e)}")
+                    warning_msg("Falling back to CPU index")
+            
+            # If we get here, use CPU index
+            self.index = cpu_index
+            
+        except Exception as e:
+            warning_msg(f"Failed to create FAISS index: {str(e)}")
+            # Create a minimal CPU index as fallback
+            self.index = faiss.IndexFlatL2(self.vector_size)
+            self.use_gpu_for_faiss = False
     
     def clear(self) -> None:
         """
@@ -227,7 +310,8 @@ class EmbeddingStore:
                 self.model = None
                 # Keep existing vector size
             
-            self.index = faiss.IndexFlatL2(self.vector_size)
+            # Initialize the index
+            self._setup_index()
             info_msg("Embeddings cleared, created new empty index")
             
             # Save empty state
@@ -666,6 +750,13 @@ class EmbeddingStore:
             if hasattr(self, 'model') and self.model is not None:
                 # Release model resources
                 self.model = None
+                
+            # Clean up GPU resources if using FAISS with GPU
+            if hasattr(self, 'use_gpu_for_faiss') and self.use_gpu_for_faiss:
+                if hasattr(self, 'gpu_resources') and self.gpu_resources is not None:
+                    # Explicitly clean up GPU resources
+                    del self.gpu_resources
+                    self.gpu_resources = None
                 
             # Explicitly clean up FAISS index
             if hasattr(self, 'index') and self.index is not None:

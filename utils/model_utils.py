@@ -331,13 +331,17 @@ def test_model_loading(model_path: str) -> bool:
         logger.error(f"Failed to test model loading: {str(e)}")
         return False 
 
-def detect_gpu_capabilities() -> dict:
+def detect_gpu_capabilities(force_gpu: bool = False, force_cpu: bool = False) -> dict:
     """
     Detect GPU capabilities and return appropriate configurations for LLMs.
     
     This function detects if CUDA/GPU is available and returns appropriate
     configuration settings for model loading.
     
+    Args:
+        force_gpu: Force GPU usage even if detection fails
+        force_cpu: Force CPU usage even if GPU is available
+        
     Returns:
         Dictionary with configuration including:
         - 'device': 'cuda', 'mps', or 'cpu'
@@ -352,24 +356,35 @@ def detect_gpu_capabilities() -> dict:
         'gpu_info': 'No GPU detected'
     }
     
+    # Handle forced settings
+    if force_cpu:
+        info_msg("Forcing CPU usage as requested")
+        return result
+    
     try:
         # Try importing torch to check for CUDA/MPS availability
         import torch
         
         # First check for CUDA (NVIDIA GPUs)
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() or force_gpu:
             # Get CUDA information
-            gpu_count = torch.cuda.device_count()
-            gpu_name = torch.cuda.get_device_name(0) if gpu_count > 0 else "Unknown NVIDIA GPU"
-            gpu_memory = None
-            
-            try:
-                # Try to get GPU memory info if available
-                gpu_properties = torch.cuda.get_device_properties(0)
-                if hasattr(gpu_properties, 'total_memory'):
-                    gpu_memory = gpu_properties.total_memory / (1024 ** 3)  # Convert to GB
-            except:
-                pass
+            if torch.cuda.is_available():
+                gpu_count = torch.cuda.device_count()
+                gpu_name = torch.cuda.get_device_name(0) if gpu_count > 0 else "Unknown NVIDIA GPU"
+                gpu_memory = None
+                
+                try:
+                    # Try to get GPU memory info if available
+                    gpu_properties = torch.cuda.get_device_properties(0)
+                    if hasattr(gpu_properties, 'total_memory'):
+                        gpu_memory = gpu_properties.total_memory / (1024 ** 3)  # Convert to GB
+                except:
+                    pass
+            elif force_gpu:
+                # If forcing GPU but CUDA not available, use placeholder values
+                gpu_count = 1
+                gpu_name = "Forced NVIDIA GPU"
+                gpu_memory = 8  # Assume 8GB
             
             # Configure based on GPU capabilities
             result['device'] = 'cuda'
@@ -424,6 +439,9 @@ def detect_gpu_capabilities() -> dict:
                         result['n_gpu_layers'] = 32
                     else:
                         result['n_gpu_layers'] = 100  # All layers
+            elif force_gpu:
+                # If forcing GPU but don't know memory, use conservative defaults
+                result['n_gpu_layers'] = is_large_model and 16 or 32
             else:
                 # Conservative default for unknown memory
                 result['n_gpu_layers'] = is_large_model and 8 or 16
