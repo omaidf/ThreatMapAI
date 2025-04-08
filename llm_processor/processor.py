@@ -1174,6 +1174,27 @@ Pay special attention to:
             Dictionary with architecture information
         """
         try:
+            # Filter out test files from file list
+            filtered_file_list = [file for file in file_list if 'test' not in file.lower()]
+            if len(filtered_file_list) < len(file_list):
+                logger.info(f"Filtered out {len(file_list) - len(filtered_file_list)} test files from architecture analysis")
+                file_list = filtered_file_list
+            
+            # Filter out test files from entry points
+            filtered_entry_points = [file for file in entry_points if 'test' not in file.lower()]
+            if len(filtered_entry_points) < len(entry_points):
+                logger.info(f"Filtered out {len(entry_points) - len(filtered_entry_points)} test files from entry points")
+                entry_points = filtered_entry_points
+            
+            # Filter out test files from file relationships
+            filtered_relationships = {}
+            for file, related in file_relationships.items():
+                if 'test' not in file.lower():
+                    filtered_relationships[file] = [f for f in related if 'test' not in f.lower()]
+            if len(filtered_relationships) < len(file_relationships):
+                logger.info(f"Filtered out test files from file relationships")
+                file_relationships = filtered_relationships
+            
             # With 100K context window, we can analyze many more files
             # We'll still apply a high limit to prevent extremely rare cases of enormous repos
             max_files_to_check = 10000  # Previously 500, now much higher for 100K context

@@ -456,7 +456,7 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
                 
                 # Give the user options unless reuse is explicitly set
                 if reuse_embeddings:
-                    info_msg("Reusing existing embeddings as requested (--reuse-embeddings)")
+                    info_msg("Reusing existing embeddings as requested (--reuse-embeddings) - only new or changed files will be indexed")
                     use_existing = True
                     clear_embeddings = False
                 else:
@@ -469,7 +469,7 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
                     )
                     
                     if action.lower() == "reuse":
-                        info_msg("Reusing existing embeddings")
+                        info_msg("Reusing existing embeddings - only new or changed files will be indexed")
                         use_existing = True
                         clear_embeddings = False
                     elif action.lower() == "recreate":

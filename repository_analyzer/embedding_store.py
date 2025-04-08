@@ -247,6 +247,11 @@ class EmbeddingStore:
             metadata: Additional metadata about the file (language, imports, etc.)
         """
         try:
+            # Check if this file is already in the embedding store
+            if self.contains_file(file_path):
+                logger.info(f"File {file_path} already in embedding store, skipping")
+                return
+                
             # Split content into chunks for embedding
             chunks = self._split_content(content)
             if not chunks:
@@ -535,6 +540,18 @@ class EmbeddingStore:
             logger.error(f"Failed to get file relationships: {str(e)}")
             return {}
     
+    def contains_file(self, file_path: str) -> bool:
+        """
+        Check if a file is already indexed in the embedding store.
+        
+        Args:
+            file_path: Path of the file to check
+            
+        Returns:
+            True if the file is already indexed, False otherwise
+        """
+        return any(entry.get("file_path") == file_path for entry in self.file_mapping)
+    
     def _get_all_files(self) -> List[str]:
         """
         Get a list of all unique file paths in the embedding store.
@@ -597,4 +614,68 @@ class EmbeddingStore:
         except Exception as e:
             # Don't raise exceptions in __del__
             print(f"Error during EmbeddingStore cleanup: {e}")
-            pass 
+            pass
+
+    def add_documents(self, documents: List[Dict[str, Any]]) -> None:
+        """
+        Add documents to the embedding store and generate embeddings.
+        
+        Args:
+            documents: List of documents to add
+        """
+        if not documents:
+            return
+            
+        try:
+            logger.info(f"Adding {len(documents)} documents to embedding store")
+            
+            # Filter out test files
+            filtered_documents = []
+            for doc in documents:
+                file_path = doc.get("metadata", {}).get("file_path", "")
+                # Skip files with 'test' or 'Test' in their paths
+                if 'test' in file_path.lower():
+                    continue
+                filtered_documents.append(doc)
+                
+            if len(filtered_documents) < len(documents):
+                logger.info(f"Filtered out {len(documents) - len(filtered_documents)} test files")
+                
+            documents = filtered_documents
+            
+            # Process documents in batches to avoid memory issues
+            batch_size = 50
+            for i in range(0, len(documents), batch_size):
+                batch = documents[i:i+batch_size]
+                
+                # Create embeddings for this batch using the helper method
+                batch_embeddings = self._encode_text([doc["content"] for doc in batch])
+                
+                # Add to index
+                self.index.add(batch_embeddings.astype('float32'))
+                
+                # Map file path to indices
+                for j, doc in enumerate(batch):
+                    idx = self.index.ntotal - len(documents) + i + j
+                    
+                    self.file_mapping.append({
+                        "file_path": doc["file_path"],
+                        "content": doc["content"],
+                        "metadata": doc["metadata"]
+                    })
+                
+                # Force garbage collection between batches to prevent memory leaks
+                if i % (batch_size * 4) == 0 and i > 0:
+                    import gc
+                    gc.collect()
+            
+            # Save after each batch to avoid losing work
+            self.save()
+            
+            logger.info(f"Added {len(documents)} documents to embedding store")
+        except Exception as e:
+            logger.error(f"Failed to add documents to embedding store: {str(e)}")
+            
+            # Try to clean up any partial work
+            import gc
+            gc.collect() 

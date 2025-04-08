@@ -31,6 +31,7 @@ import time
 
 # Add import for Counter for file extension counting
 from collections import Counter
+import fnmatch
 
 logger = logging.getLogger(__name__)
 
@@ -1085,10 +1086,20 @@ class RepositoryAnalyzer:
                 all_files = selected_files
             
             # Index the selected files for RAG
+            reused_files = 0
+            new_files = 0
             logger.info(f"Indexing {len(all_files)} files for RAG...")
             for rel_path, file_path, ext in all_files:
                 if self.embedding_store and not is_large_repo:
                     try:
+                        # Check if this file is already in the embedding store to avoid re-indexing
+                        # when reusing embeddings
+                        if self.embedding_store.contains_file(rel_path):
+                            # Skip files that are already indexed
+                            reused_files += 1
+                            indexed_files += 1
+                            continue
+                            
                         with open(file_path, 'rb') as f:
                             content = f.read()
                         
@@ -1114,11 +1125,15 @@ class RepositoryAnalyzer:
                         
                         # Add file to embedding store with metadata
                         self.embedding_store.add_file(rel_path, decoded_content, metadata)
+                        new_files += 1
                         indexed_files += 1
                     except Exception as e:
                         logger.warning(f"Failed to index {rel_path}: {str(e)}")
                         skipped_files += 1
-            
+                        
+            if reused_files > 0:
+                logger.info(f"Reused {reused_files} files already in embedding store, indexed {new_files} new files")
+
             # Process files in chunks to avoid memory issues
             chunk_size = 100  # Process 100 files at a time
             logger.info(f"Processing {len(all_files)} files in chunks of {chunk_size}...")
@@ -1370,3 +1385,65 @@ class RepositoryAnalyzer:
                 raise reraise_as(message) from error
             else:
                 raise error 
+
+    def _get_all_files(self, repo_path: str, ignore_patterns: list = None) -> List[str]:
+        """
+        Get all files in the repository, filtering out unwanted files and directories.
+        
+        Args:
+            repo_path: Path to the repository
+            ignore_patterns: List of patterns to ignore
+            
+        Returns:
+            List of file paths relative to the repository root
+        """
+        if ignore_patterns is None:
+            ignore_patterns = []
+            
+        # Add common ignore patterns if not already present
+        common_ignores = [
+            ".git", ".github", "__pycache__", ".pytest_cache", 
+            ".vscode", ".idea", "node_modules", "venv", "env",
+            "*.pyc", "*.pyo", "*.pyd", "*.so", "*.dylib", "*.dll",
+            "*.class", "*.jar", "*.war", "*.ear", "*.zip", "*.tar.gz",
+            "*.log", ".DS_Store", "Thumbs.db"
+        ]
+        
+        for pattern in common_ignores:
+            if pattern not in ignore_patterns:
+                ignore_patterns.append(pattern)
+                
+        all_files = []
+        
+        for root, dirs, files in os.walk(repo_path):
+            # Skip ignored directories
+            dirs[:] = [d for d in dirs if not any(fnmatch.fnmatch(d, pattern) for pattern in ignore_patterns)]
+            
+            for file in files:
+                # Skip ignored files
+                if any(fnmatch.fnmatch(file, pattern) for pattern in ignore_patterns):
+                    continue
+                    
+                file_path = os.path.join(root, file)
+                rel_path = os.path.relpath(file_path, repo_path)
+                
+                # Filter out test files
+                if 'test' in rel_path.lower():
+                    continue
+                
+                # Skip binary files and files that are too large
+                try:
+                    if os.path.getsize(file_path) > self.max_file_size:
+                        continue
+                        
+                    # Try to read the first few bytes to check if it's a text file
+                    with open(file_path, 'rb') as f:
+                        content = f.read(min(1024, os.path.getsize(file_path)))
+                        if b'\0' in content:  # Binary file check
+                            continue
+                            
+                    all_files.append(rel_path)
+                except Exception as e:
+                    logger.warning(f"Error processing file {rel_path}: {str(e)}")
+                    
+        return all_files 
