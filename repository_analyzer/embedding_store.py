@@ -600,6 +600,7 @@ class EmbeddingStore:
             
             # Add file extension to metadata if not already there
             if "extension" not in metadata:
+                from pathlib import Path  # Local import to ensure Path is available
                 ext = Path(file_path).suffix.lower()
                 if ext:
                     metadata["extension"] = ext
@@ -730,7 +731,7 @@ class EmbeddingStore:
         """
         try:
             # If index is empty or no model available, return empty list
-            if self.index is None or self.index.ntotal == 0 or self.model is None:
+            if not hasattr(self, 'index') or self.index is None or not hasattr(self.index, 'ntotal') or self.index.ntotal == 0 or not hasattr(self, 'model') or self.model is None:
                 logger.warning("Cannot get relevant context: index is empty or model is unavailable")
                 return []
             
@@ -738,23 +739,41 @@ class EmbeddingStore:
             query_embedding = self._encode_text([query])
             
             # Search for similar chunks - get more than we need for filtering
-            D, I = self.index.search(np.array(query_embedding).astype('float32'), min(self.index.ntotal, max_results * 3))
+            # Ensure we don't request more results than we have in the index
+            k = min(self.index.ntotal, max_results * 3)
+            if k <= 0:
+                logger.warning("Index is empty, cannot retrieve relevant context")
+                return []
+                
+            D, I = self.index.search(np.array(query_embedding).astype('float32'), k)
             
             # Return content of matching chunks with optional filtering
             results = []
-            for idx in I[0]:
-                if idx < len(self.file_mapping):
+            # Make sure I[0] exists before iterating
+            if len(I) > 0 and len(I[0]) > 0:
+                for idx in I[0]:
+                    # Check if index is valid
+                    if idx < 0 or idx >= len(self.file_mapping):
+                        logger.warning(f"Invalid index {idx} when retrieving context, skipping")
+                        continue
+                        
                     # Apply metadata filter if specified
                     if filter_metadata and not self._matches_metadata(self.file_mapping[idx].get("metadata", {}), filter_metadata):
                         continue
                     
                     # Add metadata prefix to the content if available
                     entry = self.file_mapping[idx]
+                    
+                    # Check if content exists
+                    if "content" not in entry:
+                        logger.warning(f"Missing content in entry at index {idx}, skipping")
+                        continue
+                        
                     context = entry["content"]
                     
                     # Add file path and language info as prefix
                     metadata = entry.get("metadata", {})
-                    file_info = f"File: {entry['file_path']}"
+                    file_info = f"File: {entry.get('file_path', 'unknown')}"
                     if "language" in metadata:
                         file_info += f" (Language: {metadata['language']})"
                     
@@ -936,7 +955,7 @@ class EmbeddingStore:
                     import os  # Explicitly import what we need
                     import json
                     import faiss
-                    from pathlib import Path  # Add Path import here
+                    from pathlib import Path  # Add missing import
                     self.save()
                 except Exception as save_error:
                     print(f"Failed to save embeddings during cleanup: {save_error}")
@@ -980,35 +999,74 @@ class EmbeddingStore:
         try:
             logger.info(f"Adding {len(documents)} documents to embedding store")
             
-            # Filter out test files
+            # Filter out test files and validate documents
             filtered_documents = []
             for doc in documents:
-                file_path = doc.get("metadata", {}).get("file_path", "")
+                # Skip if content is missing or empty
+                if "content" not in doc or not doc["content"]:
+                    logger.warning(f"Skipping document with missing content")
+                    continue
+                    
+                # Check if metadata exists
+                metadata = doc.get("metadata", {})
+                
+                # Get file_path from document or metadata 
+                if "file_path" in doc:
+                    file_path = doc["file_path"]
+                else:
+                    file_path = metadata.get("file_path", "")
+                
+                # Skip if file_path is missing
+                if not file_path:
+                    logger.warning(f"Skipping document with missing file_path")
+                    continue
+                
                 # Skip files with 'test' or 'Test' in their paths
                 if 'test' in file_path.lower():
                     continue
-                filtered_documents.append(doc)
+                    
+                # Create a valid document with all required fields
+                filtered_doc = {
+                    "file_path": file_path,
+                    "content": doc["content"],
+                    "metadata": metadata
+                }
+                
+                filtered_documents.append(filtered_doc)
                 
             if len(filtered_documents) < len(documents):
-                logger.info(f"Filtered out {len(documents) - len(filtered_documents)} test files")
+                logger.info(f"Filtered out {len(documents) - len(filtered_documents)} test files and invalid documents")
                 
             documents = filtered_documents
             
+            # Ensure we have an index
+            if self.index is None:
+                logger.info("Index not initialized, creating a new one")
+                self.clear()
+                
+            # Check again after filtering 
+            if not documents:
+                logger.warning("No valid documents to add after filtering")
+                return
+                
             # Process documents in batches to avoid memory issues
             batch_size = 50
             for i in range(0, len(documents), batch_size):
                 batch = documents[i:i+batch_size]
                 
                 # Create embeddings for this batch using the helper method
-                batch_embeddings = self._encode_text([doc["content"] for doc in batch])
+                batch_text = [doc["content"] for doc in batch]
+                batch_embeddings = self._encode_text(batch_text)
                 
                 # Add to index
                 self.index.add(batch_embeddings.astype('float32'))
                 
+                # Get the starting index for this batch
+                start_idx = self.index.ntotal - len(batch)
+                
                 # Map file path to indices
                 for j, doc in enumerate(batch):
-                    idx = self.index.ntotal - len(documents) + i + j
-                    
+                    idx = start_idx + j
                     self.file_mapping.append({
                         "file_path": doc["file_path"],
                         "content": doc["content"],
