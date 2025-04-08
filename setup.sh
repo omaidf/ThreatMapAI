@@ -209,11 +209,12 @@ verify_installation() {
     print_status "Verifying dependencies..."
     
     # First check NumPy version to ensure compatibility with faiss
-    NUMPY_VERSION=$("$PYTHON_CMD" -c "import numpy; print(numpy.__version__)" 2>/dev/null) || {
-        print_error "NumPy is not properly installed"
+    if ! "$PYTHON_CMD" -c "import numpy" 2>/dev/null; then
+        print_error "NumPy is not installed. Please install it and try again."
         return 1
-    }
-    
+    fi
+
+    NUMPY_VERSION=$("$PYTHON_CMD" -c "import numpy; print(numpy.__version__)" 2>/dev/null)
     if [[ "$NUMPY_VERSION" == 2.* ]]; then
         print_warning "NumPy version $NUMPY_VERSION may cause issues with faiss. Downgrading to 1.x recommended."
         read -p "Would you like to downgrade NumPy to 1.24.3 for compatibility? (yes/no, default: yes): " DOWNGRADE_NUMPY
@@ -237,11 +238,12 @@ verify_installation() {
         print_error "Failed to fix faiss-cpu installation"
     fi
     
-    # Simpler verification that just tests imports of core packages
+    # Perform comprehensive verification of all packages
+    print_status "Checking all critical packages..."
+    
     "$PYTHON_CMD" -c "
 import sys
 import importlib
-import traceback
 
 all_passed = True
 critical_packages = [
