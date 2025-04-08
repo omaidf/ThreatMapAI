@@ -300,6 +300,7 @@ def create_embedding_store(try_load: bool = True, device: Optional[str] = None, 
 
 def find_diagrams(output_dir: str) -> List[Path]:
     """Find Mermaid diagram files in the output directory."""
+    from pathlib import Path  # Ensure Path is imported here
     diagram_files = []
     output_path = Path(output_dir)
     
@@ -562,6 +563,7 @@ def clean_previous_run(output_dir: str, force_clean: bool = False, clear_embeddi
         force_clean: Force cleaning even without confirmation
         clear_embeddings: Whether to also clear the embedding store
     """
+    from pathlib import Path  # Ensure Path is imported here
     output_path = Path(output_dir)
     
     # Check if output directory exists and has previous run files
