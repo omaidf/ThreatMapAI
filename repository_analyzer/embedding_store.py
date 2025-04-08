@@ -71,6 +71,7 @@ class EmbeddingStore:
         # Initialize empty index and mapping
         self.index = None
         self.file_mapping = []  # Changed from dictionary to list for consistency
+        self.use_gpu_for_faiss = False
         
         # Auto-detect GPU if device not specified
         gpu_available, gpu_memory = detect_gpu()
@@ -156,8 +157,16 @@ class EmbeddingStore:
             self.model = None
             info_msg("ℹ️ Embedding store will use dummy embeddings")
             
-        # Set up FAISS index
-        self._setup_index()
+        # Set up FAISS index - handle errors gracefully
+        try:
+            self._setup_index()
+        except Exception as e:
+            warning_msg(f"Failed to initialize FAISS index: {str(e)}")
+            warning_msg("FAISS functionality will be limited until fixed")
+            # If using CUDA, suggest installing faiss-gpu
+            if self.device == 'cuda':
+                warning_msg("For GPU support, make sure FAISS GPU is installed: 'pip install faiss-gpu'")
+                warning_msg("Run the setup script (setup.sh) which will auto-detect and install the right version")
     
     def load(self) -> bool:
         """
@@ -247,6 +256,9 @@ class EmbeddingStore:
         """Set up the FAISS index, using GPU if available."""
         # Create a new index based on vector size
         try:
+            # First import FAISS to ensure it's available
+            import faiss
+            
             # Check if we should use GPU for FAISS
             self.use_gpu_for_faiss = self.device == 'cuda' and self.gpu_available
             
@@ -255,11 +267,18 @@ class EmbeddingStore:
             
             if self.use_gpu_for_faiss:
                 try:
-                    # Import required FAISS GPU components
-                    import faiss.contrib.torch_utils  # For PyTorch compatibility
+                    # Try importing GPU-specific FAISS components
+                    gpu_available = False
                     
-                    # Check if GPU version of FAISS is available
-                    if hasattr(faiss, 'StandardGpuResources'):
+                    # First check if this is faiss-gpu by checking get_num_gpus
+                    if hasattr(faiss, 'get_num_gpus'):
+                        num_gpus = faiss.get_num_gpus()
+                        if num_gpus > 0:
+                            # We have GPU support in this FAISS build
+                            gpu_available = True
+                            info_msg(f"FAISS detected {num_gpus} GPUs")
+                    
+                    if gpu_available and hasattr(faiss, 'StandardGpuResources'):
                         info_msg("Using GPU acceleration for FAISS index")
                         
                         # Create GPU resources
@@ -274,19 +293,30 @@ class EmbeddingStore:
                         self.index = faiss.GpuIndexFlatL2(self.gpu_resources, self.vector_size, gpu_config)
                         return
                     else:
-                        warning_msg("FAISS GPU support not available, falling back to CPU index")
+                        warning_msg("FAISS GPU support not available (install faiss-gpu instead of faiss-cpu)")
+                        warning_msg("Falling back to CPU index")
                 except Exception as e:
                     warning_msg(f"Failed to initialize GPU index for FAISS: {str(e)}")
                     warning_msg("Falling back to CPU index")
             
             # If we get here, use CPU index
             self.index = cpu_index
+            self.use_gpu_for_faiss = False
             
+        except ImportError as e:
+            warning_msg(f"Failed to import FAISS: {str(e)}")
+            warning_msg("To use FAISS with GPU, install: pip install faiss-gpu")
+            # Create a minimal CPU index
+            import numpy as np
+            self.index = None
+            self.use_gpu_for_faiss = False
+            raise e
         except Exception as e:
             warning_msg(f"Failed to create FAISS index: {str(e)}")
             # Create a minimal CPU index as fallback
-            self.index = faiss.IndexFlatL2(self.vector_size)
+            self.index = None
             self.use_gpu_for_faiss = False
+            raise e
     
     def clear(self) -> None:
         """
@@ -300,22 +330,33 @@ class EmbeddingStore:
             self.file_mapping = []  # Changed from dictionary to list
             self.total_chunks = 0
             
-            # Re-initialize the embedding model and index
+            # Re-initialize the embedding model if needed
+            if not hasattr(self, 'model') or self.model is None:
+                try:
+                    from sentence_transformers import SentenceTransformer
+                    self.model = SentenceTransformer('all-MiniLM-L6-v2', device=self.device)
+                    self.vector_size = self.model.get_sentence_embedding_dimension()
+                except Exception as e:
+                    logger.warning(f"Failed to initialize SentenceTransformer: {str(e)}")
+                    self.model = None
+                    # Set default vector size if we don't have it
+                    if not hasattr(self, 'vector_size'):
+                        self.vector_size = 384  # Standard dimension for embeddings
+            
+            # Initialize the index (will handle failures internally)
             try:
-                from sentence_transformers import SentenceTransformer
-                self.model = SentenceTransformer('all-MiniLM-L6-v2', device=self.device)
-                self.vector_size = self.model.get_sentence_embedding_dimension()
+                self._setup_index()
+                info_msg("Embeddings cleared, created new empty index")
             except Exception as e:
-                logger.warning(f"Failed to initialize SentenceTransformer: {str(e)}")
-                self.model = None
-                # Keep existing vector size
+                warning_msg(f"Failed to create new index: {str(e)}")
+                warning_msg("Embedding store will have limited functionality")
             
-            # Initialize the index
-            self._setup_index()
-            info_msg("Embeddings cleared, created new empty index")
-            
-            # Save empty state
-            self.save()
+            # Save empty state if we have a valid index
+            if self.index is not None:
+                try:
+                    self.save()
+                except Exception as save_e:
+                    warning_msg(f"Failed to save empty index: {str(save_e)}")
             
             logger.info("Embedding store cleared successfully")
         except Exception as e:

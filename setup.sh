@@ -206,119 +206,61 @@ prompt_for_hf_token() {
 }
 
 verify_installation() {
-    print_status "Verifying dependencies..."
+    print_status "Verifying installation..."
     
-    # First check NumPy version to ensure compatibility with faiss
-    if ! "$PYTHON_CMD" -c "import numpy" 2>/dev/null; then
-        print_error "NumPy is not installed. Please install it and try again."
+    MISSING_DEPS=()
+    
+    # Check for critical dependencies
+    if ! "$PYTHON_CMD" -c "import click" 2>/dev/null; then
+        MISSING_DEPS+=("click")
+    fi
+    
+    if ! "$PYTHON_CMD" -c "import langchain" 2>/dev/null; then
+        MISSING_DEPS+=("langchain and langchain-core")
+    fi
+    
+    if ! "$PYTHON_CMD" -c "import dotenv" 2>/dev/null; then
+        MISSING_DEPS+=("python-dotenv")
+    fi
+    
+    if ! "$PYTHON_CMD" -c "import tree_sitter" 2>/dev/null; then
+        MISSING_DEPS+=("tree-sitter")
+    fi
+    
+    # Check for sentence_transformers
+    if ! "$PYTHON_CMD" -c "import sentence_transformers" 2>/dev/null; then
+        MISSING_DEPS+=("sentence_transformers")
+    fi
+    
+    # Check for FAISS (either CPU or GPU version is fine)
+    if ! "$PYTHON_CMD" -c "import faiss" 2>/dev/null; then
+        MISSING_DEPS+=("faiss-cpu or faiss-gpu")
+    else
+        # Check if FAISS has GPU support
+        if "$PYTHON_CMD" -c "import faiss; print(hasattr(faiss, 'get_num_gpus') and faiss.get_num_gpus() > 0)" 2>/dev/null | grep -q "True"; then
+            print_success "FAISS with GPU support verified!"
+            mark_as_installed "faiss_gpu"
+            # Make sure we don't have both markers
+            rm -f "$INSTALL_MARKERS_DIR/faiss_cpu"
+        else
+            print_status "FAISS CPU version verified."
+            mark_as_installed "faiss_cpu"
+            # Make sure we don't have both markers
+            rm -f "$INSTALL_MARKERS_DIR/faiss_gpu"
+        fi
+    fi
+    
+    # Missing dependencies check
+    if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
+        print_error "The following critical dependencies are missing:"
+        for dep in "${MISSING_DEPS[@]}"; do
+            print_error "  - $dep"
+        done
         return 1
     fi
-
-    NUMPY_VERSION=$("$PYTHON_CMD" -c "import numpy; print(numpy.__version__)" 2>/dev/null)
-    if [[ "$NUMPY_VERSION" == 2.* ]]; then
-        print_warning "NumPy version $NUMPY_VERSION may cause issues with faiss. Downgrading to 1.x recommended."
-        read -p "Would you like to downgrade NumPy to 1.24.3 for compatibility? (yes/no, default: yes): " DOWNGRADE_NUMPY
-        DOWNGRADE_NUMPY=${DOWNGRADE_NUMPY:-yes}
-        
-        if [[ "$DOWNGRADE_NUMPY" =~ ^[Yy][Ee][Ss]$ ]]; then
-            "$PYTHON_CMD" -m pip install "numpy==1.24.3" && \
-            print_success "Downgraded NumPy to 1.24.3" || \
-            print_error "Failed to downgrade NumPy"
-        fi
-    else
-        print_success "NumPy version $NUMPY_VERSION is compatible with faiss"
-    fi
     
-    # Check faiss specifically
-    if ! "$PYTHON_CMD" -c "import faiss" 2>/dev/null; then
-        print_error "faiss-cpu is not properly installed. Trying to fix..."
-        "$PYTHON_CMD" -m pip install "numpy==1.24.3" >/dev/null 2>&1 && \
-        "$PYTHON_CMD" -m pip install "faiss-cpu==1.7.4" >/dev/null 2>&1 && \
-        print_success "Fixed faiss-cpu installation" || \
-        print_error "Failed to fix faiss-cpu installation"
-    fi
-    
-    # Perform comprehensive verification of all packages
-    print_status "Checking all critical packages..."
-    
-    "$PYTHON_CMD" -c "
-import sys
-import importlib
-
-all_passed = True
-critical_packages = [
-    'click', 'langchain', 'langchain_core', 'langchain_community', 
-    'tree_sitter', 'requests', 'tqdm', 'xmltodict', 'importlib.metadata',
-    'huggingface_hub', 'joblib'
-]
-
-for pkg in critical_packages:
-    try:
-        __import__(pkg)
-        print(f'✓ {pkg}')
-    except ImportError as e:
-        print(f'✗ {pkg} - {str(e)}')
-        all_passed = False
-
-# Special check for sentence_transformers - critical for embeddings
-try:
-    import sentence_transformers
-    print(f'✓ sentence_transformers {sentence_transformers.__version__}')
-except ImportError as e:
-    print(f'✗ sentence_transformers - {str(e)}')
-    print('  → This is critical for embeddings functionality')
-    all_passed = False
-except Exception as e:
-    print(f'⚠ sentence_transformers - imports but has issues: {str(e)}')
-    print('  → May have limited functionality')
-
-# Special check for faiss - critical for vector search
-try:
-    import faiss
-    print(f'✓ faiss-cpu')
-except ImportError as e:
-    print(f'✗ faiss-cpu - {str(e)}')
-    print('  → This is critical for vector search functionality')
-    all_passed = False
-except Exception as e:
-    print(f'⚠ faiss-cpu - imports but has issues: {str(e)}')
-    print('  → May have limited functionality')
-
-# Check optional packages
-optional_packages = [
-    ('git', 'dulwich', 'Git support for remote repositories')
-]
-
-print('\\nOptional packages:')
-for pkg_name, import_name, description in optional_packages:
-    try:
-        __import__(import_name)
-        print(f'✓ {pkg_name} ({description})')
-    except ImportError:
-        print(f'○ {pkg_name} - not installed ({description})')
-
-# Special check for torch with GPU support
-try:
-    import torch
-    gpu_available = torch.cuda.is_available() if hasattr(torch, 'cuda') else False
-    mps_available = torch.backends.mps.is_available() if hasattr(torch.backends, 'mps') else False
-    
-    if gpu_available:
-        device_count = torch.cuda.device_count()
-        device_name = torch.cuda.get_device_name(0) if device_count > 0 else 'Unknown'
-        print(f'✓ torch with CUDA support - {device_name} ({device_count} devices)')
-    elif mps_available:
-        print(f'✓ torch with MPS support (Apple Silicon)')
-    else:
-        print(f'✓ torch (CPU only)')
-except ImportError:
-    print('○ torch - not installed')
-except Exception as e:
-    print(f'⚠ torch - imports but has issues: {str(e)}')
-
-sys.exit(0 if all_passed else 1)
-"
-    return $?
+    print_success "All critical dependencies are installed!"
+    return 0
 }
 
 install_deps_in_batches() {
@@ -491,7 +433,8 @@ install_dependencies() {
     if is_already_installed "core_packages" && \
        is_already_installed "sentence_transformers" && \
        is_already_installed "tree_sitter" && \
-       is_already_installed "faiss_cpu"; then
+       is_already_installed "faiss_cpu" && \
+       is_already_installed "faiss_gpu"; then
         print_success "All critical dependencies are already installed. Skipping installation."
         return 0
     fi
@@ -642,39 +585,98 @@ install_dependencies() {
     fi
     
     # Install faiss for vector search if needed
-    if ! is_already_installed "faiss_cpu"; then
+    if ! is_already_installed "faiss_cpu" && ! is_already_installed "faiss_gpu"; then
         current_step=$((current_step + 1))
-        show_progress $total_steps $current_step "Installing faiss for vector search"
+        show_progress $total_steps $current_step "Installing FAISS for vector search"
         
         # First ensure we have a compatible NumPy version (< 2.0)
-        print_status "Installing compatible NumPy for faiss-cpu..."
+        print_status "Installing compatible NumPy for FAISS..."
         "$PYTHON_CMD" -m pip install "numpy<2.0.0" >/dev/null 2>&1 || {
             print_warning "Failed to install compatible NumPy version"
         }
         
-        # Now install faiss-cpu
-        "$PYTHON_CMD" -m pip install -q faiss-cpu >/dev/null 2>&1 || {
-            print_warning "Failed to install faiss-cpu, trying alternative method..."
-            # Try with specific pinned version
-            "$PYTHON_CMD" -m pip install -q "faiss-cpu==1.7.4" >/dev/null 2>&1 || {
-                # Try with known-compatible versions
-                "$PYTHON_CMD" -m pip install -q "numpy==1.24.3" >/dev/null 2>&1 && \
-                "$PYTHON_CMD" -m pip install -q "faiss-cpu==1.7.4" >/dev/null 2>&1 || {
-                    print_error "Failed to install faiss-cpu. Vector search functionality will be limited."
+        # Check if PyTorch with CUDA is available for GPU version
+        CUDA_AVAILABLE=false
+        print_status "Checking for CUDA availability..."
+        if "$PYTHON_CMD" -c "import torch; print(torch.cuda.is_available())" 2>/dev/null | grep -q "True"; then
+            CUDA_AVAILABLE=true
+            print_success "CUDA detected! Will install GPU-enabled FAISS."
+        elif command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
+            # If torch isn't installed, check for CUDA via system
+            CUDA_AVAILABLE=true
+            print_success "CUDA detected via nvcc/cuda directory! Will install GPU-enabled FAISS."
+        else
+            print_status "No CUDA detected, using CPU version of FAISS."
+        fi
+        
+        # Install appropriate FAISS version
+        if [ "$CUDA_AVAILABLE" = true ]; then
+            # Install PyTorch with CUDA first if needed
+            if ! "$PYTHON_CMD" -c "import torch" 2>/dev/null; then
+                print_status "Installing PyTorch with CUDA support first..."
+                "$PYTHON_CMD" -m pip install torch --index-url https://download.pytorch.org/whl/cu118 >/dev/null 2>&1 || {
+                    print_warning "Failed to install PyTorch with CUDA. Will try FAISS-GPU directly."
+                }
+            fi
+            
+            # Install faiss-gpu
+            print_status "Installing FAISS with GPU support..."
+            "$PYTHON_CMD" -m pip install -q faiss-gpu >/dev/null 2>&1 || {
+                print_warning "Failed to install faiss-gpu, trying with specific CUDA version..."
+                # Try with specific pinned version
+                "$PYTHON_CMD" -m pip install -q "faiss-gpu>=1.7.0" >/dev/null 2>&1 || {
+                    print_warning "Failed to install faiss-gpu. Falling back to CPU version."
+                    "$PYTHON_CMD" -m pip install -q faiss-cpu >/dev/null 2>&1 || {
+                        print_error "Failed to install FAISS. Vector search functionality will be limited."
+                    }
                 }
             }
-        }
-        
-        # Verify faiss installation
-        if "$PYTHON_CMD" -c "import faiss" 2>/dev/null; then
-            print_success "Successfully installed faiss-cpu"
-            mark_as_installed "faiss_cpu"
+            
+            # Verify GPU FAISS installation
+            if "$PYTHON_CMD" -c "import faiss; print(hasattr(faiss, 'get_num_gpus') and faiss.get_num_gpus() > 0)" 2>/dev/null | grep -q "True"; then
+                print_success "Successfully installed FAISS with GPU support!"
+                DETECTED_GPUS=$("$PYTHON_CMD" -c "import faiss; print(faiss.get_num_gpus())" 2>/dev/null)
+                print_status "Detected $DETECTED_GPUS GPUs for FAISS acceleration"
+                mark_as_installed "faiss_gpu"
+            elif "$PYTHON_CMD" -c "import faiss" 2>/dev/null; then
+                print_warning "FAISS installed but GPU support not detected. Using CPU version."
+                mark_as_installed "faiss_cpu"
+            else
+                print_error "Failed to import FAISS after installation. Vector search will be limited."
+            fi
         else
-            print_error "Failed to import faiss after installation. Vector search will be limited."
+            # Now install faiss-cpu
+            print_status "Installing FAISS CPU version..."
+            "$PYTHON_CMD" -m pip install -q faiss-cpu >/dev/null 2>&1 || {
+                print_warning "Failed to install faiss-cpu, trying alternative method..."
+                # Try with specific pinned version
+                "$PYTHON_CMD" -m pip install -q "faiss-cpu==1.7.4" >/dev/null 2>&1 || {
+                    # Try with known-compatible versions
+                    "$PYTHON_CMD" -m pip install -q "numpy==1.24.3" >/dev/null 2>&1 && \
+                    "$PYTHON_CMD" -m pip install -q "faiss-cpu==1.7.4" >/dev/null 2>&1 || {
+                        print_error "Failed to install faiss-cpu. Vector search functionality will be limited."
+                    }
+                }
+            }
+            
+            # Verify faiss installation
+            if "$PYTHON_CMD" -c "import faiss" 2>/dev/null; then
+                print_success "Successfully installed FAISS CPU version"
+                mark_as_installed "faiss_cpu"
+            else
+                print_error "Failed to import FAISS after installation. Vector search will be limited."
+            fi
         fi
     else
         current_step=$((current_step + 1))
-        show_progress $total_steps $current_step "Faiss already installed"
+        show_progress $total_steps $current_step "FAISS already installed"
+        
+        # Check if it's the GPU version
+        if is_already_installed "faiss_gpu"; then
+            print_status "FAISS with GPU support is already installed"
+        else
+            print_status "FAISS CPU version is already installed"
+        fi
     fi
     
     # Install llama-cpp-python with CUDA support if available
