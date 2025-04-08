@@ -37,6 +37,7 @@ app.add_middleware(
 class RepositoryRequest(BaseModel):
     repo_url: str
     local_path: Optional[str] = None
+    device: Optional[str] = None  # 'cpu', 'cuda', or None for auto-detection
 
 @app.post("/analyze")
 async def analyze_repository(request: RepositoryRequest):
@@ -48,7 +49,7 @@ async def analyze_repository(request: RepositoryRequest):
         output_dir = os.getenv("OUTPUT_DIR", "output")
         check_output_directory(output_dir)
         
-        embedding_store = EmbeddingStore()
+        embedding_store = EmbeddingStore(device=request.device)
         analyzer = RepositoryAnalyzer(repo_path)
         llm_processor = LLMProcessor(embedding_store)
         visualizer = ThreatModelVisualizer()

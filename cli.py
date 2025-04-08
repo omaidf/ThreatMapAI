@@ -152,23 +152,19 @@ def setup_tree_sitter() -> None:
         logger.error(f"Failed to setup tree-sitter: {str(e)}")
         raise CLIError(f"Failed to setup tree-sitter: {str(e)}")
 
-def create_embedding_store(try_load: bool = True) -> Optional[EmbeddingStore]:
+def create_embedding_store(try_load: bool = True, device: Optional[str] = None) -> Optional[EmbeddingStore]:
     """Create and initialize the embedding store.
     
     Args:
         try_load: Whether to try loading existing embeddings
+        device: Device to use ('cpu', 'cuda', or None for auto-detection)
         
     Returns:
         Initialized EmbeddingStore or None if initialization failed
     """
     try:
-        # Set environment variables to prevent multiprocessing issues
-        os.environ["TOKENIZERS_PARALLELISM"] = "false"
-        os.environ["OMP_NUM_THREADS"] = "1"
-        os.environ["MKL_NUM_THREADS"] = "1"
-        
-        # Initialize the embedding store
-        embedding_store = EmbeddingStore()
+        # Initialize the embedding store with specified device
+        embedding_store = EmbeddingStore(device=device)
         
         if try_load:
             # Check if embeddings already exist before trying to load
@@ -224,7 +220,9 @@ def cli():
     pass
 
 @cli.command()
-def init():
+@click.option('--device', type=click.Choice(['auto', 'cpu', 'cuda']), default='auto',
+              help='Device to use for embeddings (auto, cpu, cuda)')
+def init(device: str):
     """Initialize the framework."""
     try:
         # Setup tree-sitter grammars
@@ -240,8 +238,13 @@ def init():
         # Create embedding store
         success_msg("Initializing embedding store...")
         try:
-            embedding_store = create_embedding_store(try_load=True)
-            success_msg("Embedding store initialized")
+            # Convert 'auto' to None for auto-detection
+            device_param = None if device == 'auto' else device
+            embedding_store = create_embedding_store(try_load=True, device=device_param)
+            if embedding_store and embedding_store.gpu_available and device_param != 'cpu':
+                success_msg(f"Embedding store initialized using {embedding_store.device}")
+            else:
+                success_msg("Embedding store initialized using CPU")
         except Exception as e:
             warning_msg(f"Failed to initialize embedding store: {str(e)}")
             warning_msg("Embedding store functionality will be limited")
@@ -387,8 +390,10 @@ def clean_previous_run(output_dir: str, force_clean: bool = False, clear_embeddi
 @click.option('--clean', is_flag=True, help='Clean previous run data before analysis')
 @click.option('--clear-embeddings', is_flag=True, help='Clear embedding store from previous runs')
 @click.option('--reuse-embeddings', is_flag=True, help='Reuse existing embeddings without asking')
+@click.option('--device', type=click.Choice(['auto', 'cpu', 'cuda']), default='auto',
+              help='Device to use for embeddings (auto, cpu, cuda)')
 def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, clean: bool, 
-           clear_embeddings: bool, reuse_embeddings: bool):
+           clear_embeddings: bool, reuse_embeddings: bool, device: str):
     """Analyze a repository for security threats."""
     analyzer = None
     embedding_store = None
@@ -485,14 +490,14 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
             # Initialize embedding store
             if clear_embeddings:
                 # Initialize without loading existing data
-                embedding_store = create_embedding_store(try_load=False)
+                embedding_store = create_embedding_store(try_load=False, device=None if device == 'auto' else device)
                 # Explicitly clear any existing data
                 if embedding_store:
                     embedding_store.clear()
                     info_msg("Cleared existing embeddings")
             else:
                 # Try to load existing embeddings if available
-                embedding_store = create_embedding_store(try_load=use_existing)
+                embedding_store = create_embedding_store(try_load=use_existing, device=None if device == 'auto' else device)
             progress.update(1)
             
             # Initialize the repository analyzer directly, not in a subprocess
@@ -934,6 +939,52 @@ def set_token():
         
     except Exception as e:
         error_msg(f"Error setting token: {str(e)}")
+
+@cli.command()
+def gpu_info():
+    """Show GPU information for embedding and model acceleration."""
+    try:
+        # Check for PyTorch
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu_count = torch.cuda.device_count()
+                success_msg(f"PyTorch detected {gpu_count} CUDA-capable GPU(s)")
+                
+                for i in range(gpu_count):
+                    device_props = torch.cuda.get_device_properties(i)
+                    gpu_name = device_props.name
+                    gpu_memory = device_props.total_memory / (1024**3)  # Convert to GB
+                    info_msg(f"  GPU {i}: {gpu_name} with {gpu_memory:.2f} GB memory")
+                    
+                # Test for sentence-transformers
+                try:
+                    from sentence_transformers import SentenceTransformer
+                    info_msg("Testing small model load on CUDA...")
+                    model = SentenceTransformer('paraphrase-MiniLM-L3-v2', device='cuda')
+                    success_msg("✅ Successfully loaded embedding model on GPU")
+                    # Test embedding
+                    embedding = model.encode(["This is a test sentence"])
+                    success_msg(f"✅ Generated embedding vector with shape: {embedding.shape}")
+                except Exception as e:
+                    warning_msg(f"Failed to load embedding model on GPU: {str(e)}")
+            else:
+                info_msg("No CUDA-capable GPUs detected by PyTorch")
+        except ImportError:
+            warning_msg("PyTorch not installed. Cannot check GPU availability.")
+            
+        # Check for FAISS
+        try:
+            import faiss
+            if hasattr(faiss, 'get_num_gpus') and faiss.get_num_gpus() > 0:
+                success_msg(f"FAISS detected {faiss.get_num_gpus()} GPUs")
+            else:
+                info_msg("FAISS does not detect any GPUs or is using CPU version")
+        except ImportError:
+            warning_msg("FAISS not installed. Cannot check FAISS GPU support.")
+            
+    except Exception as e:
+        error_msg(f"Error checking GPU information: {str(e)}")
 
 def main():
     """Main entry point for the CLI."""

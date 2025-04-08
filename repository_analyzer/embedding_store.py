@@ -8,10 +8,11 @@ code embeddings for semantic search and similarity analysis.
 import os
 import logging
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 import json
 import faiss
 import numpy as np
+import argparse
 
 # Import utility modules
 from utils.common import success_msg, error_msg, warning_msg, info_msg
@@ -24,6 +25,27 @@ class EmbeddingStoreError(Exception):
     """Custom exception for embedding store errors."""
     pass
 
+def detect_gpu() -> Tuple[bool, Optional[int]]:
+    """
+    Detect if GPU is available and return its memory in GB.
+    
+    Returns:
+        Tuple of (is_gpu_available, gpu_memory_gb)
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            if gpu_count > 0:
+                # Get memory of first GPU in GB
+                gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                info_msg(f"Detected GPU with {gpu_memory:.2f} GB memory")
+                return True, gpu_memory
+    except Exception as e:
+        warning_msg(f"Error detecting GPU: {str(e)}")
+    
+    return False, None
+
 class EmbeddingStore:
     """
     Store and retrieve code embeddings for semantic search.
@@ -34,8 +56,13 @@ class EmbeddingStore:
     - Semantic search for related code
     """
     
-    def __init__(self):
-        """Initialize the embedding store."""
+    def __init__(self, device: Optional[str] = None):
+        """
+        Initialize the embedding store.
+        
+        Args:
+            device: Force device to use ('cpu', 'cuda', or None for auto-detection)
+        """
         self.output_dir = Path(get_env_variable("OUTPUT_DIR", "output"))
         check_output_directory(str(self.output_dir))
         self.index_path = self.output_dir / "embeddings.index"
@@ -45,20 +72,39 @@ class EmbeddingStore:
         self.index = None
         self.file_mapping = []  # Changed from dictionary to list for consistency
         
-        # Set environment variables to disable all parallelism
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
-        os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Disable parallelism warnings
-        os.environ["OMP_NUM_THREADS"] = "1"  # Limit OpenMP threads
-        os.environ["MKL_NUM_THREADS"] = "1"  # Limit MKL threads
+        # Auto-detect GPU if device not specified
+        gpu_available, gpu_memory = detect_gpu()
+        self.gpu_available = gpu_available
         
-        # Try to disable multiprocessing in torch
-        try:
-            import torch
-            torch.set_num_threads(1)  # Use only one thread
-            if hasattr(torch, 'set_num_interop_threads'):
-                torch.set_num_interop_threads(1)
-        except:
-            pass
+        # Determine device to use (user choice, auto-detect, or fallback)
+        if device is not None:
+            # User explicitly specified device
+            self.device = device
+            if device == 'cuda' and not gpu_available:
+                warning_msg("Requested CUDA but GPU not available, falling back to CPU")
+                self.device = 'cpu'
+        else:
+            # Auto-detect: use GPU if available and has sufficient memory (>2GB)
+            self.device = 'cuda' if gpu_available and gpu_memory and gpu_memory > 2 else 'cpu'
+        
+        info_msg(f"Using device: {self.device}")
+        
+        # Configure resources based on device
+        if self.device == 'cpu':
+            # Set environment variables to disable all parallelism
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+            os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Disable parallelism warnings
+            os.environ["OMP_NUM_THREADS"] = "1"  # Limit OpenMP threads
+            os.environ["MKL_NUM_THREADS"] = "1"  # Limit MKL threads
+            
+            # Try to disable multiprocessing in torch
+            try:
+                import torch
+                torch.set_num_threads(1)  # Use only one thread
+                if hasattr(torch, 'set_num_interop_threads'):
+                    torch.set_num_interop_threads(1)
+            except:
+                pass
         
         # Initialize the embedding model
         try:
@@ -66,33 +112,37 @@ class EmbeddingStore:
             from sentence_transformers import SentenceTransformer
             import sentence_transformers.util
             
-            # PATCH: Override the batch encoding utility to force sequential processing
-            original_batch_to_device = sentence_transformers.util.batch_to_device
-            def patched_batch_to_device(batch, target_device, cpu_pin_memory=False):
-                # Process sequentially, never use multiple processes
-                return original_batch_to_device(batch, target_device, cpu_pin_memory)
-            sentence_transformers.util.batch_to_device = patched_batch_to_device
+            if self.device == 'cpu':
+                # CPU-specific optimizations
+                # PATCH: Override the batch encoding utility to force sequential processing
+                original_batch_to_device = sentence_transformers.util.batch_to_device
+                def patched_batch_to_device(batch, target_device, cpu_pin_memory=False):
+                    # Process sequentially, never use multiple processes
+                    return original_batch_to_device(batch, target_device, cpu_pin_memory)
+                sentence_transformers.util.batch_to_device = patched_batch_to_device
             
             # Use a smaller model for embeddings to avoid memory issues
             model_name = 'all-MiniLM-L6-v2'  # This is a small, efficient model (384 dimensions)
             
             try:
-                # Standard loading method with explicit CPU device
-                self.model = SentenceTransformer(model_name, device="cpu")
-                # Disable multithreading in model
-                if hasattr(self.model, 'max_seq_length'):
+                # Load model with selected device
+                self.model = SentenceTransformer(model_name, device=self.device)
+                
+                # Configure model based on device
+                if self.device == 'cpu' and hasattr(self.model, 'max_seq_length'):
                     self.model.max_seq_length = min(self.model.max_seq_length, 256)  # Limit sequence length
+                
                 self.vector_size = self.model.get_sentence_embedding_dimension()
-                info_msg(f"Embedding model initialized with dimension {self.vector_size}")
+                info_msg(f"Embedding model initialized with dimension {self.vector_size} on {self.device}")
             except Exception as model_e:
                 # Fallback to a simpler model
                 warning_msg(f"Failed to load {model_name}: {str(model_e)}, trying alternative model")
                 try:
-                    self.model = SentenceTransformer('paraphrase-MiniLM-L3-v2', device="cpu")
-                    if hasattr(self.model, 'max_seq_length'):
+                    self.model = SentenceTransformer('paraphrase-MiniLM-L3-v2', device=self.device)
+                    if self.device == 'cpu' and hasattr(self.model, 'max_seq_length'):
                         self.model.max_seq_length = min(self.model.max_seq_length, 256)  # Limit sequence length
                     self.vector_size = self.model.get_sentence_embedding_dimension()
-                    info_msg(f"Loaded fallback embedding model with dimension {self.vector_size}")
+                    info_msg(f"Loaded fallback embedding model with dimension {self.vector_size} on {self.device}")
                 except Exception as e2:
                     # Create a dummy embedding model that returns zeros
                     warning_msg(f"Failed to load embedding model: {str(e2)}")
@@ -170,7 +220,7 @@ class EmbeddingStore:
             # Re-initialize the embedding model and index
             try:
                 from sentence_transformers import SentenceTransformer
-                self.model = SentenceTransformer('all-MiniLM-L6-v2')
+                self.model = SentenceTransformer('all-MiniLM-L6-v2', device=self.device)
                 self.vector_size = self.model.get_sentence_embedding_dimension()
             except Exception as e:
                 logger.warning(f"Failed to initialize SentenceTransformer: {str(e)}")
@@ -204,27 +254,38 @@ class EmbeddingStore:
             return np.zeros((len(texts), self.vector_size), dtype=np.float32)
         else:
             try:
-                # Force sequential processing - do NOT batch process
-                all_embeddings = []
-                
-                # Process each text individually to avoid multiprocessing
-                for text in texts:
-                    # Set show_progress_bar to False to avoid tqdm which can sometimes use semaphores
-                    # Set convert_to_tensor to False to avoid torch multiprocessing
-                    # Set normalize_embeddings to False for speed (we normalize manually later)
-                    single_embedding = self.model.encode(
-                        [text], 
+                if self.device == 'cpu':
+                    # Force sequential processing - do NOT batch process on CPU
+                    all_embeddings = []
+                    
+                    # Process each text individually to avoid multiprocessing
+                    for text in texts:
+                        # Set show_progress_bar to False to avoid tqdm which can sometimes use semaphores
+                        # Set convert_to_tensor to False to avoid torch multiprocessing
+                        # Set normalize_embeddings to False for speed (we normalize manually later)
+                        single_embedding = self.model.encode(
+                            [text], 
+                            show_progress_bar=False,
+                            convert_to_tensor=False,
+                            normalize_embeddings=False,
+                            batch_size=1  # Force batch size of 1
+                        )
+                        
+                        # Only keep the first embedding (there's only one anyway)
+                        all_embeddings.append(single_embedding[0])
+                    
+                    # Stack all embeddings
+                    result = np.vstack(all_embeddings)
+                else:
+                    # Use GPU acceleration with batch processing
+                    # Still disable progress bar to avoid tqdm issues
+                    result = self.model.encode(
+                        texts,
                         show_progress_bar=False,
                         convert_to_tensor=False,
                         normalize_embeddings=False,
-                        batch_size=1  # Force batch size of 1
+                        batch_size=32  # Larger batch size for GPU
                     )
-                    
-                    # Only keep the first embedding (there's only one anyway)
-                    all_embeddings.append(single_embedding[0])
-                
-                # Stack all embeddings
-                result = np.vstack(all_embeddings)
                 
                 # Normalize manually if needed (L2 normalization)
                 norms = np.linalg.norm(result, axis=1, keepdims=True)
@@ -682,4 +743,50 @@ class EmbeddingStore:
             
             # Try to clean up any partial work
             import gc
-            gc.collect() 
+            gc.collect()
+
+def add_cli_args(parser: argparse.ArgumentParser) -> None:
+    """
+    Add embedding store CLI arguments to parser.
+    
+    Args:
+        parser: ArgumentParser to add arguments to
+    """
+    group = parser.add_argument_group('Embedding Store Options')
+    group.add_argument(
+        '--device', 
+        type=str, 
+        choices=['auto', 'cpu', 'cuda'], 
+        default='auto',
+        help='Device to use for embedding calculations (auto, cpu, cuda)'
+    )
+
+def get_embedding_store_from_args(args: argparse.Namespace) -> EmbeddingStore:
+    """
+    Create EmbeddingStore from CLI arguments.
+    
+    Args:
+        args: Parsed CLI arguments
+        
+    Returns:
+        Configured EmbeddingStore instance
+    """
+    # Convert 'auto' to None for auto-detection
+    device = None if args.device == 'auto' else args.device
+    return EmbeddingStore(device=device)
+
+if __name__ == "__main__":
+    # Simple CLI for testing embedding store
+    parser = argparse.ArgumentParser(description="Embedding Store CLI")
+    add_cli_args(parser)
+    args = parser.parse_args()
+    
+    # Initialize embedding store
+    store = get_embedding_store_from_args(args)
+    
+    # Load existing embeddings
+    store.load()
+    
+    # Some basic info
+    print(f"Device: {store.device}")
+    print(f"Index size: {store.index.ntotal if store.index else 0} embeddings") 
