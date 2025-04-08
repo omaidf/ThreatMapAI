@@ -667,10 +667,32 @@ def clean_previous_run(output_dir: str, force_clean: bool = False, clear_embeddi
     # Clean embedding store if requested
     if clear_embeddings and found_embeddings:
         try:
+            # Import required modules explicitly
+            import sys
+            import json
+            import faiss
+            from pathlib import Path
+            
+            # Check if Python is shutting down
+            if sys is None or sys.meta_path is None:
+                info_msg("Skipping embedding store clearing during Python shutdown")
+                return
+                
             # Initialize and clear the embedding store
             info_msg("Clearing embedding store contents...")
             embedding_store = create_embedding_store(try_load=False)  # Don't load existing data
             if embedding_store:
+                # First manually delete the embedding files to avoid issues
+                for emb_file in embedding_files:
+                    file_path = output_path / emb_file
+                    if file_path.exists():
+                        try:
+                            file_path.unlink()
+                            info_msg(f"Deleted {emb_file}")
+                        except Exception as file_error:
+                            warning_msg(f"Failed to delete {emb_file}: {str(file_error)}")
+                
+                # Then clear the store's internal state
                 embedding_store.clear()
                 success_msg("Embedding store cleared successfully")
         except Exception as e:
@@ -1088,9 +1110,22 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
         if embedding_store:
             # Save state before cleanup
             try:
-                embedding_store.save()
-            except:
-                pass
+                # Check if Python is shutting down
+                import sys
+                if sys is None or sys.meta_path is None:
+                    info_msg("Skipping save during Python shutdown")
+                else:
+                    # Explicitly import required libraries to ensure they're available
+                    import os
+                    import json
+                    import faiss
+                    from pathlib import Path
+                    info_msg("Saving embedding store state...")
+                    embedding_store.save()
+                    info_msg("Embedding store saved successfully")
+            except Exception as save_error:
+                warning_msg(f"Failed to save embedding store: {str(save_error)}")
+            # Set to None to release reference
             embedding_store = None
             
         # Clean up analyzer
@@ -1118,9 +1153,22 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
         # Final cleanup of resources
         if embedding_store:
             try:
-                embedding_store.save()
-            except:
-                pass
+                # Check if Python is shutting down
+                import sys
+                if sys is None or sys.meta_path is None:
+                    info_msg("Skipping final save during Python shutdown")
+                else:
+                    # Explicitly import required libraries to ensure they're available
+                    import os
+                    import json
+                    import faiss
+                    from pathlib import Path
+                    info_msg("Saving final embedding store state...")
+                    embedding_store.save()
+                    info_msg("Final embedding store save completed")
+            except Exception as save_error:
+                warning_msg(f"Failed to save embedding store during cleanup: {str(save_error)}")
+            # Set to None to release reference
             embedding_store = None
             
         if analyzer:

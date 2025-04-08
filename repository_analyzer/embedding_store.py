@@ -277,33 +277,45 @@ class EmbeddingStore:
     def save(self) -> None:
         """Save embeddings to disk."""
         try:
+            # Explicitly import required libraries
+            import os
+            import json
+            import faiss
+            from pathlib import Path
+            
             if self.index is None:
                 warning_msg("No index to save")
                 return
             
             # Ensure the output directory exists
-            check_output_directory(str(self.output_dir))
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Convert paths to strings for safer file operations
+            mapping_path_str = str(self.mapping_path)
+            index_path_str = str(self.index_path)
             
             # Save mapping
-            with open(self.mapping_path, 'w') as f:
+            with open(mapping_path_str, 'w') as f:
                 json.dump(self.file_mapping, f, indent=2)
             
             # If using GPU index, we need to convert back to CPU for saving
             if hasattr(self, 'use_gpu_for_faiss') and self.use_gpu_for_faiss:
                 try:
                     cpu_index = faiss.index_gpu_to_cpu(self.index)
-                    faiss.write_index(cpu_index, str(self.index_path))
+                    faiss.write_index(cpu_index, index_path_str)
                 except Exception as e:
                     warning_msg(f"Failed to convert GPU index to CPU for saving: {str(e)}")
                     warning_msg("Attempting to save index directly")
-                    faiss.write_index(self.index, str(self.index_path))
+                    faiss.write_index(self.index, index_path_str)
             else:
                 # Save index directly if it's already a CPU index
-                faiss.write_index(self.index, str(self.index_path))
+                faiss.write_index(self.index, index_path_str)
             
             success_msg(f"Saved {len(self.file_mapping)} embeddings to {self.index_path}")
         except Exception as e:
             error_msg(f"Failed to save embeddings: {str(e)}")
+            # Print a direct message in case logging is not working
+            print(f"Failed to save embeddings: {str(e)}")
     
     def _setup_index(self) -> None:
         """Set up the FAISS index, using GPU if available."""
@@ -406,10 +418,22 @@ class EmbeddingStore:
         embedding infrastructure.
         """
         try:
+            # Check if Python is shutting down
+            import sys
+            if sys is None or sys.meta_path is None:
+                print("Skipping clear during Python shutdown")
+                return
+                
+            # Explicitly import all required modules
+            import os
+            import json
+            import faiss
+            import numpy as np
+            from pathlib import Path
+
             # Reset in-memory data
             self.index = None
             self.file_mapping = []  # Changed from dictionary to list
-            self.total_chunks = 0
             
             # Re-initialize the embedding model if needed
             if not hasattr(self, 'model') or self.model is None:
@@ -442,14 +466,26 @@ class EmbeddingStore:
             # Save empty state if we have a valid index
             if self.index is not None:
                 try:
+                    # Delete any existing embedding files first
+                    index_path = self.output_dir / "embeddings.index"
+                    mapping_path = self.output_dir / "embeddings_mapping.json"
+                    
+                    if index_path.exists():
+                        index_path.unlink()
+                    if mapping_path.exists():
+                        mapping_path.unlink()
+                        
+                    # Now save empty index
                     self.save()
                 except Exception as save_e:
                     warning_msg(f"Failed to save empty index: {str(save_e)}")
             
-            logger.info("Embedding store cleared successfully")
+            info_msg("Embedding store cleared successfully")
         except Exception as e:
             logger.error(f"Failed to clear embedding store: {str(e)}")
-            raise EmbeddingStoreError(f"Failed to clear embedding store: {str(e)}")
+            warning_msg(f"Error during clear: {str(e)}")
+            # Don't raise exception to avoid crashes
+            pass
     
     def _encode_text(self, texts: List[str]) -> np.ndarray:
         """
@@ -887,12 +923,22 @@ class EmbeddingStore:
     def __del__(self):
         """Cleanup resources when the object is deleted."""
         try:
-            # Save any pending changes
+            # Check if Python is shutting down
+            import sys
+            if sys is None or sys.meta_path is None:
+                # Python is shutting down, don't try to save
+                print("Skipping save during Python shutdown")
+                return
+                
+            # Save any pending changes - only if Python is not shutting down
             if hasattr(self, 'index') and self.index is not None and hasattr(self, 'file_mapping'):
                 try:
+                    import os  # Explicitly import what we need
+                    import json
+                    import faiss
                     self.save()
-                except:
-                    pass
+                except Exception as save_error:
+                    print(f"Failed to save embeddings during cleanup: {save_error}")
                     
             # Clean up model resources
             if hasattr(self, 'model') and self.model is not None:
