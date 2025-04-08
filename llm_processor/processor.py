@@ -917,8 +917,9 @@ Pay special attention to:
                         file_list.append(api_file)
                 
                 # Add remaining files from the embedding store
-                for file_path, data in self.embedding_store.file_mapping.items():
-                    if file_path not in file_list:
+                for info in self.embedding_store.file_mapping:  # Changed from dict.items() to list iteration
+                    file_path = info.get("file_path", "")
+                    if file_path and file_path not in file_list:
                         file_list.append(file_path)
                 
                 logger.info(f"Using all {len(file_list)} files for architecture analysis with 100K context window")

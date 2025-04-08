@@ -502,7 +502,7 @@ class EmbeddingStore:
             
             # Get unique file paths and their metadata
             files_metadata = {}
-            for info in self.file_mapping:  # Changed from iterating over dict items to list items
+            for info in self.file_mapping:  # This is correct - iterating over list items
                 path = info.get("file_path", "")
                 if not path or path in files_metadata:
                     continue
