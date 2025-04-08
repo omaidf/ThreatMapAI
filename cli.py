@@ -170,6 +170,9 @@ def create_embedding_store(try_load: bool = True, device: Optional[str] = None, 
         try:
             import torch
             cuda_available = torch.cuda.is_available()
+            if cuda_available:
+                gpu_count = torch.cuda.device_count()
+                info_msg(f"Detected {gpu_count} GPU(s) for embedding generation")
         except ImportError:
             # If torch isn't available, we'll default to CPU anyway
             pass
@@ -177,6 +180,57 @@ def create_embedding_store(try_load: bool = True, device: Optional[str] = None, 
         # Only use CPU if explicitly requested or if CUDA isn't available
         use_cpu = (device == 'cpu' or not cuda_available)
         
+        # Check if faiss-gpu is installed when a GPU is available
+        if not use_cpu:
+            try:
+                # Try to import faiss and check if GPU support is available
+                import faiss
+                gpu_supported = hasattr(faiss, 'StandardGpuResources')
+                
+                if not gpu_supported:
+                    info_msg("FAISS GPU support not detected. Installing faiss-gpu...")
+                    try:
+                        # Try to install the right version of faiss-gpu based on CUDA version
+                        try:
+                            # Check CUDA version to install the right package
+                            import torch
+                            cuda_version = torch.version.cuda
+                            
+                            # Get major version for package selection
+                            cuda_major = cuda_version.split('.')[0] if cuda_version else None
+                            
+                            if cuda_major == '11':
+                                package = "faiss-gpu"
+                            elif cuda_major == '12':
+                                package = "faiss-gpu>=1.7.3"  # For CUDA 12 compatibility
+                            else:
+                                package = "faiss-gpu"  # Default
+                                
+                            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+                            success_msg(f"Successfully installed {package} for CUDA {cuda_version}")
+                            
+                            # Reload faiss after installation
+                            import importlib
+                            importlib.reload(sys.modules['faiss'])
+                            gpu_supported = hasattr(faiss, 'StandardGpuResources')
+                        except Exception as cuda_error:
+                            # If we can't determine the CUDA version, just try the general package
+                            warning_msg(f"Could not detect CUDA version: {str(cuda_error)}")
+                            subprocess.check_call([sys.executable, "-m", "pip", "install", "faiss-gpu"])
+                            success_msg("Installed faiss-gpu (default version)")
+                            
+                            # Reload faiss after installation
+                            import importlib
+                            importlib.reload(sys.modules['faiss'])
+                            gpu_supported = hasattr(faiss, 'StandardGpuResources')
+                    except Exception as install_error:
+                        warning_msg(f"Failed to install faiss-gpu: {str(install_error)}")
+                        warning_msg("FAISS will use CPU mode for vector similarity search")
+                        warning_msg("This is not ideal for performance but embedding generation will still use GPU")
+            except ImportError:
+                # If faiss isn't imported at all, we'll install it below
+                pass
+
         # Configure the embedding store
         config = {}
         if not use_cpu:
@@ -216,8 +270,20 @@ def create_embedding_store(try_load: bool = True, device: Optional[str] = None, 
         if "faiss" in str(e):
             error_msg("FAISS is not installed. Installing CPU version...")
             try:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "faiss-cpu"])
-                info_msg("FAISS-CPU installed successfully. Retrying...")
+                # First check if we should install GPU version instead
+                try:
+                    import torch
+                    if torch.cuda.is_available() and not use_cpu:
+                        info_msg("CUDA detected, installing GPU version of FAISS...")
+                        subprocess.check_call([sys.executable, "-m", "pip", "install", "faiss-gpu"])
+                        info_msg("FAISS-GPU installed successfully. Retrying...")
+                    else:
+                        subprocess.check_call([sys.executable, "-m", "pip", "install", "faiss-cpu"])
+                        info_msg("FAISS-CPU installed successfully. Retrying...")
+                except ImportError:
+                    # Torch not available, install CPU version
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "faiss-cpu"])
+                    info_msg("FAISS-CPU installed successfully. Retrying...")
                 return create_embedding_store(try_load, device, gpu_id)
             except Exception as install_error:
                 error_msg(f"Failed to install FAISS: {str(install_error)}")
@@ -245,6 +311,78 @@ def find_diagrams(output_dir: str) -> List[Path]:
 def cli():
     """AI Threat Model Map Generator CLI."""
     pass
+
+def install_faiss_gpu() -> bool:
+    """Install the FAISS-GPU package that matches the system's CUDA version.
+    
+    Returns:
+        True if installation was successful, False otherwise
+    """
+    try:
+        # First check if faiss is already installed with GPU support
+        try:
+            import faiss
+            if hasattr(faiss, 'StandardGpuResources'):
+                # GPU support already available
+                info_msg("FAISS with GPU support is already installed")
+                return True
+        except ImportError:
+            # FAISS not installed at all
+            pass
+        
+        # Check CUDA version to determine which package to install
+        cuda_version = None
+        try:
+            import torch
+            if torch.cuda.is_available():
+                cuda_version = torch.version.cuda
+                info_msg(f"Detected CUDA version: {cuda_version}")
+            else:
+                warning_msg("No CUDA available, cannot install FAISS-GPU")
+                return False
+        except ImportError:
+            warning_msg("PyTorch not installed, cannot detect CUDA version")
+            warning_msg("Installing default FAISS-GPU package")
+        
+        # Select appropriate package based on CUDA version
+        if cuda_version:
+            major_version = cuda_version.split('.')[0]
+            if major_version == '11':
+                package = "faiss-gpu"
+            elif major_version == '12':
+                package = "faiss-gpu>=1.7.3"  # For CUDA 12 compatibility
+            else:
+                package = "faiss-gpu"  # Default
+        else:
+            package = "faiss-gpu"  # Default if can't determine version
+        
+        # Install the package
+        info_msg(f"Installing {package}...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+        success_msg(f"Successfully installed {package}")
+        
+        # Verify installation
+        try:
+            # Force reload of faiss module if it was already imported
+            import importlib
+            if 'faiss' in sys.modules:
+                importlib.reload(sys.modules['faiss'])
+            else:
+                import faiss
+                
+            if hasattr(faiss, 'StandardGpuResources'):
+                success_msg("FAISS GPU support successfully installed")
+                return True
+            else:
+                warning_msg("FAISS installed but GPU support not available")
+                return False
+        except ImportError:
+            warning_msg("Failed to import FAISS after installation")
+            return False
+            
+    except Exception as e:
+        warning_msg(f"Failed to install FAISS-GPU: {str(e)}")
+        return False
 
 @cli.command()
 @click.option('--device', type=click.Choice(['auto', 'cpu', 'cuda']), default='auto',
@@ -317,6 +455,11 @@ def init(device: str, gpu_ids: str):
                         success_msg("Enabling distributed processing for better performance")
                         os.environ["DISTRIBUTED"] = "true"
                         update_env_file("DISTRIBUTED", "true")
+                        
+                        # When detecting multiple GPUs, automatically install FAISS-GPU
+                        if device != 'cpu':  # Skip if user explicitly requested CPU
+                            info_msg("Installing GPU-accelerated libraries for multi-GPU support...")
+                            install_faiss_gpu()
                     else:
                         info_msg("Multi-GPU configuration detected but with limited memory")
                         info_msg("For optimal performance with large models, consider:")
@@ -732,8 +875,20 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
                     device_param = None  # Auto-detect
                 else:
                     device_param = device
+                
+                # Configure embedding store - use first GPU ID for the store itself
+                # The embedding generation will still benefit from GPU acceleration
+                gpu_id_param = selected_gpu_ids[0] if selected_gpu_ids else None
+                
+                # Set up for multi-GPU usage if available
+                if use_distributed and len(selected_gpu_ids) > 1:
+                    info_msg(f"Setting up embedding store with GPU {gpu_id_param} (part of multi-GPU setup)")
+                    # The other GPUs will be used for other parts of the pipeline
+                else:
+                    info_msg(f"Setting up embedding store with GPU {gpu_id_param}")
+                
                 embedding_store = create_embedding_store(try_load=False, device=device_param, 
-                                                         gpu_id=selected_gpu_ids[0] if selected_gpu_ids else None)
+                                                         gpu_id=gpu_id_param)
                 # Explicitly clear any existing data
                 if embedding_store:
                     embedding_store.clear()
@@ -744,8 +899,19 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
                     device_param = None  # Auto-detect
                 else:
                     device_param = device
+                
+                # Configure embedding store - use first GPU ID for the store itself
+                gpu_id_param = selected_gpu_ids[0] if selected_gpu_ids else None
+                
+                # Set up for multi-GPU usage if available
+                if use_distributed and len(selected_gpu_ids) > 1:
+                    info_msg(f"Setting up embedding store with GPU {gpu_id_param} (part of multi-GPU setup)")
+                    # The other GPUs will be used for other parts of the pipeline
+                else:
+                    info_msg(f"Setting up embedding store with GPU {gpu_id_param}" if gpu_id_param is not None else "Setting up embedding store with auto-detected device")
+                
                 embedding_store = create_embedding_store(try_load=use_existing, device=device_param, 
-                                                         gpu_id=selected_gpu_ids[0] if selected_gpu_ids else None)
+                                                         gpu_id=gpu_id_param)
             progress.update(1)
             
             # Initialize the repository analyzer directly, not in a subprocess
@@ -1615,6 +1781,15 @@ def configure_gpu(force_gpu: bool, force_cpu: bool, gpu_ids: str, memory_limit: 
                 os.environ["DISTRIBUTED"] = "true"
                 success_msg("Multi-GPU distributed processing enabled (experimental)")
                 info_msg("This feature requires all selected GPUs to have sufficient memory")
+            
+            # When forcing GPU mode, automatically install FAISS-GPU
+            if cuda_available:
+                info_msg("Installing GPU-accelerated libraries for FAISS...")
+                if install_faiss_gpu():
+                    success_msg("GPU acceleration packages installed successfully")
+                else:
+                    warning_msg("Failed to install GPU acceleration packages")
+                    warning_msg("System will still use GPU for model inference and embedding generation")
             
             success_msg("GPU acceleration FORCED ON for LLM")
             if not gpu_config['use_gpu']:
