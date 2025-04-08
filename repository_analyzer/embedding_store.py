@@ -936,6 +936,7 @@ class EmbeddingStore:
                     import os  # Explicitly import what we need
                     import json
                     import faiss
+                    from pathlib import Path  # Add Path import here
                     self.save()
                 except Exception as save_error:
                     print(f"Failed to save embeddings during cleanup: {save_error}")
