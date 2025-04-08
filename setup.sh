@@ -249,7 +249,7 @@ install_deps_in_batches() {
     if [ ! -f "$req_file" ]; then
         print_warning "Requirements file '$req_file' not found"
         return 1
-    }
+    fi
     
     # Count lines in requirements file
     local total_lines=$(grep -v "^#" "$req_file" | grep -v "^$" | wc -l | tr -d ' ')
