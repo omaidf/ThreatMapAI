@@ -64,7 +64,7 @@ MODEL_REPOS = {
 }
 
 # Default model to use - can be overridden through environment variable
-DEFAULT_MODEL_NAME = os.environ.get("LLM_MODEL", "codellama-70b-instruct.Q5_K_M.gguf")
+DEFAULT_MODEL_NAME = os.environ.get("LLM_MODEL", "codellama-70b-instruct")
 
 def detect_architecture() -> Tuple[str, str]:
     """
