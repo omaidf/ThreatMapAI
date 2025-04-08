@@ -11,8 +11,8 @@ import logging
 import subprocess
 import platform
 import json
-import pathlib
-from pathlib import Path
+import pathlib  # Import the pathlib module
+from pathlib import Path  # Import the Path class
 from typing import Optional, Tuple, List
 import click
 import threading
@@ -673,7 +673,8 @@ def clean_previous_run(output_dir: str, force_clean: bool = False, clear_embeddi
             import sys
             import json
             import faiss
-            from pathlib import Path
+            import pathlib  # Add pathlib module
+            from pathlib import Path  # Import Path class
             
             # Check if Python is shutting down
             if sys is None or sys.meta_path is None:
@@ -896,7 +897,8 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
                     import os
                     import json
                     import faiss
-                    from pathlib import Path
+                    import pathlib  # Add pathlib import
+                    from pathlib import Path  # Make sure Path class is available
                     info_msg("Saving final embedding store state...")
                     embedding_store.save()
                     info_msg("Final embedding store save completed")
@@ -918,6 +920,8 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
 def report(output_dir: str):
     """Generate a comprehensive security report from analysis results."""
     import webbrowser
+    import pathlib  # Add pathlib import
+    from pathlib import Path  # Import Path explicitly 
     from visualizer.visualizer import ThreatModelVisualizer
     
     try:
@@ -950,6 +954,8 @@ def report(output_dir: str):
 def visualize(output_dir: str):
     """Generate visualizations from analysis results."""
     from tqdm import tqdm
+    import pathlib  # Add pathlib module
+    from pathlib import Path  # Import Path class
     from visualizer.visualizer import ThreatModelVisualizer
     
     try:
