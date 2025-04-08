@@ -45,6 +45,12 @@ matplotlib>=3.7.0
 networkx>=2.8.0
 graphviz>=0.20.0 
 
+# For large models with extended context (100K tokens)
+llama-cpp-python-cuda>=0.2.0     # GPU-accelerated LLM inference
+psutil>=5.9.0                    # Memory monitoring
+flash-attn>=2.3.0                # Optional: Faster attention mechanism for large contexts
+einops>=0.6.1                    # For tensor operations with large models
+
 # Optional dependencies
 # Uncomment to install:
 
