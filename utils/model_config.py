@@ -222,11 +222,12 @@ def set_default_model(model_name: str) -> bool:
     logger.info(f"Default model set to: {model_name}")
     return True
 
-def download_model(model_name: str = None, variant: str = None, force: bool = False) -> str:
+def download_model(model_path: str = None, model_name: str = None, variant: str = None, force: bool = False) -> str:
     """
     Download the specified model if it doesn't exist locally.
     
     Args:
+        model_path: Path to save the model to
         model_name: Name of the model (default is DEFAULT_MODEL_NAME)
         variant: Specific variant to download (default is determined by architecture)
         force: Force download even if the file exists
@@ -237,17 +238,29 @@ def download_model(model_name: str = None, variant: str = None, force: bool = Fa
     # Check if MODEL_PATH is explicitly set
     env_model_path = os.environ.get("MODEL_PATH", "")
     
+    # If model_path isn't provided, use environment or default
+    if not model_path:
+        model_path = env_model_path
+    
+    # Try to determine model name from the path if not provided
+    if not model_name and model_path:
+        if "70b" in model_path.lower():
+            model_name = "codellama-70b-instruct"
+        elif "7b" in model_path.lower():
+            model_name = "codellama-7b-instruct"
+    
     # Get model info - using environment model path to help determine the model
     model_info = get_model_info(model_name, variant)
+    
+    # Log which model is being used
+    logger.info(f"Using model configuration: {model_info['name']} ({model_info['variant']})")
     
     # Build paths
     models_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
     os.makedirs(models_dir, exist_ok=True)
     
-    # If MODEL_PATH is set, use that path directly
-    if env_model_path and os.path.dirname(env_model_path):
-        model_path = env_model_path
-    else:
+    # If model_path is already set, use it, otherwise build from models dir and filename
+    if not model_path:
         model_path = os.path.join(models_dir, model_info["filename"])
     
     # Check if model exists

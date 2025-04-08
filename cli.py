@@ -430,7 +430,7 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
         if not Path(model_path).exists():
             logger.warning(f"CodeLlama model not found at {model_path}")
             if click.confirm("Model not found. Would you like to download it now?"):
-                download_model(model_path)
+                download_model(model_path=model_path, force=True)
             else:
                 error_msg("Model must be downloaded before analysis.")
                 return
@@ -761,7 +761,7 @@ def download_model_cmd(force: bool):
         model_path = get_default_model_path()
         
         # Download the model using huggingface_hub
-        downloaded_path = download_model(model_path, force)
+        downloaded_path = download_model(model_path=model_path, force=force)
         
         success_msg(f"Model downloaded successfully to {downloaded_path}")
         info_msg("You can now run `python -m cli analyze` to analyze a repository")
@@ -807,7 +807,7 @@ def select_model(model_name: str, list_models: bool, variant: str, download: boo
             # Download if requested
             if download:
                 info_msg(f"Downloading {model_name}...")
-                download_model(model_path, force=False)
+                download_model(model_path=model_path, model_name=model_name)
             else:
                 info_msg(f"To download this model, run: python -m cli download_model_cmd")
         else:
@@ -842,6 +842,11 @@ def check_model():
         # Identify expected model path
         model_path = get_default_model_path()
         
+        # Identify model type from env or config 
+        from utils.model_config import DEFAULT_MODEL_NAME
+        model_name = os.environ.get("LLM_MODEL", DEFAULT_MODEL_NAME)
+        info_msg(f"Current configured model: {model_name}")
+
         # Check if the model file exists
         env_model_path = get_env_variable("MODEL_PATH")
         
@@ -862,16 +867,33 @@ def check_model():
         if exists:
             info_msg(f"Model found at: {model_path}")
             
-            if file_size_gb < 1.0:
+            # Size expectations based on model type
+            min_size_gb = 1.0
+            if "70b" in model_path.lower() or "70b" in model_name.lower():
+                min_size_gb = 30.0  # 70B models should be at least 30GB
+                
+            if file_size_gb < min_size_gb:
                 warning_msg(f"Model file size is only {file_size_gb:.2f} GB, which seems too small")
-                if click.confirm("Would you like to re-download the model?", default=True):
-                    download_model(model_path, force=True)
+                if "70b" in model_path.lower() and file_size_gb < 30.0:
+                    warning_msg("This appears to be a 7B model file mistakenly named as a 70B model.")
+                
+                if click.confirm("Would you like to re-download the correct model?", default=True):
+                    download_model(model_path=model_path, model_name=model_name, force=True)
             else:
                 success_msg(f"Model file size looks good: {file_size_gb:.2f} GB")
         else:
             warning_msg(f"Model not found at: {model_path}")
             if click.confirm("Would you like to download the model now?", default=True):
-                download_model(model_path)
+                # Important to pass the model name to ensure right model
+                from utils.model_config import get_model_info
+                model_info = get_model_info(model_name)
+                
+                # Show user which model will be downloaded
+                info_msg(f"Preparing to download {model_info['name']} ({model_info['variant']})")
+                info_msg(f"The {model_info['name']} model is approximately {model_info['min_ram_gb']/4:.1f}GB in size.")
+                info_msg(f"This will take some time to download. Please be patient.")
+                
+                download_model(model_path=model_path, model_name=model_name)
             else:
                 error_msg("Model is required for analysis. Please download it before proceeding.")
                 return
@@ -885,7 +907,7 @@ def check_model():
             error_msg(f"Failed to load model")
             warning_msg("You may have a corrupted model file or incompatible hardware.")
             if click.confirm("Would you like to re-download the model?", default=True):
-                download_model(model_path, force=True)
+                download_model(model_path=model_path, model_name=model_name, force=True)
     
     except Exception as e:
         error_msg(f"Error checking model: {str(e)}")

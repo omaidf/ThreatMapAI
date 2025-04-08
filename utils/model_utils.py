@@ -136,8 +136,14 @@ def download_model(model_path: str, force: bool = False) -> str:
             logger.info(f"Model already exists at {model_path} ({file_size_gb:.2f} GB)")
             return model_path
         
-        # Extract model information from the path and get proper config
-        model_name = "codellama-7b-instruct"  # Default
+        # Get model name from the path
+        if "70b" in model_path.lower():
+            model_name = "codellama-70b-instruct"
+        elif "7b" in model_path.lower():
+            model_name = "codellama-7b-instruct"
+        else:
+            model_name = "codellama-7b-instruct"  # Default fallback
+            
         model_variant = None
         
         # Try to determine variant from path
@@ -145,6 +151,8 @@ def download_model(model_path: str, force: bool = False) -> str:
             model_variant = "Q4_0"
         elif "Q4_K_M" in model_path:
             model_variant = "Q4_K_M"
+        elif "Q5_K_M" in model_path:
+            model_variant = "Q5_K_M"
         
         # Get model information from centralized config
         model_info = get_model_info(model_name, model_variant)
