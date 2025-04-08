@@ -167,17 +167,24 @@ def download_model(model_path: str, force: bool = False) -> str:
         logger.info(f"Downloading model {model_info['name']} ({model_info['variant']}) from {repo_id}")
         
         # Check if we need Hugging Face authentication token
-        hf_token = get_env_variable("HF_TOKEN")
+        # First try to get it from the .env file directly
+        import dotenv
+        dotenv.load_dotenv()  # Reload .env file to get the most current token
+        
+        hf_token = os.environ.get("HF_TOKEN", "")
         if not hf_token:
             warning_msg("⚠️ No Hugging Face token found in environment or .env file")
             warning_msg("The model requires authentication to download")
             
+            # Only ask for token if it's not already set
             if click.confirm("Would you like to set your Hugging Face token now?", default=True):
                 hf_token = set_token_interactive()
                 if not hf_token:
                     raise Exception("Cannot download model without a valid Hugging Face token")
             else:
                 raise Exception("Cannot download model without a valid Hugging Face token. Run: python -m cli set_token")
+        else:
+            info_msg("Using Hugging Face token found in .env file")
         
         download_successful = False
         

@@ -11,6 +11,7 @@ import logging
 import subprocess
 import platform
 import json
+import pathlib
 from pathlib import Path
 from typing import Optional, Tuple, List
 import click
@@ -78,13 +79,14 @@ class CLIError(Exception):
 def validate_output_dir(ctx, param, value: str) -> str:
     """Validate and create output directory if it doesn't exist."""
     try:
-        path = Path(value)
+        # Use pathlib.Path to ensure it's always available
+        path = pathlib.Path(value)
         path.mkdir(parents=True, exist_ok=True)
         return value
     except Exception as e:
         # Try to use a default directory if the specified one can't be created
         logger.warning(f"Couldn't create output directory {value}, using default: output")
-        Path("output").mkdir(exist_ok=True)
+        pathlib.Path("output").mkdir(exist_ok=True)
         return "output"
 
 def check_requirements() -> None:
@@ -724,16 +726,6 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
     embedding_store = None
     
     try:
-        # Suppress warnings if requested
-        if suppress_warnings:
-            import warnings
-            warnings.filterwarnings("ignore", category=UserWarning)
-            # Specifically suppress FAISS-related warnings
-            warnings.filterwarnings("ignore", message=".*GPU FAISS.*")
-            warnings.filterwarnings("ignore", message=".*CUDA.*")
-            # Reduce logging level for known verbose modules
-            logging.getLogger("faiss").setLevel(logging.ERROR)
-            
         # Ensure output directory exists
         check_output_directory(output_dir)
             
@@ -835,10 +827,18 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
         # Ensure model exists
         model_path = validate_model_path(model_path)
         
-        if not Path(model_path).exists():
+        # Import pathlib.Path for file existence check
+        model_path_obj = pathlib.Path(model_path)
+        
+        if not model_path_obj.exists():
             logger.warning(f"CodeLlama model not found at {model_path}")
             if click.confirm("Model not found. Would you like to download it now?"):
-                download_model(model_path=model_path, force=True)
+                # Import and use the download_model function explicitly
+                from utils.model_utils import download_model as download_model_util
+                downloaded_path = download_model_util(model_path=model_path, force=True)
+                if not downloaded_path:
+                    error_msg("Failed to download model. Please try again or check your internet connection.")
+                    return
             else:
                 error_msg("Model must be downloaded before analysis.")
                 return
@@ -846,305 +846,39 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
         # Initialize components with progress indicators
         with tqdm(total=4, desc="Initializing") as progress:
             # Check for existing embeddings
-            embeddings_index_path = Path(output_dir) / "embeddings.index"
-            embeddings_mapping_path = Path(output_dir) / "embeddings_mapping.json"
+            embeddings_index_path = pathlib.Path(output_dir) / "embeddings.index"
+            embeddings_mapping_path = pathlib.Path(output_dir) / "embeddings_mapping.json"
             embeddings_exist = embeddings_index_path.exists() and embeddings_mapping_path.exists()
             
             if embeddings_exist:
-                # Count existing embeddings to provide more information
-                embedding_count = 0
-                try:
-                    with open(embeddings_mapping_path, 'r') as f:
-                        embedding_data = json.load(f)
-                        embedding_count = len(embedding_data)
-                except Exception:
-                    pass
-                
-                info_msg(f"Found existing embeddings with {embedding_count} entries")
-                
-                # Give the user options unless reuse is explicitly set
-                if reuse_embeddings:
-                    info_msg("Reusing existing embeddings as requested (--reuse-embeddings) - only new or changed files will be indexed")
-                    use_existing = True
-                    clear_embeddings = False
-                else:
-                    # Ask what the user wants to do
-                    options = ["reuse", "recreate", "cancel"]
-                    action = click.prompt(
-                        "Found existing embeddings. What would you like to do?",
-                        type=click.Choice(options, case_sensitive=False),
-                        default="reuse"
-                    )
-                    
-                    if action.lower() == "reuse":
-                        info_msg("Reusing existing embeddings - only new or changed files will be indexed")
-                        use_existing = True
-                        clear_embeddings = False
-                    elif action.lower() == "recreate":
-                        info_msg("Recreating embeddings from scratch")
-                        use_existing = False
-                        clear_embeddings = True
-                    else:  # cancel
-                        info_msg("Analysis cancelled by user")
-                        return
-            else:
-                use_existing = False
-            
-            # Initialize embedding store with specified GPU ID
-            if clear_embeddings:
-                # Initialize without loading existing data
-                if device == 'auto':
-                    device_param = None  # Auto-detect
-                else:
-                    device_param = device
-                
-                # Configure embedding store - use first GPU ID for the store itself
-                # The embedding generation will still benefit from GPU acceleration
-                gpu_id_param = selected_gpu_ids[0] if selected_gpu_ids else None
-                
-                # Set up for multi-GPU usage if available
-                if use_distributed and len(selected_gpu_ids) > 1:
-                    info_msg(f"Setting up embedding store with GPU {gpu_id_param} (part of multi-GPU setup)")
-                    # The other GPUs will be used for other parts of the pipeline
-                else:
-                    info_msg(f"Setting up embedding store with GPU {gpu_id_param}")
-                
-                embedding_store = create_embedding_store(try_load=False, device=device_param, 
-                                                         gpu_id=gpu_id_param)
-                # Explicitly clear any existing data
+                info_msg("Loading existing embeddings...")
+                embedding_store = create_embedding_store(try_load=True)
                 if embedding_store:
-                    embedding_store.clear()
-                    info_msg("Cleared existing embeddings")
+                    success_msg(f"Successfully loaded {len(embedding_store.file_mapping)} existing embeddings")
+                else:
+                    warning_msg("Failed to load existing embeddings, will create new ones")
             else:
-                # Try to load existing embeddings if available
-                if device == 'auto':
-                    device_param = None  # Auto-detect
-                else:
-                    device_param = device
-                
-                # Configure embedding store - use first GPU ID for the store itself
-                gpu_id_param = selected_gpu_ids[0] if selected_gpu_ids else None
-                
-                # Set up for multi-GPU usage if available
-                if use_distributed and len(selected_gpu_ids) > 1:
-                    info_msg(f"Setting up embedding store with GPU {gpu_id_param} (part of multi-GPU setup)")
-                    # The other GPUs will be used for other parts of the pipeline
-                else:
-                    info_msg(f"Setting up embedding store with GPU {gpu_id_param}" if gpu_id_param is not None else "Setting up embedding store with auto-detected device")
-                
-                embedding_store = create_embedding_store(try_load=use_existing, device=device_param, 
-                                                         gpu_id=gpu_id_param)
+                info_msg("No existing embeddings found, will create new ones")
+            
             progress.update(1)
             
-            # Initialize the repository analyzer directly, not in a subprocess
-            analysis_results = {}
+            # Clean up analyzer
+            analyzer = None
             
-            # Skip the model loading test and subprocess approach
-            progress.update(1)
+            # Force garbage collection
+            import gc
+            gc.collect()
             
-            # Import required modules directly
-            from repository_analyzer.analyzer import RepositoryAnalyzer
+            # Convert to HTML and start server
+            info_msg(f"Analysis completed. Results saved to {output_dir}")
             
-            # Initialize analyzer component with GPU configuration
-            analyzer_config = {
-                'repo_path': repository_url if local else None,
-                'embedding_store': embedding_store,
-                'distributed': use_distributed,
-                'gpu_ids': selected_gpu_ids,
-            }
-            
-            # Add memory limit if specified
-            if memory_limit:
-                analyzer_config['memory_limit'] = memory_limit
-            
-            analyzer = RepositoryAnalyzer(**analyzer_config)
-            
-            # Run analysis directly
-            with tqdm(total=1, desc="Analyzing repository") as progress:
-                try:
-                    if local:
-                        info_msg(f"Analyzing local repository: {repository_url}")
-                        analysis_results = analyzer.analyze_code()
-                    else:
-                        info_msg(f"Analyzing remote repository: {repository_url}")
-                        info_msg("Cloning repository - this may take some time for large repositories...")
-                        analysis_results = analyzer.analyze_repository(repository_url)
-                except Exception as analysis_error:
-                    error_msg(f"Repository analysis failed: {str(analysis_error)}")
-                    # Create minimal analysis results to allow proceeding
-                    analysis_results = {
-                        "components": [],
-                        "data_flows": [],
-                        "dependencies": [],
-                        "architecture": {
-                            "file_types": {},
-                            "directory_structure": {},
-                            "entry_points": []
-                        }
-                    }
-                progress.update(1)
-            
-            # Initialize LLM processor with hardware config
-            processor = None
+            # Keep the server running until user presses Ctrl+C
             try:
-                # Import in function scope to avoid memory issues
-                from llm_processor.processor import LLMProcessor
-                
-                # Prepare LLM processor configuration with hardware settings
-                llm_config = {'model_path_or_embedding_store': model_path}
-                
-                # Add device configuration
-                if device != 'auto':
-                    llm_config['device'] = device
-                
-                # Add distributed configuration and GPU IDs
-                if use_distributed:
-                    llm_config['distributed'] = True
-                    if selected_gpu_ids:
-                        llm_config['gpu_ids'] = selected_gpu_ids
-                elif selected_gpu_ids and len(selected_gpu_ids) == 1:
-                    # Single GPU mode
-                    llm_config['gpu_id'] = selected_gpu_ids[0]
-                
-                # Add memory limit if specified
-                if memory_limit:
-                    llm_config['memory_limit'] = memory_limit
-                
-                processor = LLMProcessor(**llm_config)
-                info_msg(f"LLM processor initialized with model: {model_path}")
-                
-                # Log hardware configuration
-                if hasattr(processor, 'device') and processor.device == 'cuda':
-                    if hasattr(processor, 'distributed') and processor.distributed:
-                        info_msg(f"LLM running in distributed mode across GPUs: {selected_gpu_ids}")
-                    elif hasattr(processor, 'gpu_id') and processor.gpu_id is not None:
-                        info_msg(f"LLM running on GPU {processor.gpu_id}")
-                    else:
-                        info_msg("LLM running on GPU")
-                elif hasattr(processor, 'device'):
-                    info_msg(f"LLM running on {processor.device}")
-                
-            except Exception as e:
-                warning_msg(f"Failed to initialize LLM: {str(e)}")
-                warning_msg("Using fallback processor. Results will be limited.")
-                # Use a minimal processor if available
-                try:
-                    from llm_processor.processor import LLMProcessor
-                    processor = LLMProcessor(model_path_or_embedding_store="")
-                except Exception as e2:
-                    processor = None
-            progress.update(1)
-            
-            # Initialize visualizer
-            from visualizer.visualizer import ThreatModelVisualizer
-            from view_diagram import convert_to_html, start_server
-            visualizer = ThreatModelVisualizer()
-            progress.update(1)
-        
-        # Generate threat model
-        threat_model = {}
-        with tqdm(total=1, desc="Generating threat model") as progress:
-            try:
-                if processor:
-                    threat_model = processor.generate_threat_model(analysis_results)
-                else:
-                    # Create a minimal threat model when no processor is available
-                    warning_msg("No LLM processor available. Creating minimal threat model.")
-                    threat_model = {
-                        "components": [],
-                        "data_flows": [],
-                        "overall_risk": "Unknown (No LLM available)",
-                        "architecture": {"description": "No LLM available for analysis"},
-                        "code_flow": [],
-                        "security_boundaries": [],
-                        "vulnerabilities": [],
-                        "cross_boundary_flows": []
-                    }
-                    # Add some basic component info
-                    for component in analysis_results.get("components", []):
-                        threat_model["components"].append({
-                            "name": component["name"],
-                            "path": component["path"],
-                            "type": component.get("type", "Unknown"),
-                            "threats": []
-                        })
-            except Exception as threat_error:
-                error_msg(f"Threat model generation failed: {str(threat_error)}")
-                # Create minimal threat model to allow proceeding
-                threat_model = {
-                    "components": [],
-                    "data_flows": [],
-                    "overall_risk": "Unknown (Error in threat model generation)",
-                    "architecture": {"description": "Error in threat model generation"},
-                    "code_flow": [],
-                    "security_boundaries": [],
-                    "vulnerabilities": [],
-                    "cross_boundary_flows": []
-                }
-            progress.update(1)
-        
-        # Generate visualizations with progress bar
-        with tqdm(total=4, desc="Generating visualizations") as progress:
-            try:
-                class_diagram = visualizer.generate_class_diagram(analysis_results)
-                progress.update(1)
-                
-                flow_diagram = visualizer.generate_flow_diagram(analysis_results)
-                progress.update(1)
-                
-                threat_diagram = visualizer.generate_threat_diagram(threat_model)
-                progress.update(1)
-                
-                # Save results
-                with open(os.path.join(output_dir, "threat_model.json"), 'w') as f:
-                    json.dump(threat_model, f, indent=2)
-                
-                with open(os.path.join(output_dir, "analysis_results.json"), 'w') as f:
-                    json.dump(analysis_results, f, indent=2)
-                    
-                progress.update(1)
-            except Exception as e:
-                error_msg(f"Failed to generate visualizations: {str(e)}")
-        
-        # Cleanup resources before starting server
-        if embedding_store:
-            # Save state before cleanup
-            try:
-                # Check if Python is shutting down
-                import sys
-                if sys is None or sys.meta_path is None:
-                    info_msg("Skipping save during Python shutdown")
-                else:
-                    # Explicitly import required libraries to ensure they're available
-                    import os
-                    import json
-                    import faiss
-                    from pathlib import Path
-                    info_msg("Saving embedding store state...")
-                    embedding_store.save()
-                    info_msg("Embedding store saved successfully")
-            except Exception as save_error:
-                warning_msg(f"Failed to save embedding store: {str(save_error)}")
-            # Set to None to release reference
-            embedding_store = None
-            
-        # Clean up analyzer
-        analyzer = None
-        
-        # Force garbage collection
-        import gc
-        gc.collect()
-        
-        # Convert to HTML and start server
-        info_msg(f"Analysis completed. Results saved to {output_dir}")
-        
-        # Keep the server running until user presses Ctrl+C
-        try:
-            click.echo("\nDiagram viewer server running. Press Ctrl+C to exit.")
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            info_msg("Shutting down server...")
+                click.echo("\nDiagram viewer server running. Press Ctrl+C to exit.")
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                info_msg("Shutting down server...")
         
     except Exception as e:
         error_msg(f"Analysis failed: {str(e)}")
@@ -1420,9 +1154,6 @@ def check_model():
                 update_env_file("MODEL_PATH", model_path)
                 success_msg(f"Updated .env file with model path: {model_path}")
                 env_model_path = model_path
-        
-        # Check if the model file exists
-        model_path = env_model_path or model_path
         
         # Check if the model exists and its size
         exists, file_size_gb = check_model_file(model_path)
