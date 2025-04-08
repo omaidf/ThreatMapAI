@@ -16,7 +16,8 @@ from datetime import datetime
 import tempfile
 
 # Import utility modules
-from utils.common import success_msg, error_msg, warning_msg, info_msg, get_env_variable
+from utils.common import success_msg, error_msg, warning_msg, info_msg
+from utils.env_utils import get_env_variable
 from utils.file_utils import check_output_directory
 
 logger = logging.getLogger(__name__)

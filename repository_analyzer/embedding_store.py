@@ -550,7 +550,11 @@ class EmbeddingStore:
         Returns:
             True if the file is already indexed, False otherwise
         """
-        return any(entry.get("file_path") == file_path for entry in self.file_mapping)
+        # Optimize the check to stop as soon as a match is found
+        for entry in self.file_mapping:
+            if entry.get("file_path") == file_path:
+                return True
+        return False
     
     def _get_all_files(self) -> List[str]:
         """

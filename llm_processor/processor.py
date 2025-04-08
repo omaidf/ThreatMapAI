@@ -18,7 +18,8 @@ from langchain_core.output_parsers import StrOutputParser
 from repository_analyzer.embedding_store import EmbeddingStore
 
 # Import utility modules
-from utils.common import success_msg, error_msg, warning_msg, info_msg, get_env_variable
+from utils.common import success_msg, error_msg, warning_msg, info_msg
+from utils.env_utils import get_env_variable
 from utils.model_utils import download_model, validate_model_path, check_model_file, detect_gpu_capabilities
 from utils.model_config import get_default_model_path
 

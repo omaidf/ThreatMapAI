@@ -927,6 +927,10 @@ class RepositoryAnalyzer:
                 # Skip common directories to ignore
                 if any(i in root for i in ['.git', 'node_modules', '__pycache__', 'venv', '.idea']):
                     continue
+                    
+                # Skip test directories and paths containing 'test'
+                if 'test' in root.lower() or 'tests' in root.lower():
+                    continue
                 
                 # Update directory structure
                 rel_root = os.path.relpath(root, self.repo_path)
@@ -944,6 +948,10 @@ class RepositoryAnalyzer:
                 
                 # Process files
                 for file in files:
+                    # Skip test files
+                    if 'test' in file.lower():
+                        continue
+                        
                     total_files += 1
                     file_path = os.path.join(root, file)
                     rel_path = os.path.relpath(file_path, self.repo_path)
@@ -1088,8 +1096,14 @@ class RepositoryAnalyzer:
             # Index the selected files for RAG
             reused_files = 0
             new_files = 0
+            skipped_test_files = 0
             logger.info(f"Indexing {len(all_files)} files for RAG...")
             for rel_path, file_path, ext in all_files:
+                # Skip test files
+                if 'test' in rel_path.lower():
+                    skipped_test_files += 1
+                    continue
+                    
                 if self.embedding_store and not is_large_repo:
                     try:
                         # Check if this file is already in the embedding store to avoid re-indexing
@@ -1133,6 +1147,9 @@ class RepositoryAnalyzer:
                         
             if reused_files > 0:
                 logger.info(f"Reused {reused_files} files already in embedding store, indexed {new_files} new files")
+            
+            if skipped_test_files > 0:
+                logger.info(f"Skipped {skipped_test_files} test files from RAG indexing")
 
             # Process files in chunks to avoid memory issues
             chunk_size = 100  # Process 100 files at a time
@@ -1151,6 +1168,11 @@ class RepositoryAnalyzer:
                 
                 # Process files in this chunk
                 for rel_path, file_path, ext in chunk:
+                    # Skip test files
+                    if 'test' in rel_path.lower():
+                        skipped_files += 1
+                        continue
+                        
                     # Only try to parse files with supported extensions
                     if ext in supported_extensions:
                         logger.info(f"Parsing: {rel_path}")
