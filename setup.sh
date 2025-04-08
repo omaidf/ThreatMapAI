@@ -353,7 +353,7 @@ install_dependencies() {
         }
     else
         print_warning "requirements.txt not found, skipping batch installation"
-    }
+    fi
     
     # Install critical packages separately to ensure they're installed
     current_step=$((current_step + 1))
