@@ -15,6 +15,52 @@ BATCH_SIZE=5
 PARALLEL_JOBS=2
 PIP_PARALLEL_JOBS=2
 
+# Create a checkpoint file to track installation progress
+CHECKPOINT_FILE=".setup_checkpoints"
+VENV_NAME="venv311"
+
+# Check if a component is already installed
+is_already_installed() {
+    local component=$1
+    
+    # Check if checkpoint file exists and contains the component
+    if [ -f "$CHECKPOINT_FILE" ] && grep -q "^${component}=installed$" "$CHECKPOINT_FILE"; then
+        return 0  # Already installed
+    fi
+    return 1  # Not installed
+}
+
+# Mark a component as installed
+mark_as_installed() {
+    local component=$1
+    
+    # Create checkpoint file if it doesn't exist
+    touch "$CHECKPOINT_FILE"
+    
+    # Add or update the component in the checkpoint file
+    if grep -q "^${component}=" "$CHECKPOINT_FILE"; then
+        # Update existing entry
+        if [[ "$(uname)" == "Darwin" ]]; then
+            # macOS requires different sed syntax
+            sed -i '' -e "s/^${component}=.*/${component}=installed/" "$CHECKPOINT_FILE"
+        else
+            # Linux
+            sed -i -e "s/^${component}=.*/${component}=installed/" "$CHECKPOINT_FILE"
+        fi
+    else
+        # Add new entry
+        echo "${component}=installed" >> "$CHECKPOINT_FILE"
+    fi
+}
+
+# Check if we're in a venv that we created previously
+is_in_our_venv() {
+    if [ -n "$VIRTUAL_ENV" ] && [[ "$VIRTUAL_ENV" == *"$VENV_NAME"* ]]; then
+        return 0  # Yes, we're in our venv
+    fi
+    return 1  # No, we're not in our venv
+}
+
 # Progress bar function
 show_progress() {
     local total=$1
@@ -161,6 +207,32 @@ prompt_for_hf_token() {
 
 verify_installation() {
     print_status "Verifying dependencies..."
+    
+    # First check NumPy version to ensure compatibility with faiss
+    NUMPY_VERSION=$("$PYTHON_CMD" -c "import numpy; print(numpy.__version__)" 2>/dev/null) || {
+        print_error "NumPy is not properly installed"
+        return 1
+    }
+    
+    if [[ "$NUMPY_VERSION" == 2.* ]]; then
+        print_warning "NumPy version $NUMPY_VERSION may cause issues with faiss. Downgrading to 1.x recommended."
+        if click.confirm("Would you like to downgrade NumPy to 1.24.3 for compatibility?", default=True); then
+            "$PYTHON_CMD" -m pip install "numpy==1.24.3" && \
+            print_success "Downgraded NumPy to 1.24.3" || \
+            print_error "Failed to downgrade NumPy"
+        fi
+    else
+        print_success "NumPy version $NUMPY_VERSION is compatible with faiss"
+    fi
+    
+    # Check faiss specifically
+    if ! "$PYTHON_CMD" -c "import faiss" 2>/dev/null; then
+        print_error "faiss-cpu is not properly installed. Trying to fix..."
+        "$PYTHON_CMD" -m pip install "numpy==1.24.3" >/dev/null 2>&1 && \
+        "$PYTHON_CMD" -m pip install "faiss-cpu==1.7.4" >/dev/null 2>&1 && \
+        print_success "Fixed faiss-cpu installation" || \
+        print_error "Failed to fix faiss-cpu installation"
+    fi
     
     # Simpler verification that just tests imports of core packages
     "$PYTHON_CMD" -c "
@@ -408,6 +480,17 @@ setup_cache_dir() {
 }
 
 install_dependencies() {
+    print_status "Checking Python dependencies..."
+    
+    # If all critical components are already installed, we can skip
+    if is_already_installed "core_packages" && \
+       is_already_installed "sentence_transformers" && \
+       is_already_installed "tree_sitter" && \
+       is_already_installed "faiss_cpu"; then
+        print_success "All critical dependencies are already installed. Skipping installation."
+        return 0
+    fi
+    
     print_status "Installing Python dependencies..."
     
     # Set up cache directories
@@ -442,7 +525,7 @@ install_dependencies() {
     
     if [ -f "requirements.txt" ]; then
         print_status "Installing all packages with optimized settings..."
-        "$PYTHON_CMD" -m pip install -q --no-cache-dir --upgrade-strategy only-if-needed -j"$PIP_PARALLEL_JOBS" -r requirements.txt >/dev/null 2>&1 || {
+        "$PYTHON_CMD" -m pip install -q --upgrade-strategy only-if-needed -j"$PIP_PARALLEL_JOBS" -r requirements.txt >/dev/null 2>&1 || {
             print_warning "Optimized installation failed, falling back to batch installation"
             install_deps_in_batches "requirements.txt"
         }
@@ -451,109 +534,170 @@ install_dependencies() {
     fi
     
     # Install critical packages separately to ensure they're installed
-    current_step=$((current_step + 1))
-    show_progress $total_steps $current_step "Installing critical packages"
-    
-    # Split critical packages into groups for parallel installation
-    print_status "Installing critical packages in parallel..."
-    {
-        "$PYTHON_CMD" -m pip install -q --no-cache-dir click python-dotenv colorama tqdm >/dev/null 2>&1 &
-        PID1=$!
+    if ! is_already_installed "core_packages"; then
+        current_step=$((current_step + 1))
+        show_progress $total_steps $current_step "Installing critical packages"
         
-        "$PYTHON_CMD" -m pip install -q --no-cache-dir pydantic huggingface_hub joblib >/dev/null 2>&1 &
-        PID2=$!
-        
-        "$PYTHON_CMD" -m pip install -q --no-cache-dir requests >/dev/null 2>&1 &
-        PID3=$!
-        
-        # Wait for all processes to complete
-        wait $PID1 $PID2 $PID3
-    }
-    
-    # Install LangChain separately (it has interdependencies)
-    "$PYTHON_CMD" -m pip install -q --no-cache-dir langchain langchain-core langchain-community >/dev/null 2>&1 || {
-        print_error "Failed to install critical packages"
-        return 1
-    }
-    
-    # Install sentence-transformers prerequisites in parallel
-    current_step=$((current_step + 1))
-    show_progress $total_steps $current_step "Installing transformers & torch (for sentence-transformers)"
-    {
-        "$PYTHON_CMD" -m pip install -q --no-cache-dir transformers >/dev/null 2>&1 &
-        PID1=$!
-        
-        "$PYTHON_CMD" -m pip install -q --no-cache-dir torch torchvision >/dev/null 2>&1 &
-        PID2=$!
-        
-        # Wait for all processes to complete
-        wait $PID1 $PID2
-    } || {
-        print_warning "Failed to install transformers prerequisites"
-    }
-    
-    # Install sentence-transformers specifically - this is critical for embeddings
-    current_step=$((current_step + 1))
-    show_progress $total_steps $current_step "Installing sentence-transformers"
-    "$PYTHON_CMD" -m pip install -q --no-cache-dir sentence-transformers >/dev/null 2>&1 || {
-        print_warning "Failed to install sentence-transformers. Trying alternative method..."
-        "$PYTHON_CMD" -m pip install -q --no-cache-dir "sentence-transformers>=2.2.2" >/dev/null 2>&1 || {
-            print_error "Failed to install sentence-transformers. Embedding functionality will be limited."
+        # Split critical packages into groups for parallel installation
+        print_status "Installing critical packages in parallel..."
+        {
+            "$PYTHON_CMD" -m pip install -q click python-dotenv colorama tqdm >/dev/null 2>&1 &
+            PID1=$!
+            
+            "$PYTHON_CMD" -m pip install -q pydantic huggingface_hub joblib >/dev/null 2>&1 &
+            PID2=$!
+            
+            "$PYTHON_CMD" -m pip install -q requests >/dev/null 2>&1 &
+            PID3=$!
+            
+            # Wait for all processes to complete
+            wait $PID1 $PID2 $PID3
         }
-    }
-    
-    # Apply fixes for sentence-transformers if needed
-    current_step=$((current_step + 1))
-    show_progress $total_steps $current_step "Fixing sentence-transformers issues"
-    fix_sentence_transformers || {
-        print_warning "Could not fully resolve sentence-transformers issues. Some functionality may be limited."
-    }
-    
-    # Install accelerate for model loading
-    current_step=$((current_step + 1))
-    show_progress $total_steps $current_step "Installing accelerate for model loading"
-    "$PYTHON_CMD" -m pip install -q --no-cache-dir accelerate >/dev/null 2>&1 || {
-        print_warning "Failed to install accelerate. Model loading might encounter issues."
-    }
-    
-    # Install tree-sitter versions specifically
-    current_step=$((current_step + 1))
-    show_progress $total_steps $current_step "Installing tree-sitter"
-    "$PYTHON_CMD" -m pip install -q --no-cache-dir --force-reinstall tree-sitter==0.20.1 tree-sitter-languages==1.8.0 >/dev/null 2>&1 || {
-        print_error "Failed to install tree-sitter"
-        return 1
-    }
-    
-    # Install faiss for vector search
-    current_step=$((current_step + 1))
-    show_progress $total_steps $current_step "Installing faiss for vector search"
-    "$PYTHON_CMD" -m pip install -q --no-cache-dir faiss-cpu >/dev/null 2>&1 || {
-        print_warning "Failed to install faiss-cpu, trying alternative method..."
-        "$PYTHON_CMD" -m pip install -q --no-cache-dir -U "faiss-cpu>=1.7.3" >/dev/null 2>&1 || {
-            print_error "Failed to install faiss-cpu. Vector search functionality will be limited."
+        
+        # Install LangChain separately (it has interdependencies)
+        "$PYTHON_CMD" -m pip install -q langchain langchain-core langchain-community >/dev/null 2>&1 || {
+            print_error "Failed to install critical packages"
+            return 1
         }
-    }
+        
+        mark_as_installed "core_packages"
+    else
+        print_status "Core packages already installed, skipping..."
+        current_step=$((current_step + 1))
+        show_progress $total_steps $current_step "Critical packages already installed"
+    fi
+    
+    # Install sentence-transformers prerequisites in parallel if needed
+    if ! is_already_installed "sentence_transformers"; then
+        current_step=$((current_step + 1))
+        show_progress $total_steps $current_step "Installing transformers & torch (for sentence-transformers)"
+        {
+            "$PYTHON_CMD" -m pip install -q transformers >/dev/null 2>&1 &
+            PID1=$!
+            
+            "$PYTHON_CMD" -m pip install -q torch torchvision >/dev/null 2>&1 &
+            PID2=$!
+            
+            # Wait for all processes to complete
+            wait $PID1 $PID2
+        } || {
+            print_warning "Failed to install transformers prerequisites"
+        }
+        
+        # Install sentence-transformers specifically - this is critical for embeddings
+        current_step=$((current_step + 1))
+        show_progress $total_steps $current_step "Installing sentence-transformers"
+        "$PYTHON_CMD" -m pip install -q sentence-transformers >/dev/null 2>&1 || {
+            print_warning "Failed to install sentence-transformers. Trying alternative method..."
+            "$PYTHON_CMD" -m pip install -q "sentence-transformers>=2.2.2" >/dev/null 2>&1 || {
+                print_error "Failed to install sentence-transformers. Embedding functionality will be limited."
+            }
+        }
+        
+        # Apply fixes for sentence-transformers if needed
+        current_step=$((current_step + 1))
+        show_progress $total_steps $current_step "Fixing sentence-transformers issues"
+        fix_sentence_transformers || {
+            print_warning "Could not fully resolve sentence-transformers issues. Some functionality may be limited."
+        }
+        
+        mark_as_installed "sentence_transformers"
+    else
+        print_status "Sentence-transformers already installed, skipping..."
+        # Skip 3 steps
+        current_step=$((current_step + 3))
+        show_progress $total_steps $current_step "Sentence transformers already installed"
+    fi
+    
+    # Install accelerate for model loading if needed
+    if ! is_already_installed "accelerate"; then
+        current_step=$((current_step + 1))
+        show_progress $total_steps $current_step "Installing accelerate for model loading"
+        "$PYTHON_CMD" -m pip install -q accelerate >/dev/null 2>&1 || {
+            print_warning "Failed to install accelerate. Model loading might encounter issues."
+        }
+        mark_as_installed "accelerate"
+    else
+        current_step=$((current_step + 1))
+        show_progress $total_steps $current_step "Accelerate already installed"
+    fi
+    
+    # Install tree-sitter versions specifically if needed
+    if ! is_already_installed "tree_sitter"; then
+        current_step=$((current_step + 1))
+        show_progress $total_steps $current_step "Installing tree-sitter"
+        "$PYTHON_CMD" -m pip install -q --force-reinstall tree-sitter==0.20.1 tree-sitter-languages==1.8.0 >/dev/null 2>&1 || {
+            print_error "Failed to install tree-sitter"
+            return 1
+        }
+        mark_as_installed "tree_sitter"
+    else
+        current_step=$((current_step + 1))
+        show_progress $total_steps $current_step "Tree-sitter already installed"
+    fi
+    
+    # Install faiss for vector search if needed
+    if ! is_already_installed "faiss_cpu"; then
+        current_step=$((current_step + 1))
+        show_progress $total_steps $current_step "Installing faiss for vector search"
+        
+        # First ensure we have a compatible NumPy version (< 2.0)
+        print_status "Installing compatible NumPy for faiss-cpu..."
+        "$PYTHON_CMD" -m pip install "numpy<2.0.0" >/dev/null 2>&1 || {
+            print_warning "Failed to install compatible NumPy version"
+        }
+        
+        # Now install faiss-cpu
+        "$PYTHON_CMD" -m pip install -q faiss-cpu >/dev/null 2>&1 || {
+            print_warning "Failed to install faiss-cpu, trying alternative method..."
+            # Try with specific pinned version
+            "$PYTHON_CMD" -m pip install -q "faiss-cpu==1.7.4" >/dev/null 2>&1 || {
+                # Try with known-compatible versions
+                "$PYTHON_CMD" -m pip install -q "numpy==1.24.3" >/dev/null 2>&1 && \
+                "$PYTHON_CMD" -m pip install -q "faiss-cpu==1.7.4" >/dev/null 2>&1 || {
+                    print_error "Failed to install faiss-cpu. Vector search functionality will be limited."
+                }
+            }
+        }
+        
+        # Verify faiss installation
+        if "$PYTHON_CMD" -c "import faiss" 2>/dev/null; then
+            print_success "Successfully installed faiss-cpu"
+            mark_as_installed "faiss_cpu"
+        else
+            print_error "Failed to import faiss after installation. Vector search will be limited."
+        fi
+    else
+        current_step=$((current_step + 1))
+        show_progress $total_steps $current_step "Faiss already installed"
+    fi
     
     # Install llama-cpp-python with CUDA support if available
-    current_step=$((current_step + 1))
-    show_progress $total_steps $current_step "Installing llama-cpp-python with hardware acceleration"
-    
-    # Check if we're on a system with CUDA
-    if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
-        print_status "CUDA detected, installing llama-cpp-python with CUDA support..."
-        CMAKE_ARGS="-DLLAMA_CUBLAS=on" "$PYTHON_CMD" -m pip install --no-cache-dir --force-reinstall llama-cpp-python >/dev/null 2>&1 && \
-            print_success "Installed llama-cpp-python with CUDA support!" || \
-            print_warning "Failed to install with CUDA. Installing standard version..."
-    # Check if we're on a Mac with Metal (Apple Silicon)
-    elif [ "$(uname)" == "Darwin" ] && [ "$(uname -m)" == "arm64" ]; then
-        print_status "Apple Silicon detected, installing llama-cpp-python with Metal support..."
-        CMAKE_ARGS="-DLLAMA_METAL=on" "$PYTHON_CMD" -m pip install --no-cache-dir --force-reinstall llama-cpp-python >/dev/null 2>&1 && \
-            print_success "Installed llama-cpp-python with Metal support!" || \
-            print_warning "Failed to install with Metal. Installing standard version..."
+    if ! is_already_installed "llama_cpp_python"; then
+        current_step=$((current_step + 1))
+        show_progress $total_steps $current_step "Installing llama-cpp-python with hardware acceleration"
+        
+        # Check if we're on a system with CUDA
+        if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
+            print_status "CUDA detected, installing llama-cpp-python with CUDA support..."
+            CMAKE_ARGS="-DLLAMA_CUBLAS=on" "$PYTHON_CMD" -m pip install --force-reinstall llama-cpp-python >/dev/null 2>&1 && \
+                print_success "Installed llama-cpp-python with CUDA support!" || \
+                print_warning "Failed to install with CUDA. Installing standard version..."
+        # Check if we're on a Mac with Metal (Apple Silicon)
+        elif [ "$(uname)" == "Darwin" ] && [ "$(uname -m)" == "arm64" ]; then
+            print_status "Apple Silicon detected, installing llama-cpp-python with Metal support..."
+            CMAKE_ARGS="-DLLAMA_METAL=on" "$PYTHON_CMD" -m pip install --force-reinstall llama-cpp-python >/dev/null 2>&1 && \
+                print_success "Installed llama-cpp-python with Metal support!" || \
+                print_warning "Failed to install with Metal. Installing standard version..."
+        else
+            print_status "Installing standard llama-cpp-python..."
+            "$PYTHON_CMD" -m pip install --force-reinstall llama-cpp-python >/dev/null 2>&1 || \
+                print_warning "Failed to install llama-cpp-python."
+        fi
+        mark_as_installed "llama_cpp_python"
     else
-        print_status "Installing standard llama-cpp-python..."
-        "$PYTHON_CMD" -m pip install --no-cache-dir --force-reinstall llama-cpp-python >/dev/null 2>&1 || \
-            print_warning "Failed to install llama-cpp-python."
+        current_step=$((current_step + 1))
+        show_progress $total_steps $current_step "Llama-cpp-python already installed"
     fi
     
     print_success "All dependencies installed!"
@@ -561,6 +705,11 @@ install_dependencies() {
 }
 
 handle_git_support() {
+    if is_already_installed "git_support"; then
+        print_success "Git support already installed."
+        return 0
+    fi
+
     print_status "Git support is optional and only required for analyzing remote repositories."
     if command -v git &> /dev/null; then
         print_status "Git is already installed on your system."
@@ -572,7 +721,10 @@ handle_git_support() {
 
     if [[ "$INSTALL_GIT" =~ ^[Yy][Ee][Ss]$ ]]; then
         print_status "Installing Git support..."
-        "$PYTHON_CMD" -m pip install -q --no-cache-dir dulwich==0.21.6 >/dev/null 2>&1 && print_success "Git support installed!" || print_warning "Failed to install Git support"
+        "$PYTHON_CMD" -m pip install -q dulwich==0.21.6 >/dev/null 2>&1 && {
+            print_success "Git support installed!"
+            mark_as_installed "git_support"
+        } || print_warning "Failed to install Git support"
     else
         print_status "Skipping Git support. You'll only be able to analyze local repositories."
     fi
@@ -580,6 +732,12 @@ handle_git_support() {
 
 setup_venv() {
     VENV_NAME="venv311"
+    
+    # If we're already in the venv, no need to reactivate
+    if is_in_our_venv; then
+        print_success "Already in virtual environment $VENV_NAME"
+        return 0
+    fi
     
     if [ ! -d "$VENV_NAME" ]; then
         print_status "Creating Python virtual environment in ./$VENV_NAME..."
@@ -591,6 +749,11 @@ setup_venv() {
         print_success "Virtual environment created!"
     else
         print_status "Using existing virtual environment at ./$VENV_NAME"
+        
+        # Check if marker file exists inside venv
+        if [ -f "$VENV_NAME/.setup_complete" ]; then
+            print_status "This venv was previously set up successfully"
+        fi
     fi
     
     # Activate the virtual environment
@@ -600,6 +763,9 @@ setup_venv() {
         print_error "Failed to activate virtual environment."
         return 1
     }
+    
+    # Create a marker file inside venv
+    touch "$VENV_NAME/.setup_complete"
     
     print_success "Virtual environment activated!"
     return 0
