@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Exit immediately if a command exits with a non-zero status
+set -e
+
 # Define color codes
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -31,7 +34,7 @@ print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 
 # Define helper functions
 check_command() {
-    if ! command -v $1 &> /dev/null; then
+    if ! command -v "$1" &> /dev/null; then
         print_error "$1 is not installed. Please install it and try again."
         return 1
     fi
@@ -58,9 +61,9 @@ detect_architecture() {
 }
 
 setup_env_file() {
-    local model_variant=$1
-    local hf_token=$2
-    local token_set=$3
+    local model_variant="$1"
+    local hf_token="$2"
+    local token_set="$3"
 
     if [ -f ".env" ]; then
         print_status "Found existing .env file"
@@ -68,7 +71,12 @@ setup_env_file() {
         # Update or add HF_TOKEN if provided
         if [ "$token_set" = true ]; then
             if grep -q "HF_TOKEN=" .env; then
-                sed -i'' -e "s|HF_TOKEN=.*|HF_TOKEN=$hf_token|" .env
+                # Use different sed syntax for macOS vs Linux
+                if [[ "$(uname)" == "Darwin" ]]; then
+                    sed -i '' -e "s|HF_TOKEN=.*|HF_TOKEN=$hf_token|" .env
+                else
+                    sed -i -e "s|HF_TOKEN=.*|HF_TOKEN=$hf_token|" .env
+                fi
                 print_status "Updated HF_TOKEN in .env file"
             else
                 echo "HF_TOKEN=$hf_token" >> .env
@@ -86,7 +94,12 @@ setup_env_file() {
         
         # Update model path based on detected architecture
         if grep -q "LLM_MODEL_PATH=" .env; then
-            sed -i'' -e "s|LLM_MODEL_PATH=.*|LLM_MODEL_PATH=models/codellama-7b-instruct.$model_variant.gguf|" .env
+            # Use different sed syntax for macOS vs Linux
+            if [[ "$(uname)" == "Darwin" ]]; then
+                sed -i '' -e "s|LLM_MODEL_PATH=.*|LLM_MODEL_PATH=models/codellama-7b-instruct.$model_variant.gguf|" .env
+            else
+                sed -i -e "s|LLM_MODEL_PATH=.*|LLM_MODEL_PATH=models/codellama-7b-instruct.$model_variant.gguf|" .env
+            fi
             print_status "Updated LLM_MODEL_PATH in .env file to use $model_variant model"
         else
             # Add model path if it doesn't exist
@@ -145,7 +158,7 @@ verify_installation() {
     print_status "Verifying dependencies..."
     
     # Simpler verification that just tests imports of core packages
-    python -c "
+    "$PYTHON_CMD" -c "
 import sys
 import importlib
 import traceback
@@ -228,24 +241,30 @@ sys.exit(0 if all_passed else 1)
 
 install_deps_in_batches() {
     # This function installs dependencies in smaller batches to avoid hanging
-    local req_file=$1
+    local req_file="$1"
     
     print_status "Installing dependencies in batches to prevent hanging..."
+    
+    # Check if file exists
+    if [ ! -f "$req_file" ]; then
+        print_warning "Requirements file '$req_file' not found"
+        return 1
+    }
     
     # Count lines in requirements file
     local total_lines=$(grep -v "^#" "$req_file" | grep -v "^$" | wc -l | tr -d ' ')
     
     # If requirements file is empty or missing, return
     if [ "$total_lines" -eq 0 ]; then
-        print_warning "Requirements file is empty or missing"
+        print_warning "Requirements file is empty"
         return 1
     fi
     
-    # Split into smaller batches (about 5 packages per batch)
-    local batch_size=5
+    # Use dynamic batch size based on system resources
+    local batch_size=$BATCH_SIZE
     local batches=$((total_lines / batch_size + 1))
     
-    print_status "Found $total_lines packages, installing in $batches batches"
+    print_status "Found $total_lines packages, installing in $batches batches with size $batch_size"
     
     # Process each batch
     for ((i=1; i<=batches; i++)); do
@@ -261,7 +280,7 @@ install_deps_in_batches() {
         
         # Install this batch
         print_status "Installing batch $i/$batches..."
-        echo "$deps" | xargs pip install -q --no-cache-dir >/dev/null 2>&1 || {
+        echo "$deps" | xargs "$PYTHON_CMD" -m pip install -q --no-cache-dir -j"$PIP_PARALLEL_JOBS" >/dev/null 2>&1 || {
             print_warning "Some packages in batch $i failed, continuing anyway"
         }
         
@@ -276,7 +295,7 @@ fix_sentence_transformers() {
     print_status "Applying fix for sentence_transformers..."
     
     # First check if we can import it at all
-    if python -c "import sentence_transformers" 2>/dev/null; then
+    if "$PYTHON_CMD" -c "import sentence_transformers" 2>/dev/null; then
         print_status "sentence_transformers seems to be installed correctly"
         return 0
     fi
@@ -285,31 +304,31 @@ fix_sentence_transformers() {
     
     # Fix 1: Try reinstalling with explicit dependencies
     print_status "Fix 1: Reinstalling with explicit dependencies..."
-    pip install -q --no-cache-dir --force-reinstall -U transformers torch numpy scipy >/dev/null 2>&1
-    pip install -q --no-cache-dir --force-reinstall -U sentence-transformers >/dev/null 2>&1
+    "$PYTHON_CMD" -m pip install -q --no-cache-dir --force-reinstall -U transformers torch numpy scipy >/dev/null 2>&1
+    "$PYTHON_CMD" -m pip install -q --no-cache-dir --force-reinstall -U sentence-transformers >/dev/null 2>&1
     
     # Try importing again
-    if python -c "import sentence_transformers" 2>/dev/null; then
+    if "$PYTHON_CMD" -c "import sentence_transformers" 2>/dev/null; then
         print_success "Fix 1 succeeded!"
         return 0
     fi
     
     # Fix 2: Try with a specific version
     print_status "Fix 2: Trying specific version..."
-    pip install -q --no-cache-dir --force-reinstall "sentence-transformers==2.2.2" >/dev/null 2>&1
+    "$PYTHON_CMD" -m pip install -q --no-cache-dir --force-reinstall "sentence-transformers==2.2.2" >/dev/null 2>&1
     
     # Try importing again
-    if python -c "import sentence_transformers" 2>/dev/null; then
+    if "$PYTHON_CMD" -c "import sentence_transformers" 2>/dev/null; then
         print_success "Fix 2 succeeded!"
         return 0
     fi
     
     # Fix 3: Try building from source
     print_status "Fix 3: Building from source..."
-    pip install -q --no-cache-dir git+https://github.com/UKPLab/sentence-transformers.git >/dev/null 2>&1
+    "$PYTHON_CMD" -m pip install -q --no-cache-dir git+https://github.com/UKPLab/sentence-transformers.git >/dev/null 2>&1
     
     # Final check
-    if python -c "import sentence_transformers" 2>/dev/null; then
+    if "$PYTHON_CMD" -c "import sentence_transformers" 2>/dev/null; then
         print_success "Fix 3 succeeded!"
         return 0
     fi
@@ -318,8 +337,79 @@ fix_sentence_transformers() {
     return 1
 }
 
+detect_system_resources() {
+    # Detect RAM (in GB)
+    if [[ "$(uname)" == "Darwin" ]]; then
+        # macOS
+        MEM_GB=$(sysctl -n hw.memsize | awk '{print int($1/1024/1024/1024)}')
+    else
+        # Linux
+        MEM_GB=$(free -g | awk '/^Mem:/{print $2}')
+    fi
+    MEM_GB=${MEM_GB:-4}  # Default to 4GB if detection fails
+    
+    # Detect CPU count
+    if [[ "$(uname)" == "Darwin" ]]; then
+        # macOS
+        CPU_COUNT=$(sysctl -n hw.ncpu)
+    else
+        # Linux
+        CPU_COUNT=$(nproc 2>/dev/null || grep -c processor /proc/cpuinfo)
+    fi
+    CPU_COUNT=${CPU_COUNT:-2}  # Default to 2 CPUs if detection fails
+    
+    # Scale parallel jobs based on available CPUs (leave 1 core free)
+    PARALLEL_JOBS=$((CPU_COUNT > 2 ? CPU_COUNT - 1 : 1))
+    
+    # Scale batch size based on memory
+    if [ "$MEM_GB" -ge 16 ]; then
+        BATCH_SIZE=10
+    elif [ "$MEM_GB" -ge 8 ]; then
+        BATCH_SIZE=8
+    elif [ "$MEM_GB" -ge 4 ]; then
+        BATCH_SIZE=5
+    else
+        BATCH_SIZE=3
+    fi
+    
+    # Set pip parallelism based on CPU count
+    PIP_PARALLEL_JOBS=$((CPU_COUNT > 1 ? CPU_COUNT - 1 : 1))
+    
+    print_status "System resources detected: ${MEM_GB}GB RAM, ${CPU_COUNT} CPUs"
+    print_status "Using optimization settings: batch size ${BATCH_SIZE}, parallel jobs ${PARALLEL_JOBS}, pip parallel ${PIP_PARALLEL_JOBS}"
+}
+
+setup_cache_dir() {
+    # Set up cache directory to speed up repeated installations
+    if [[ "$(uname)" == "Darwin" ]]; then
+        # macOS
+        CACHE_DIR="$HOME/Library/Caches/aithreatmap"
+    else
+        # Linux
+        CACHE_DIR="$HOME/.cache/aithreatmap"
+    fi
+    
+    # Create cache directory if it doesn't exist
+    mkdir -p "$CACHE_DIR"
+    mkdir -p "$CACHE_DIR/pip"
+    mkdir -p "$CACHE_DIR/wheels"
+    
+    # Export pip cache and wheel directory
+    export PIP_CACHE_DIR="$CACHE_DIR/pip"
+    export PYTHONWHEELHOUSE="$CACHE_DIR/wheels"
+    export PIP_WHEEL_DIR="$CACHE_DIR/wheels"
+    
+    print_status "Using cache directory: $CACHE_DIR"
+}
+
 install_dependencies() {
     print_status "Installing Python dependencies..."
+    
+    # Set up cache directories
+    setup_cache_dir
+    
+    # Detect system resources
+    detect_system_resources
     
     # Define total steps for progress tracking
     local total_steps=9  # Increased to 9 to account for transformer fixes
@@ -328,7 +418,7 @@ install_dependencies() {
     # Upgrade pip first
     current_step=$((current_step + 1))
     show_progress $total_steps $current_step "Upgrading pip"
-    python -m pip install --upgrade pip >/dev/null 2>&1 || {
+    "$PYTHON_CMD" -m pip install --upgrade pip >/dev/null 2>&1 || {
         print_error "Failed to upgrade pip"
         return 1
     }
@@ -336,7 +426,7 @@ install_dependencies() {
     # Install build tools
     current_step=$((current_step + 1))
     show_progress $total_steps $current_step "Installing build tools"
-    pip install -q wheel setuptools build >/dev/null 2>&1 || {
+    "$PYTHON_CMD" -m pip install -q wheel setuptools build >/dev/null 2>&1 || {
         print_error "Failed to install build tools"
         return 1
     }
@@ -347,7 +437,7 @@ install_dependencies() {
     
     if [ -f "requirements.txt" ]; then
         print_status "Installing all packages with optimized settings..."
-        pip install -q --no-cache-dir --upgrade-strategy only-if-needed -j8 -r requirements.txt >/dev/null 2>&1 || {
+        "$PYTHON_CMD" -m pip install -q --no-cache-dir --upgrade-strategy only-if-needed -j"$PIP_PARALLEL_JOBS" -r requirements.txt >/dev/null 2>&1 || {
             print_warning "Optimized installation failed, falling back to batch installation"
             install_deps_in_batches "requirements.txt"
         }
@@ -358,24 +448,51 @@ install_dependencies() {
     # Install critical packages separately to ensure they're installed
     current_step=$((current_step + 1))
     show_progress $total_steps $current_step "Installing critical packages"
-    pip install -q --no-cache-dir click python-dotenv requests colorama tqdm langchain langchain-core langchain-community pydantic huggingface_hub joblib >/dev/null 2>&1 || {
+    
+    # Split critical packages into groups for parallel installation
+    print_status "Installing critical packages in parallel..."
+    {
+        "$PYTHON_CMD" -m pip install -q --no-cache-dir click python-dotenv colorama tqdm >/dev/null 2>&1 &
+        PID1=$!
+        
+        "$PYTHON_CMD" -m pip install -q --no-cache-dir pydantic huggingface_hub joblib >/dev/null 2>&1 &
+        PID2=$!
+        
+        "$PYTHON_CMD" -m pip install -q --no-cache-dir requests >/dev/null 2>&1 &
+        PID3=$!
+        
+        # Wait for all processes to complete
+        wait $PID1 $PID2 $PID3
+    }
+    
+    # Install LangChain separately (it has interdependencies)
+    "$PYTHON_CMD" -m pip install -q --no-cache-dir langchain langchain-core langchain-community >/dev/null 2>&1 || {
         print_error "Failed to install critical packages"
         return 1
     }
     
-    # Install sentence-transformers prerequisites
+    # Install sentence-transformers prerequisites in parallel
     current_step=$((current_step + 1))
     show_progress $total_steps $current_step "Installing transformers & torch (for sentence-transformers)"
-    pip install -q --no-cache-dir transformers torch torchvision >/dev/null 2>&1 || {
+    {
+        "$PYTHON_CMD" -m pip install -q --no-cache-dir transformers >/dev/null 2>&1 &
+        PID1=$!
+        
+        "$PYTHON_CMD" -m pip install -q --no-cache-dir torch torchvision >/dev/null 2>&1 &
+        PID2=$!
+        
+        # Wait for all processes to complete
+        wait $PID1 $PID2
+    } || {
         print_warning "Failed to install transformers prerequisites"
     }
     
     # Install sentence-transformers specifically - this is critical for embeddings
     current_step=$((current_step + 1))
     show_progress $total_steps $current_step "Installing sentence-transformers"
-    pip install -q --no-cache-dir sentence-transformers >/dev/null 2>&1 || {
+    "$PYTHON_CMD" -m pip install -q --no-cache-dir sentence-transformers >/dev/null 2>&1 || {
         print_warning "Failed to install sentence-transformers. Trying alternative method..."
-        pip install -q --no-cache-dir "sentence-transformers>=2.2.2" >/dev/null 2>&1 || {
+        "$PYTHON_CMD" -m pip install -q --no-cache-dir "sentence-transformers>=2.2.2" >/dev/null 2>&1 || {
             print_error "Failed to install sentence-transformers. Embedding functionality will be limited."
         }
     }
@@ -390,14 +507,14 @@ install_dependencies() {
     # Install accelerate for model loading
     current_step=$((current_step + 1))
     show_progress $total_steps $current_step "Installing accelerate for model loading"
-    pip install -q --no-cache-dir accelerate >/dev/null 2>&1 || {
+    "$PYTHON_CMD" -m pip install -q --no-cache-dir accelerate >/dev/null 2>&1 || {
         print_warning "Failed to install accelerate. Model loading might encounter issues."
     }
     
     # Install tree-sitter versions specifically
     current_step=$((current_step + 1))
     show_progress $total_steps $current_step "Installing tree-sitter"
-    pip install -q --no-cache-dir --force-reinstall tree-sitter==0.20.1 tree-sitter-languages==1.8.0 >/dev/null 2>&1 || {
+    "$PYTHON_CMD" -m pip install -q --no-cache-dir --force-reinstall tree-sitter==0.20.1 tree-sitter-languages==1.8.0 >/dev/null 2>&1 || {
         print_error "Failed to install tree-sitter"
         return 1
     }
@@ -405,9 +522,9 @@ install_dependencies() {
     # Install faiss for vector search
     current_step=$((current_step + 1))
     show_progress $total_steps $current_step "Installing faiss for vector search"
-    pip install -q --no-cache-dir faiss-cpu >/dev/null 2>&1 || {
+    "$PYTHON_CMD" -m pip install -q --no-cache-dir faiss-cpu >/dev/null 2>&1 || {
         print_warning "Failed to install faiss-cpu, trying alternative method..."
-        pip install -q --no-cache-dir -U "faiss-cpu>=1.7.3" >/dev/null 2>&1 || {
+        "$PYTHON_CMD" -m pip install -q --no-cache-dir -U "faiss-cpu>=1.7.3" >/dev/null 2>&1 || {
             print_error "Failed to install faiss-cpu. Vector search functionality will be limited."
         }
     }
@@ -419,18 +536,18 @@ install_dependencies() {
     # Check if we're on a system with CUDA
     if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
         print_status "CUDA detected, installing llama-cpp-python with CUDA support..."
-        CMAKE_ARGS="-DLLAMA_CUBLAS=on" pip install --no-cache-dir --force-reinstall llama-cpp-python >/dev/null 2>&1 && \
+        CMAKE_ARGS="-DLLAMA_CUBLAS=on" "$PYTHON_CMD" -m pip install --no-cache-dir --force-reinstall llama-cpp-python >/dev/null 2>&1 && \
             print_success "Installed llama-cpp-python with CUDA support!" || \
             print_warning "Failed to install with CUDA. Installing standard version..."
     # Check if we're on a Mac with Metal (Apple Silicon)
     elif [ "$(uname)" == "Darwin" ] && [ "$(uname -m)" == "arm64" ]; then
         print_status "Apple Silicon detected, installing llama-cpp-python with Metal support..."
-        CMAKE_ARGS="-DLLAMA_METAL=on" pip install --no-cache-dir --force-reinstall llama-cpp-python >/dev/null 2>&1 && \
+        CMAKE_ARGS="-DLLAMA_METAL=on" "$PYTHON_CMD" -m pip install --no-cache-dir --force-reinstall llama-cpp-python >/dev/null 2>&1 && \
             print_success "Installed llama-cpp-python with Metal support!" || \
             print_warning "Failed to install with Metal. Installing standard version..."
     else
         print_status "Installing standard llama-cpp-python..."
-        pip install --no-cache-dir --force-reinstall llama-cpp-python >/dev/null 2>&1 || \
+        "$PYTHON_CMD" -m pip install --no-cache-dir --force-reinstall llama-cpp-python >/dev/null 2>&1 || \
             print_warning "Failed to install llama-cpp-python."
     fi
     
@@ -450,7 +567,7 @@ handle_git_support() {
 
     if [[ "$INSTALL_GIT" =~ ^[Yy][Ee][Ss]$ ]]; then
         print_status "Installing Git support..."
-        pip install -q --no-cache-dir dulwich==0.21.6 >/dev/null 2>&1 && print_success "Git support installed!" || print_warning "Failed to install Git support"
+        "$PYTHON_CMD" -m pip install -q --no-cache-dir dulwich==0.21.6 >/dev/null 2>&1 && print_success "Git support installed!" || print_warning "Failed to install Git support"
     else
         print_status "Skipping Git support. You'll only be able to analyze local repositories."
     fi
@@ -461,7 +578,7 @@ setup_venv() {
     
     if [ ! -d "$VENV_NAME" ]; then
         print_status "Creating Python virtual environment in ./$VENV_NAME..."
-        $PYTHON_CMD -m venv $VENV_NAME || {
+        "$PYTHON_CMD" -m venv "$VENV_NAME" || {
             print_error "Failed to create virtual environment."
             print_status "Try installing the venv module with: pip3 install virtualenv"
             return 1
@@ -473,7 +590,8 @@ setup_venv() {
     
     # Activate the virtual environment
     print_status "Activating virtual environment..."
-    source $VENV_NAME/bin/activate || {
+    # shellcheck disable=SC1090
+    source "$VENV_NAME/bin/activate" || {
         print_error "Failed to activate virtual environment."
         return 1
     }
@@ -481,6 +599,15 @@ setup_venv() {
     print_success "Virtual environment activated!"
     return 0
 }
+
+# Handle interruption - cleanup
+cleanup() {
+    print_warning "Interrupted! Cleaning up..."
+    exit 1
+}
+
+# Set up trap for SIGINT
+trap cleanup INT
 
 # Main execution starts here
 print_status "Starting setup..."
@@ -501,7 +628,7 @@ if command -v python3.11 &> /dev/null; then
     print_success "Python 3.11 is installed!"
 elif command -v python3 &> /dev/null; then
     PYTHON_CMD="python3"
-    PY_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    PY_VERSION=$("$PYTHON_CMD" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
     print_status "Python version: $PY_VERSION"
     
     if [[ "$PY_VERSION" != "3.11" ]]; then
@@ -521,6 +648,9 @@ CURRENT_STEP=$((CURRENT_STEP + 1))
 show_progress $TOTAL_SETUP_STEPS $CURRENT_STEP "Checking pip installation"
 check_command pip3 || exit 1
 print_success "pip3 is installed!"
+
+# Turn off exit on error for the remainder so we can handle errors gracefully
+set +e
 
 # Setup virtual environment
 CURRENT_STEP=$((CURRENT_STEP + 1))
@@ -550,18 +680,19 @@ CURRENT_STEP=$((CURRENT_STEP + 1))
 show_progress $TOTAL_SETUP_STEPS $CURRENT_STEP "Detecting architecture & setting up environment"
 MODEL_VARIANT=$(detect_architecture)
 TOKEN_INFO=$(prompt_for_hf_token)
-read HF_TOKEN_SET HF_TOKEN <<< "$TOKEN_INFO"
+read -r HF_TOKEN_SET HF_TOKEN <<< "$TOKEN_INFO"
 setup_env_file "$MODEL_VARIANT" "$HF_TOKEN" "$HF_TOKEN_SET"
 
 # Initialize the framework
 CURRENT_STEP=$((CURRENT_STEP + 1))
 show_progress $TOTAL_SETUP_STEPS $CURRENT_STEP "Initializing framework"
 print_status "Initializing the framework..."
-python -m cli init 2>/dev/null || print_warning "Framework initialization encountered issues, but we can continue"
+"$PYTHON_CMD" -m cli init 2>/dev/null || print_warning "Framework initialization encountered issues, but we can continue"
 
 # Verify installation
 verify_installation
-if [ $? -ne 0 ]; then
+VERIFY_STATUS=$?
+if [ $VERIFY_STATUS -ne 0 ]; then
     print_error "Some critical dependencies are missing. There may have been installation errors."
     print_status "You can try installing them manually:"
     print_status "pip install click langchain langchain-core langchain-community python-dotenv tree-sitter==0.20.1 tree-sitter-languages==1.8.0 requests tqdm xmltodict==0.13.0 click-plugins XlsxWriter faiss-cpu==1.7.4"
