@@ -21,7 +21,7 @@ from repository_analyzer.embedding_store import EmbeddingStore
 from utils.common import success_msg, error_msg, warning_msg, info_msg
 from utils.env_utils import get_env_variable
 from utils.model_utils import download_model, validate_model_path, check_model_file, detect_gpu_capabilities
-from utils.model_config import get_default_model_path
+from utils.model_config import get_default_model_path, get_model_info
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,13 @@ class LLMProcessor:
             # Import the GPU detection function
             from utils.model_utils import detect_gpu_capabilities
             
+            # Import model config functions to get context size
+            from utils.model_config import get_model_info
+            
+            # Get model info to determine context size
+            model_info = get_model_info()
+            model_ctx_size = model_info.get("context_length", 4096)
+            
             # Detect GPU capabilities
             gpu_config = detect_gpu_capabilities()
             
@@ -94,7 +101,10 @@ class LLMProcessor:
                     raise FileNotFoundError(f"Model file {model_path} not found")
                 
                 # Configure LlamaCpp options
-                n_ctx = int(get_env_variable("LLM_N_CTX", "4096"))  # Increase context window size - use 4096 when available
+                # Use model context size from configuration, override with environment if specified
+                n_ctx = int(get_env_variable("LLM_N_CTX", str(model_ctx_size)))
+                info_msg(f"Using context window size: {n_ctx}")
+                
                 n_batch = int(get_env_variable("LLM_N_BATCH", "512"))  # Batch size
                 n_gpu_layers = gpu_config['n_gpu_layers']  # Use detected GPU layers
                 temperature = float(get_env_variable("LLM_TEMPERATURE", "0.7"))

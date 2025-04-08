@@ -33,7 +33,8 @@ MODEL_REPOS = {
             }
         },
         "default_variant": "Q4_K_M",
-        "min_ram_gb": 8
+        "min_ram_gb": 8,
+        "context_length": 4096
     },
     "codellama-70b-instruct": {
         "repo_id": "TheBloke/CodeLlama-70B-Instruct-GGUF",
@@ -59,7 +60,8 @@ MODEL_REPOS = {
             }
         },
         "default_variant": "Q4_K_M",
-        "min_ram_gb": 32
+        "min_ram_gb": 32,
+        "context_length": 16384  # The 70B model supports larger context
     }
 }
 
@@ -119,12 +121,31 @@ def get_model_info(model_name: str = None, variant: str = None) -> Dict[str, Any
     Returns:
         Dictionary with model information
     """
+    # Get model name from environment variable MODEL_PATH if available
+    model_path_env = os.environ.get("MODEL_PATH", "")
+    if model_path_env and not model_name:
+        # Extract model name from model path environment variable
+        if "70b" in model_path_env.lower():
+            model_name = "codellama-70b-instruct"
+        elif "7b" in model_path_env.lower():
+            model_name = "codellama-7b-instruct"
+    
+    # Fall back to default model name if still not determined
     model_name = model_name or DEFAULT_MODEL_NAME
     
     if model_name not in MODEL_REPOS:
         raise ValueError(f"Unknown model: {model_name}")
     
     model_config = MODEL_REPOS[model_name]
+    
+    # Extract variant from model path if available
+    if model_path_env and not variant:
+        if "Q4_0" in model_path_env:
+            variant = "Q4_0"
+        elif "Q4_K_M" in model_path_env:
+            variant = "Q4_K_M"
+        elif "Q5_K_M" in model_path_env:
+            variant = "Q5_K_M"
     
     if not variant:
         # Detect appropriate variant based on architecture
@@ -142,7 +163,8 @@ def get_model_info(model_name: str = None, variant: str = None) -> Dict[str, Any
         "filename": variant_info["filename"],
         "url": variant_info["url"],
         "description": variant_info["description"],
-        "min_ram_gb": model_config.get("min_ram_gb", 8)
+        "min_ram_gb": model_config.get("min_ram_gb", 8),
+        "context_length": model_config.get("context_length", 4096)
     }
 
 def get_default_model_path() -> str:
@@ -152,6 +174,13 @@ def get_default_model_path() -> str:
     Returns:
         Default path to the model file
     """
+    # Check if MODEL_PATH is set in environment
+    model_path_env = os.environ.get("MODEL_PATH", "")
+    if model_path_env:
+        # Use the exact path from environment if available
+        return model_path_env
+        
+    # Otherwise use the detected configuration
     model_info = get_model_info()
     return f"models/{model_info['filename']}"
 
@@ -167,7 +196,8 @@ def get_available_models() -> Dict[str, Dict[str, Any]]:
         models[model_name] = {
             "description": config["description"],
             "min_ram_gb": config.get("min_ram_gb", 8),
-            "variants": list(config["variants"].keys())
+            "variants": list(config["variants"].keys()),
+            "context_length": config.get("context_length", 4096)
         }
     return models
 
@@ -190,4 +220,77 @@ def set_default_model(model_name: str) -> bool:
     DEFAULT_MODEL_NAME = model_name
     os.environ["LLM_MODEL"] = model_name
     logger.info(f"Default model set to: {model_name}")
-    return True 
+    return True
+
+def download_model(model_name: str = None, variant: str = None, force: bool = False) -> str:
+    """
+    Download the specified model if it doesn't exist locally.
+    
+    Args:
+        model_name: Name of the model (default is DEFAULT_MODEL_NAME)
+        variant: Specific variant to download (default is determined by architecture)
+        force: Force download even if the file exists
+        
+    Returns:
+        Path to the downloaded model file
+    """
+    # Check if MODEL_PATH is explicitly set
+    env_model_path = os.environ.get("MODEL_PATH", "")
+    
+    # Get model info - using environment model path to help determine the model
+    model_info = get_model_info(model_name, variant)
+    
+    # Build paths
+    models_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
+    os.makedirs(models_dir, exist_ok=True)
+    
+    # If MODEL_PATH is set, use that path directly
+    if env_model_path and os.path.dirname(env_model_path):
+        model_path = env_model_path
+    else:
+        model_path = os.path.join(models_dir, model_info["filename"])
+    
+    # Check if model exists
+    if os.path.exists(model_path) and not force:
+        logger.info(f"Model already exists at {model_path}")
+        logger.info(f"File size: {os.path.getsize(model_path) / (1024 * 1024 * 1024):.2f} GB")
+        return model_path
+    
+    # Download the model
+    logger.info(f"Downloading model {model_info['name']} ({model_info['variant']})...")
+    logger.info(f"URL: {model_info['url']}")
+    logger.info(f"This may take a while for large models...")
+    
+    try:
+        # Use wget or curl depending on availability
+        import sys
+        import subprocess
+        
+        if sys.platform.startswith('win'):
+            # Use PowerShell on Windows
+            cmd = f'powershell -Command "Invoke-WebRequest -Uri "{model_info["url"]}" -OutFile "{model_path}"'
+        else:
+            # Use wget on Unix-like systems if available, otherwise curl
+            if subprocess.run(['which', 'wget'], stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode == 0:
+                cmd = f'wget -O "{model_path}" "{model_info["url"]}"'
+            else:
+                cmd = f'curl -L "{model_info["url"]}" -o "{model_path}"'
+        
+        logger.info(f"Running download command: {cmd}")
+        subprocess.run(cmd, shell=True, check=True)
+        
+        # Verify file exists and has content
+        if os.path.exists(model_path) and os.path.getsize(model_path) > 0:
+            logger.info(f"Download complete. Model saved to {model_path}")
+            logger.info(f"File size: {os.path.getsize(model_path) / (1024 * 1024 * 1024):.2f} GB")
+            return model_path
+        else:
+            logger.error(f"Download failed or file is empty")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error downloading model: {str(e)}")
+        if os.path.exists(model_path):
+            logger.info(f"Removing incomplete download file")
+            os.remove(model_path)
+        return None

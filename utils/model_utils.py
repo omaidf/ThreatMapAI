@@ -368,26 +368,62 @@ def detect_gpu_capabilities() -> dict:
             result['use_gpu'] = True
             result['gpu_info'] = f"{gpu_name} ({gpu_count} available)"
             
-            # Decide how many layers to offload to GPU based on memory
-            if gpu_memory is not None:
-                # Conservative estimates:
-                # <4GB: 1 layer, 4-8GB: 8 layers, 8-12GB: 16 layers, >12GB: 32 layers, >24GB: all layers
-                if gpu_memory < 4:
-                    result['n_gpu_layers'] = 1
-                elif gpu_memory < 8:
-                    result['n_gpu_layers'] = 8
-                elif gpu_memory < 12:
-                    result['n_gpu_layers'] = 16
-                elif gpu_memory < 24:
-                    result['n_gpu_layers'] = 32
+            # Check if we're using the 70B model
+            try:
+                from utils.model_config import get_model_info
+                model_info = get_model_info()
+                is_large_model = "70b" in model_info["name"].lower()
+            except:
+                is_large_model = True  # Assume large model to be safer
+            
+            # Special case for multiple GPUs
+            if gpu_count > 1:
+                # With multiple GPUs, be more aggressive with layer offloading
+                if is_large_model:
+                    if gpu_count >= 4:
+                        # With 4+ GPUs, we can offload more layers for large models
+                        result['n_gpu_layers'] = 64
+                    else:
+                        # With 2-3 GPUs, be more conservative for 70B model
+                        result['n_gpu_layers'] = 32
                 else:
+                    # For smaller models, we can use more layers with fewer GPUs
                     result['n_gpu_layers'] = 100  # All layers
+            # Single GPU case
+            elif gpu_memory is not None:
+                # Decide based on GPU memory and model size
+                if is_large_model:
+                    # More conservative for large models
+                    if gpu_memory < 8:
+                        result['n_gpu_layers'] = 1   # Very limited
+                    elif gpu_memory < 16:
+                        result['n_gpu_layers'] = 8   # Limited
+                    elif gpu_memory < 24:
+                        result['n_gpu_layers'] = 16  # Moderate
+                    elif gpu_memory < 32:
+                        result['n_gpu_layers'] = 24  # Good
+                    else:
+                        result['n_gpu_layers'] = 32  # Very good
+                else:
+                    # More aggressive for smaller models
+                    if gpu_memory < 4:
+                        result['n_gpu_layers'] = 1
+                    elif gpu_memory < 8:
+                        result['n_gpu_layers'] = 8
+                    elif gpu_memory < 12:
+                        result['n_gpu_layers'] = 16
+                    elif gpu_memory < 24:
+                        result['n_gpu_layers'] = 32
+                    else:
+                        result['n_gpu_layers'] = 100  # All layers
             else:
-                # If we can't determine memory, be conservative
-                result['n_gpu_layers'] = 8
+                # Conservative default for unknown memory
+                result['n_gpu_layers'] = is_large_model and 8 or 16
             
             info_msg(f"🔥 NVIDIA GPU detected: {result['gpu_info']}")
             info_msg(f"Will use CUDA with {result['n_gpu_layers']} GPU layers")
+            if is_large_model:
+                info_msg("Using conservative GPU settings for 70B model")
             return result
             
         # Next check for Metal Performance Shaders (Apple Silicon)
