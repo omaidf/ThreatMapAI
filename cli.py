@@ -770,6 +770,55 @@ def download_model_cmd(force: bool):
         raise click.ClickException(str(e))
 
 @cli.command()
+@click.argument('model_name', required=False)
+@click.option('--list', 'list_models', is_flag=True, help='List available models')
+@click.option('--variant', help='Specific model variant (e.g., Q4_0, Q4_K_M, Q5_K_M)')
+@click.option('--download', is_flag=True, help='Download the model after selection')
+def select_model(model_name: str, list_models: bool, variant: str, download: bool):
+    """Select and optionally download a different model (e.g., codellama-70b-instruct)."""
+    try:
+        # Import model configuration functions
+        from utils.model_config import get_available_models, set_default_model
+        
+        # List available models if requested or if no model name provided
+        if list_models or not model_name:
+            info_msg("Available models:")
+            available_models = get_available_models()
+            
+            for name, info in available_models.items():
+                click.echo(f"  - {name}: {info['description']}")
+                click.echo(f"    Variants: {', '.join(info['variants'])}")
+                click.echo(f"    Minimum RAM: {info['min_ram_gb']}GB")
+                click.echo("")
+                
+            if not model_name:
+                return
+        
+        # Set the selected model as default
+        if set_default_model(model_name):
+            success_msg(f"Selected model: {model_name}")
+            
+            # Update the .env file
+            from utils.env_utils import update_env_file
+            model_path = get_default_model_path()
+            update_env_file("LLM_MODEL_PATH", model_path)
+            success_msg(f"Updated LLM_MODEL_PATH in .env: {model_path}")
+            
+            # Download if requested
+            if download:
+                info_msg(f"Downloading {model_name}...")
+                download_model(model_path, force=False)
+            else:
+                info_msg(f"To download this model, run: python -m cli download_model_cmd")
+        else:
+            error_msg(f"Invalid model name: {model_name}")
+            info_msg("Use --list to see available models")
+            
+    except Exception as e:
+        error_msg(f"Error selecting model: {str(e)}")
+        raise click.ClickException(str(e))
+
+@cli.command()
 @click.option('--output-dir', default='output',
               help='Directory containing output files')
 @click.option('--force', is_flag=True, help='Force cleanup without confirmation')
@@ -883,6 +932,21 @@ def main():
         # Set up signal handlers
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
+        
+        # Check if using default model and show message about 70B option
+        from utils.model_config import DEFAULT_MODEL_NAME, MODEL_REPOS
+        from utils.env_utils import get_env_variable
+        
+        # Check if this is an analyze command that could benefit from 70B model
+        is_analyze_command = len(sys.argv) > 1 and sys.argv[1] == "analyze"
+        env_model = get_env_variable("LLM_MODEL")
+        model_path = get_env_variable("LLM_MODEL_PATH", "")
+        
+        if is_analyze_command and (not env_model or env_model == "codellama-7b-instruct") and "70b" not in model_path.lower():
+            info_msg("")
+            info_msg("ℹ️  TIP: This project now supports CodeLlama 70B for much better results!")
+            info_msg("To use it, run: python -m cli select_model codellama-70b-instruct --download")
+            info_msg("")
         
         # Run the CLI
         cli()

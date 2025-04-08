@@ -1535,7 +1535,7 @@ FILES_BY_BOUNDARY:
             prompt = self._check_tokens_and_truncate(prompt, max_output_tokens=300)
             
             # Call LLM directly
-            answer = self.llm(prompt)
+            answer = self.llm.invoke(prompt)
             
             return answer
             
@@ -1736,7 +1736,7 @@ For PHP code, pay special attention to input validation, SQL injection, XSS, and
             prompt = self._check_tokens_and_truncate(prompt_template, max_output_tokens=600)
             
             # Call LLM directly
-            result = self.llm(prompt)
+            result = self.llm.invoke(prompt)
             
             # Parse and return threats
             threats = self._parse_threats(result)

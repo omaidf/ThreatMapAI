@@ -7,6 +7,7 @@ variants, and default settings to avoid duplication across the codebase.
 
 import platform
 import logging
+import os
 from typing import Dict, Tuple, Any
 
 # Configure logger
@@ -31,12 +32,39 @@ MODEL_REPOS = {
                 "description": "Better quantization model suitable for x86 systems"
             }
         },
-        "default_variant": "Q4_K_M"
+        "default_variant": "Q4_K_M",
+        "min_ram_gb": 8
+    },
+    "codellama-70b-instruct": {
+        "repo_id": "TheBloke/CodeLlama-70B-Instruct-GGUF",
+        "description": "CodeLlama 70B Instruct GGUF (High performance model)",
+        "variants": {
+            "Q4_0": {
+                "filename": "codellama-70b-instruct.Q4_0.gguf",
+                "url": "https://huggingface.co/TheBloke/CodeLlama-70B-Instruct-GGUF/resolve/main/codellama-70b-instruct.Q4_0.gguf?download=true",
+                "recommended_for": ["arm64", "aarch64", "arm"],
+                "description": "Low quantization model suitable for ARM-based systems with 32GB+ RAM"
+            },
+            "Q4_K_M": {
+                "filename": "codellama-70b-instruct.Q4_K_M.gguf",
+                "url": "https://huggingface.co/TheBloke/CodeLlama-70B-Instruct-GGUF/resolve/main/codellama-70b-instruct.Q4_K_M.gguf?download=true",
+                "recommended_for": ["x86_64", "amd64", "x86"],
+                "description": "Better quantization model suitable for x86 systems with 32GB+ RAM"
+            },
+            "Q5_K_M": {
+                "filename": "codellama-70b-instruct.Q5_K_M.gguf",
+                "url": "https://huggingface.co/TheBloke/CodeLlama-70B-Instruct-GGUF/resolve/main/codellama-70b-instruct.Q5_K_M.gguf?download=true",
+                "recommended_for": ["x86_64", "amd64", "x86"],
+                "description": "Higher quality quantization for systems with 40GB+ RAM"
+            }
+        },
+        "default_variant": "Q4_K_M",
+        "min_ram_gb": 32
     }
 }
 
-# Default model to use
-DEFAULT_MODEL_NAME = "codellama-7b-instruct"
+# Default model to use - can be overridden through environment variable
+DEFAULT_MODEL_NAME = os.environ.get("LLM_MODEL", "codellama-7b-instruct")
 
 def detect_architecture() -> Tuple[str, str]:
     """
@@ -105,7 +133,8 @@ def get_model_info(model_name: str = None, variant: str = None) -> Dict[str, Any
         "variant": variant,
         "filename": variant_info["filename"],
         "url": variant_info["url"],
-        "description": variant_info["description"]
+        "description": variant_info["description"],
+        "min_ram_gb": model_config.get("min_ram_gb", 8)
     }
 
 def get_default_model_path() -> str:
@@ -116,4 +145,41 @@ def get_default_model_path() -> str:
         Default path to the model file
     """
     model_info = get_model_info()
-    return f"models/{model_info['filename']}" 
+    return f"models/{model_info['filename']}"
+
+def get_available_models() -> Dict[str, Dict[str, Any]]:
+    """
+    Get information about all available models.
+    
+    Returns:
+        Dictionary with model names as keys and basic info as values
+    """
+    models = {}
+    for model_name, config in MODEL_REPOS.items():
+        models[model_name] = {
+            "description": config["description"],
+            "min_ram_gb": config.get("min_ram_gb", 8),
+            "variants": list(config["variants"].keys())
+        }
+    return models
+
+def set_default_model(model_name: str) -> bool:
+    """
+    Set the default model to use.
+    
+    Args:
+        model_name: Name of the model to use as default
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    global DEFAULT_MODEL_NAME
+    
+    if model_name not in MODEL_REPOS:
+        logger.error(f"Unknown model: {model_name}")
+        return False
+        
+    DEFAULT_MODEL_NAME = model_name
+    os.environ["LLM_MODEL"] = model_name
+    logger.info(f"Default model set to: {model_name}")
+    return True 

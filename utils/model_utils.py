@@ -14,7 +14,8 @@ from typing import Tuple, Optional
 from tqdm import tqdm
 
 # Import from within utils package
-from utils.common import success_msg, error_msg, warning_msg, info_msg, get_env_variable, update_env_file
+from utils.common import success_msg, error_msg, warning_msg, info_msg
+from utils.env_utils import get_env_variable, update_env_file
 from utils.model_config import detect_architecture, get_model_info, get_default_model_path
 
 # Configure logger
