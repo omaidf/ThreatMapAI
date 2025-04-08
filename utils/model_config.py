@@ -75,22 +75,30 @@ def detect_architecture() -> Tuple[str, str]:
     """
     try:
         platform_system = platform.system().lower()
-        is_arm = platform.machine().lower() in ['arm64', 'aarch64', 'arm']
+        machine_arch = platform.machine().lower()
+        is_arm = machine_arch in ['arm64', 'aarch64', 'arm']
+        is_x86 = machine_arch in ['x86_64', 'amd64', 'x86']
         
         # Get model configuration
         model_config = MODEL_REPOS[DEFAULT_MODEL_NAME]
         
-        # Determine model variant based on architecture
-        if is_arm:
+        # Force x86 path for Docker containers running on x86 hardware
+        if is_x86:
+            logger.info(f"Detected x86_64 architecture: {machine_arch}")
+            # Use Q4_K_M for NVIDIA GPUs on x86 systems
+            model_variant = "Q4_K_M"
+        elif is_arm:
+            logger.info(f"Detected ARM architecture: {machine_arch}")
             model_variant = "Q4_0"  # Less quantization for ARM
         else:
-            model_variant = "Q4_K_M"  # Better quantization for x86
+            # Fallback to default variant
+            logger.warning(f"Unknown architecture: {machine_arch}, using default variant")
+            model_variant = model_config["default_variant"]
         
         # Get URL for this variant
         model_url = model_config["variants"][model_variant]["url"]
         
-        logger.info(f"Detected architecture: {platform.machine()} on {platform_system}")
-        logger.info(f"Using model variant: {model_variant}")
+        logger.info(f"Using model variant: {model_variant} for {platform_system}")
         
         return model_variant, model_url
     except Exception as e:
