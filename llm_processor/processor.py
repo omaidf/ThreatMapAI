@@ -19,7 +19,7 @@ from repository_analyzer.embedding_store import EmbeddingStore
 
 # Import utility modules
 from utils.common import success_msg, error_msg, warning_msg, info_msg, get_env_variable
-from utils.model_utils import download_model, validate_model_path, check_model_file
+from utils.model_utils import download_model, validate_model_path, check_model_file, detect_gpu_capabilities
 from utils.model_config import get_default_model_path
 
 logger = logging.getLogger(__name__)
@@ -73,6 +73,12 @@ class LLMProcessor:
     def _setup_llm(self) -> None:
         """Set up the local LLM with appropriate configuration."""
         try:
+            # Import the GPU detection function
+            from utils.model_utils import detect_gpu_capabilities
+            
+            # Detect GPU capabilities
+            gpu_config = detect_gpu_capabilities()
+            
             # First try to use LlamaCpp, which is better for GGUF files
             info_msg("Loading model using LlamaCpp (better for GGUF files)")
             try:
@@ -89,10 +95,16 @@ class LLMProcessor:
                 # Configure LlamaCpp options
                 n_ctx = int(get_env_variable("LLM_N_CTX", "4096"))  # Increase context window size - use 4096 when available
                 n_batch = int(get_env_variable("LLM_N_BATCH", "512"))  # Batch size
-                n_gpu_layers = int(get_env_variable("LLM_N_GPU_LAYERS", "0"))  # Number of layers to offload to GPU
+                n_gpu_layers = gpu_config['n_gpu_layers']  # Use detected GPU layers
                 temperature = float(get_env_variable("LLM_TEMPERATURE", "0.7"))
                 max_tokens = int(get_env_variable("LLM_MAX_TOKENS", "1024"))
                 top_p = float(get_env_variable("LLM_TOP_P", "0.95"))
+                
+                # Log GPU usage
+                if n_gpu_layers > 0:
+                    success_msg(f"Using GPU acceleration: {gpu_config['gpu_info']} with {n_gpu_layers} layers")
+                else:
+                    warning_msg("Running on CPU only (no GPU acceleration)")
                 
                 # Save context size for token counting logic
                 self.max_context_size = n_ctx
@@ -154,6 +166,9 @@ class LLMProcessor:
                 # Use accelerate for better model loading
                 from accelerate import init_empty_weights
                 
+                # Determine device based on GPU detection
+                device = gpu_config['device'] if gpu_config['use_gpu'] else "cpu"
+                
                 # Skip quantization if disabled via environment variable
                 if not use_quantization:
                     info_msg("Quantization disabled via LLM_USE_QUANTIZATION, using standard loading")
@@ -161,7 +176,7 @@ class LLMProcessor:
                         model_id,
                         torch_dtype=torch.float16 if use_float16 else torch.float32,
                         low_cpu_mem_usage=True,
-                        device_map="auto" if get_env_variable("LLM_USE_GPU", "false").lower() == "true" else "cpu"
+                        device_map=device if gpu_config['use_gpu'] else "cpu"
                     )
                 else:
                     try:
@@ -186,7 +201,7 @@ class LLMProcessor:
                             model = AutoModelForCausalLM.from_pretrained(
                                 model_id,
                                 quantization_config=quantization_config,
-                                device_map="auto" if get_env_variable("LLM_USE_GPU", "false").lower() == "true" else "cpu",
+                                device_map=device if gpu_config['use_gpu'] else "cpu",
                                 low_cpu_mem_usage=True
                             )
                         except Exception as install_e:
@@ -199,7 +214,7 @@ class LLMProcessor:
                             model_id,
                             torch_dtype=torch.float16 if use_float16 else torch.float32,
                             low_cpu_mem_usage=True,
-                            device_map="auto" if get_env_variable("LLM_USE_GPU", "false").lower() == "true" else "cpu"
+                            device_map=device if gpu_config['use_gpu'] else "cpu"
                         )
                 
                 # Create a pipeline with memory-efficient settings
@@ -217,7 +232,12 @@ class LLMProcessor:
                 
                 # Create the LangChain wrapper
                 self.llm = HuggingFacePipeline(pipeline=pipe)
-                success_msg("Successfully loaded model directly from Hugging Face")
+                
+                # Report GPU status
+                if gpu_config['use_gpu']:
+                    success_msg(f"Successfully loaded model using Hugging Face with {gpu_config['device']} acceleration ({gpu_config['gpu_info']})")
+                else:
+                    success_msg("Successfully loaded model directly from Hugging Face (CPU only)")
             except Exception as local_e:
                 error_msg(f"Failed to load model with standard approach: {str(local_e)}")
                 
@@ -248,14 +268,10 @@ class LLMProcessor:
                 except Exception as fallback_e:
                     error_msg(f"Fallback loading also failed: {str(fallback_e)}")
                     self.llm = None
-                    
+                
         except Exception as e:
-            error_msg(f"Failed to load model from Hugging Face: {str(e)}")
-            error_msg("Using fallback processor with minimal functionality")
+            error_msg(f"Failed to set up LLM: {str(e)}")
             self.llm = None
-            # Set some fallback defaults
-            self.max_context_size = 512
-            self.max_tokens_out = 100
     
     def _get_token_count(self, text: str) -> int:
         """

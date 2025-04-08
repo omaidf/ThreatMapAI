@@ -1,7 +1,5 @@
 """
-Utility functions for the AI Threat Model Map Generator.
-
-This module provides common utility functions used across the application.
+Utility modules for the AI Threat Model Map Generator
 """
 
 from utils.common import (
@@ -14,11 +12,14 @@ from utils.file_utils import (
 )
 from utils.model_utils import (
     validate_model_path, download_model, set_token_interactive, 
-    test_model_loading, check_model_file,
+    test_model_loading, check_model_file, detect_gpu_capabilities
 )
 from utils.model_config import (
     detect_architecture, get_default_model_path, get_model_info,
     MODEL_REPOS, DEFAULT_MODEL_NAME,
+)
+from utils.diagram_utils import (
+    find_diagrams, start_server_and_open_diagrams, view_diagrams
 )
 
 __all__ = [
@@ -45,6 +46,7 @@ __all__ = [
     'set_token_interactive',
     'test_model_loading',
     'check_model_file',
+    'detect_gpu_capabilities',
     
     # Model config
     'detect_architecture',

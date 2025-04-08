@@ -321,3 +321,104 @@ def test_model_loading(model_path: str) -> bool:
     except Exception as e:
         logger.error(f"Failed to test model loading: {str(e)}")
         return False 
+
+def detect_gpu_capabilities() -> dict:
+    """
+    Detect GPU capabilities and return appropriate configurations for LLMs.
+    
+    This function detects if CUDA/GPU is available and returns appropriate
+    configuration settings for model loading.
+    
+    Returns:
+        Dictionary with configuration including:
+        - 'device': 'cuda', 'mps', or 'cpu'
+        - 'n_gpu_layers': Number of layers to offload to GPU
+        - 'use_gpu': Boolean indicating if GPU is available
+        - 'gpu_info': Information about detected GPU
+    """
+    result = {
+        'device': 'cpu',
+        'n_gpu_layers': 0,
+        'use_gpu': False,
+        'gpu_info': 'No GPU detected'
+    }
+    
+    try:
+        # Try importing torch to check for CUDA/MPS availability
+        import torch
+        
+        # First check for CUDA (NVIDIA GPUs)
+        if torch.cuda.is_available():
+            # Get CUDA information
+            gpu_count = torch.cuda.device_count()
+            gpu_name = torch.cuda.get_device_name(0) if gpu_count > 0 else "Unknown NVIDIA GPU"
+            gpu_memory = None
+            
+            try:
+                # Try to get GPU memory info if available
+                gpu_properties = torch.cuda.get_device_properties(0)
+                if hasattr(gpu_properties, 'total_memory'):
+                    gpu_memory = gpu_properties.total_memory / (1024 ** 3)  # Convert to GB
+            except:
+                pass
+            
+            # Configure based on GPU capabilities
+            result['device'] = 'cuda'
+            result['use_gpu'] = True
+            result['gpu_info'] = f"{gpu_name} ({gpu_count} available)"
+            
+            # Decide how many layers to offload to GPU based on memory
+            if gpu_memory is not None:
+                # Conservative estimates:
+                # <4GB: 1 layer, 4-8GB: 8 layers, 8-12GB: 16 layers, >12GB: 32 layers, >24GB: all layers
+                if gpu_memory < 4:
+                    result['n_gpu_layers'] = 1
+                elif gpu_memory < 8:
+                    result['n_gpu_layers'] = 8
+                elif gpu_memory < 12:
+                    result['n_gpu_layers'] = 16
+                elif gpu_memory < 24:
+                    result['n_gpu_layers'] = 32
+                else:
+                    result['n_gpu_layers'] = 100  # All layers
+            else:
+                # If we can't determine memory, be conservative
+                result['n_gpu_layers'] = 8
+            
+            info_msg(f"🔥 NVIDIA GPU detected: {result['gpu_info']}")
+            info_msg(f"Will use CUDA with {result['n_gpu_layers']} GPU layers")
+            return result
+            
+        # Next check for Metal Performance Shaders (Apple Silicon)
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            result['device'] = 'mps'
+            result['use_gpu'] = True
+            result['n_gpu_layers'] = 1  # Start conservative with Apple Silicon
+            result['gpu_info'] = "Apple Silicon GPU (MPS)"
+            
+            # Determine device by platform
+            import platform
+            mac_model = platform.machine()
+            if mac_model == "arm64":
+                # This is Apple Silicon
+                if "M1" in platform.processor():
+                    result['gpu_info'] = "Apple M1"
+                    result['n_gpu_layers'] = 4  # Conservative for M1
+                elif "M2" in platform.processor():
+                    result['gpu_info'] = "Apple M2"
+                    result['n_gpu_layers'] = 8  # Better for M2
+                elif "M3" in platform.processor():
+                    result['gpu_info'] = "Apple M3"
+                    result['n_gpu_layers'] = 12  # More aggressive for M3
+            
+            info_msg(f"🔥 Apple Silicon GPU detected: {result['gpu_info']}")
+            info_msg(f"Will use Metal with {result['n_gpu_layers']} GPU layers")
+            return result
+    
+    except ImportError:
+        warning_msg("PyTorch not available, defaulting to CPU")
+    except Exception as e:
+        warning_msg(f"Error detecting GPU capabilities: {str(e)}")
+    
+    info_msg("Using CPU for inference (no GPU acceleration)")
+    return result 
