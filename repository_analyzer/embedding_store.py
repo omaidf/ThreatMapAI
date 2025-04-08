@@ -7,7 +7,8 @@ code embeddings for semantic search and similarity analysis.
 
 import os
 import logging
-from pathlib import Path
+import pathlib  # Import the whole pathlib module
+from pathlib import Path  # Import Path class specifically
 from typing import List, Dict, Any, Optional, Tuple
 import json
 import faiss
@@ -281,7 +282,8 @@ class EmbeddingStore:
             import os
             import json
             import faiss
-            from pathlib import Path
+            import pathlib  # Import pathlib directly
+            from pathlib import Path  # Also import Path explicitly
             
             if self.index is None:
                 warning_msg("No index to save")
@@ -429,7 +431,8 @@ class EmbeddingStore:
             import json
             import faiss
             import numpy as np
-            from pathlib import Path
+            import pathlib  # Add pathlib import
+            from pathlib import Path  # Explicitly import Path class
 
             # Reset in-memory data
             self.index = None
