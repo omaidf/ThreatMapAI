@@ -24,6 +24,7 @@ except ImportError:
 # from dulwich import porcelain
 
 from .embedding_store import EmbeddingStore
+from utils import info_msg
 import re
 import json
 from tqdm import tqdm

@@ -54,13 +54,33 @@ class LLMProcessor:
     security recommendations using CodeLlama.
     """
     
-    def __init__(self, model_path_or_embedding_store: Union[str, EmbeddingStore]):
+    def __init__(self, model_path_or_embedding_store: Union[str, EmbeddingStore], 
+                distributed: bool = False, gpu_id: Optional[int] = None, 
+                gpu_ids: Optional[List[int]] = None, memory_limit: Optional[float] = None,
+                device: str = None):
         """
         Initialize the LLM processor.
         
         Args:
             model_path_or_embedding_store: Either a path to the model file or an instance of EmbeddingStore
+            distributed: Whether to use distributed processing (multi-GPU) when available
+            gpu_id: Specific GPU ID to use if multiple GPUs are available
+            gpu_ids: List of specific GPU IDs to use if multiple GPUs are available
+            memory_limit: Memory limit per GPU in GB
+            device: Device to use ('cpu', 'cuda', or None for auto-detection)
         """
+        # Initialize core attributes
+        self.distributed = distributed
+        self.gpu_id = gpu_id
+        self.gpu_ids = gpu_ids
+        self.memory_limit = memory_limit
+        self.device = device
+        
+        # Set a default max_context_size to prevent errors
+        self.max_context_size = 2048
+        self.max_tokens_out = 1024
+        
+        # Handle model path or embedding store
         if isinstance(model_path_or_embedding_store, str):
             self.embedding_store = EmbeddingStore()
             self.model_path = model_path_or_embedding_store
