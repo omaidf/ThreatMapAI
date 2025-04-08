@@ -10,6 +10,11 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Initialize default values for variables (will be adjusted based on system detection)
+BATCH_SIZE=5
+PARALLEL_JOBS=2
+PIP_PARALLEL_JOBS=2
+
 # Progress bar function
 show_progress() {
     local total=$1
