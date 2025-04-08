@@ -21,6 +21,7 @@ import webbrowser
 from tqdm import tqdm
 import importlib.util
 import signal
+import psutil
 
 # Import utility modules
 from utils import (
@@ -152,19 +153,45 @@ def setup_tree_sitter() -> None:
         logger.error(f"Failed to setup tree-sitter: {str(e)}")
         raise CLIError(f"Failed to setup tree-sitter: {str(e)}")
 
-def create_embedding_store(try_load: bool = True, device: Optional[str] = None) -> Optional[EmbeddingStore]:
+def create_embedding_store(try_load: bool = True, device: Optional[str] = None, gpu_id: Optional[int] = None) -> Optional[EmbeddingStore]:
     """Create and initialize the embedding store.
     
     Args:
         try_load: Whether to try loading existing embeddings
         device: Device to use ('cpu', 'cuda', or None for auto-detection)
+        gpu_id: Specific GPU ID to use when multiple GPUs are available (ignored if device is 'cpu')
         
     Returns:
         Initialized EmbeddingStore or None if initialization failed
     """
     try:
-        # Initialize the embedding store with specified device
-        embedding_store = EmbeddingStore(device=device)
+        # Handle GPU detection gracefully
+        cuda_available = False
+        try:
+            import torch
+            cuda_available = torch.cuda.is_available()
+        except ImportError:
+            # If torch isn't available, we'll default to CPU anyway
+            pass
+            
+        # Only use CPU if explicitly requested or if CUDA isn't available
+        use_cpu = (device == 'cpu' or not cuda_available)
+        
+        # Configure the embedding store
+        config = {}
+        if not use_cpu:
+            config['device'] = 'cuda'
+            if gpu_id is not None:
+                config['gpu_id'] = gpu_id
+                
+            # Log that we're using GPU for embeddings
+            success_msg(f"Using GPU{f' {gpu_id}' if gpu_id is not None else ''} for embedding generation")
+        else:
+            config['device'] = 'cpu'
+            info_msg("Using CPU for embedding generation")
+
+        # Initialize the store with our configuration
+        embedding_store = EmbeddingStore(**config)
         
         if try_load:
             # Check if embeddings already exist before trying to load
@@ -186,16 +213,16 @@ def create_embedding_store(try_load: bool = True, device: Optional[str] = None) 
             
         return embedding_store
     except ImportError as e:
-        if 'faiss' in str(e):
-            error_msg("FAISS is not installed. Continuing without semantic search capabilities.")
+        if "faiss" in str(e):
+            error_msg("FAISS is not installed. Installing CPU version...")
             try:
-                if click.confirm("Would you like to install FAISS now?", default=True):
-                    info_msg("Installing FAISS... This may take a while.")
-                    subprocess.check_call([sys.executable, "-m", "pip", "install", "faiss-cpu"])
-                    info_msg("FAISS installed successfully. Please restart the tool.")
-            except Exception as install_e:
-                error_msg(f"Failed to install FAISS: {str(install_e)}")
-            return None
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "faiss-cpu"])
+                info_msg("FAISS-CPU installed successfully. Retrying...")
+                return create_embedding_store(try_load, device, gpu_id)
+            except Exception as install_error:
+                error_msg(f"Failed to install FAISS: {str(install_error)}")
+                error_msg("Please run: pip install faiss-cpu")
+                return None
         else:
             error_msg(f"Failed to initialize embedding store: {str(e)}")
             return None
@@ -222,9 +249,100 @@ def cli():
 @cli.command()
 @click.option('--device', type=click.Choice(['auto', 'cpu', 'cuda']), default='auto',
               help='Device to use for embeddings (auto, cpu, cuda)')
-def init(device: str):
-    """Initialize the framework."""
+@click.option('--gpu-ids', help='Specify GPU IDs to use (comma-separated, e.g., "0,1,2")')
+def init(device: str, gpu_ids: str):
+    """Initialize the framework.
+    
+    Detects hardware capabilities and sets up components for optimal performance.
+    For multi-GPU setups, you can specify which GPUs to use with --gpu-ids.
+    """
     try:
+        # Process GPU IDs if provided
+        selected_gpus = None
+        if gpu_ids:
+            try:
+                selected_gpus = [int(gpu_id.strip()) for gpu_id in gpu_ids.split(',')]
+                info_msg(f"Selected GPUs: {selected_gpus}")
+            except Exception as e:
+                warning_msg(f"Invalid GPU IDs format: {str(e)}")
+                warning_msg("Using default GPU selection")
+        
+        # Check hardware capabilities first
+        try:
+            import torch
+            cuda_available = torch.cuda.is_available()
+            if cuda_available:
+                gpu_count = torch.cuda.device_count()
+                
+                # Check if the selected GPUs are valid
+                if selected_gpus:
+                    for gpu_id in selected_gpus:
+                        if gpu_id >= gpu_count:
+                            warning_msg(f"GPU {gpu_id} does not exist (only {gpu_count} GPUs available)")
+                            warning_msg("Ignoring invalid GPU IDs")
+                            # Reset to use all available GPUs
+                            selected_gpus = list(range(gpu_count))
+                            break
+                
+                # Use all available GPUs if none specified
+                if not selected_gpus:
+                    selected_gpus = list(range(gpu_count))
+                
+                # Show information about detected GPUs
+                info_msg(f"Detected {gpu_count} GPU(s):")
+                total_memory = 0
+                for i in range(gpu_count):
+                    gpu_props = torch.cuda.get_device_properties(i)
+                    gpu_name = gpu_props.name
+                    gpu_memory = gpu_props.total_memory / (1024**3)  # Convert to GB
+                    total_memory += gpu_memory
+                    
+                    # Mark if this GPU is selected
+                    is_selected = i in selected_gpus
+                    marker = "→ " if is_selected else "  "
+                    info_msg(f"{marker}GPU {i}: {gpu_name} with {gpu_memory:.2f} GB VRAM")
+                
+                # Set environment variables for selected GPUs
+                os.environ["GPU_IDS"] = ",".join(str(gpu_id) for gpu_id in selected_gpus)
+                from utils.env_utils import update_env_file
+                update_env_file("GPU_IDS", ",".join(str(gpu_id) for gpu_id in selected_gpus))
+                
+                # Provide recommendations based on detected hardware
+                success_msg(f"Hardware acceleration available: {gpu_count} GPU(s) with {total_memory:.2f} GB total VRAM")
+                
+                # Check for multi-GPU capabilities
+                if gpu_count > 1:
+                    if total_memory >= 24:  # Generous threshold for good multi-GPU performance
+                        success_msg("Multi-GPU configuration detected with good memory capacity")
+                        success_msg("Enabling distributed processing for better performance")
+                        os.environ["DISTRIBUTED"] = "true"
+                        update_env_file("DISTRIBUTED", "true")
+                    else:
+                        info_msg("Multi-GPU configuration detected but with limited memory")
+                        info_msg("For optimal performance with large models, consider:")
+                        info_msg("python -m cli configure-gpu --gpu-ids 0")
+                elif gpu_memory and gpu_memory < 6:
+                    warning_msg("GPU memory is limited. You may experience better performance with CPU mode for large models.")
+                    info_msg("Consider using --device cpu for analysis of large codebases")
+            else:
+                info_msg("No GPU detected. Running in CPU-only mode, which is perfectly fine but slower.")
+                # Set environment variable to force CPU
+                if device == 'auto' or device == 'cpu':
+                    os.environ["FORCE_CPU"] = "true"
+                    from utils.env_utils import update_env_file
+                    update_env_file("FORCE_CPU", "true")
+                    update_env_file("FORCE_GPU", "")
+        except ImportError:
+            info_msg("PyTorch not installed. Cannot detect GPU capabilities.")
+        
+        # Set the selected device
+        if device != 'auto':
+            os.environ["FORCE_CPU"] = "true" if device == "cpu" else ""
+            os.environ["FORCE_GPU"] = "true" if device == "cuda" else ""
+            from utils.env_utils import update_env_file
+            update_env_file("FORCE_CPU", "true" if device == "cpu" else "")
+            update_env_file("FORCE_GPU", "true" if device == "cuda" else "")
+        
         # Setup tree-sitter grammars
         success_msg("Initializing tree-sitter grammars...")
         try:
@@ -235,21 +353,56 @@ def init(device: str):
             warning_msg("The framework may not function correctly")
             return
         
-        # Create embedding store
+        # Create embedding store using specified settings
         success_msg("Initializing embedding store...")
         try:
             # Convert 'auto' to None for auto-detection
             device_param = None if device == 'auto' else device
-            embedding_store = create_embedding_store(try_load=True, device=device_param)
-            if embedding_store and embedding_store.gpu_available and device_param != 'cpu':
-                success_msg(f"Embedding store initialized using {embedding_store.device}")
+            
+            # Use first selected GPU if specified
+            gpu_id_param = None
+            if selected_gpus:
+                gpu_id_param = selected_gpus[0]
+                
+            embedding_store = create_embedding_store(try_load=True, device=device_param, gpu_id=gpu_id_param)
+            if embedding_store:
+                if embedding_store.gpu_available and device_param != 'cpu':
+                    success_msg(f"Embedding store initialized using {embedding_store.device}")
+                    if hasattr(embedding_store, 'use_gpu_for_faiss') and embedding_store.use_gpu_for_faiss:
+                        success_msg(f"FAISS index using GPU acceleration (GPU {embedding_store.gpu_id if embedding_store.gpu_id is not None else 0})")
+                else:
+                    success_msg("Embedding store initialized using CPU")
+                    if device_param == 'cuda':
+                        warning_msg("Requested CUDA but GPU not available. Running in CPU mode.")
             else:
-                success_msg("Embedding store initialized using CPU")
+                warning_msg("Embedding store initialization incomplete")
         except Exception as e:
             warning_msg(f"Failed to initialize embedding store: {str(e)}")
             warning_msg("Embedding store functionality will be limited")
             
         success_msg("Framework initialized successfully")
+        
+        # Provide specific recommendations based on detected hardware
+        try:
+            import psutil
+            cpu_count = psutil.cpu_count(logical=False)
+            memory_gb = psutil.virtual_memory().total / (1024**3)
+            
+            if cuda_available:
+                if gpu_count > 1:
+                    info_msg("\nMulti-GPU setup detected! For best performance:")
+                    info_msg(f"python -m cli analyze --gpu-ids {','.join(str(i) for i in selected_gpus)} --distributed")
+                else:
+                    info_msg("\nSingle GPU setup detected. For best performance:")
+                    info_msg("python -m cli analyze --device cuda")
+            elif memory_gb > 32 and cpu_count >= 8:
+                info_msg("\nHigh-performance CPU setup detected. For best performance:")
+                info_msg("python -m cli analyze --device cpu")
+            elif memory_gb < 16:
+                warning_msg("\nLimited memory detected. For better stability:")
+                warning_msg("python -m cli analyze --device cpu --memory-limit 4")
+        except Exception:
+            pass
         
     except Exception as e:
         error_msg(f"Failed to initialize framework: {str(e)}")
@@ -392,13 +545,28 @@ def clean_previous_run(output_dir: str, force_clean: bool = False, clear_embeddi
 @click.option('--reuse-embeddings', is_flag=True, help='Reuse existing embeddings without asking')
 @click.option('--device', type=click.Choice(['auto', 'cpu', 'cuda']), default='auto',
               help='Device to use for embeddings (auto, cpu, cuda)')
+@click.option('--gpu-id', type=int, help='Specific GPU ID to use for embeddings')
+@click.option('--distributed', is_flag=True, help='Use distributed processing for multi-GPU setups')
+@click.option('--memory-limit', type=float, help='Limit GPU memory usage (in GB)')
+@click.option('--suppress-warnings', is_flag=True, default=True, help='Suppress non-critical warnings')
 def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, clean: bool, 
-           clear_embeddings: bool, reuse_embeddings: bool, device: str):
+           clear_embeddings: bool, reuse_embeddings: bool, device: str, gpu_id: int, 
+           distributed: bool, memory_limit: float, suppress_warnings: bool):
     """Analyze a repository for security threats."""
     analyzer = None
     embedding_store = None
     
     try:
+        # Suppress warnings if requested
+        if suppress_warnings:
+            import warnings
+            warnings.filterwarnings("ignore", category=UserWarning)
+            # Specifically suppress FAISS-related warnings
+            warnings.filterwarnings("ignore", message=".*GPU FAISS.*")
+            warnings.filterwarnings("ignore", message=".*CUDA.*")
+            # Reduce logging level for known verbose modules
+            logging.getLogger("faiss").setLevel(logging.ERROR)
+            
         # Ensure output directory exists
         check_output_directory(output_dir)
             
@@ -428,6 +596,58 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
         
         # Set environment variables
         os.environ["OUTPUT_DIR"] = output_dir
+        
+        # Force GPU usage when available (unless explicitly set to CPU)
+        if device != 'cpu':
+            # Check if GPU is available
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    # For CUDA operations, force GPU
+                    os.environ["FORCE_GPU"] = "true"
+                    if "FORCE_CPU" in os.environ:
+                        del os.environ["FORCE_CPU"]
+                    
+                    # Get number of available GPUs
+                    gpu_count = torch.cuda.device_count()
+                    
+                    # For multi-GPU setups, enable distributed mode if requested
+                    if distributed and gpu_count > 1:
+                        os.environ["DISTRIBUTED"] = "true"
+                        info_msg(f"Using distributed processing across {gpu_count} GPUs")
+                    
+                    # Set specific GPU ID if provided
+                    if gpu_id is not None:
+                        if gpu_id < gpu_count:
+                            os.environ["GPU_IDS"] = str(gpu_id)
+                            info_msg(f"Using specific GPU: {gpu_id}")
+                        else:
+                            warning_msg(f"GPU {gpu_id} not available (only {gpu_count} GPUs detected)")
+                            warning_msg(f"Using default GPU 0 instead")
+                            os.environ["GPU_IDS"] = "0"
+                    
+                    # Set memory limit if provided
+                    if memory_limit:
+                        os.environ["GPU_MEMORY_LIMIT"] = str(memory_limit)
+                        info_msg(f"GPU memory limit set to {memory_limit} GB")
+                    
+                    success_msg("GPU acceleration enabled for analysis")
+                else:
+                    warning_msg("No GPU detected, falling back to CPU")
+                    os.environ["FORCE_CPU"] = "true"
+                    if "FORCE_GPU" in os.environ:
+                        del os.environ["FORCE_GPU"]
+            except ImportError:
+                warning_msg("PyTorch not installed, cannot detect GPU. Falling back to CPU")
+                os.environ["FORCE_CPU"] = "true"
+                if "FORCE_GPU" in os.environ:
+                    del os.environ["FORCE_GPU"]
+        else:
+            # Explicitly requested CPU mode
+            info_msg("Using CPU as requested")
+            os.environ["FORCE_CPU"] = "true"
+            if "FORCE_GPU" in os.environ:
+                del os.environ["FORCE_GPU"]
         
         # Ensure model exists
         model_path = validate_model_path(model_path)
@@ -487,17 +707,25 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
             else:
                 use_existing = False
             
-            # Initialize embedding store
+            # Initialize embedding store with specified GPU ID
             if clear_embeddings:
                 # Initialize without loading existing data
-                embedding_store = create_embedding_store(try_load=False, device=None if device == 'auto' else device)
+                if device == 'auto':
+                    device_param = None  # Auto-detect
+                else:
+                    device_param = device
+                embedding_store = create_embedding_store(try_load=False, device=device_param, gpu_id=gpu_id)
                 # Explicitly clear any existing data
                 if embedding_store:
                     embedding_store.clear()
                     info_msg("Cleared existing embeddings")
             else:
                 # Try to load existing embeddings if available
-                embedding_store = create_embedding_store(try_load=use_existing, device=None if device == 'auto' else device)
+                if device == 'auto':
+                    device_param = None  # Auto-detect
+                else:
+                    device_param = device
+                embedding_store = create_embedding_store(try_load=use_existing, device=device_param, gpu_id=gpu_id)
             progress.update(1)
             
             # Initialize the repository analyzer directly, not in a subprocess
@@ -509,11 +737,28 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
             # Import required modules directly
             from repository_analyzer.analyzer import RepositoryAnalyzer
             
-            # Initialize analyzer component
-            analyzer = RepositoryAnalyzer(
-                repo_path=repository_url if local else None,
-                embedding_store=embedding_store
-            )
+            # Initialize analyzer component with GPU configuration
+            analyzer_config = {
+                'repo_path': repository_url if local else None,
+                'embedding_store': embedding_store,
+            }
+            
+            # Add multi-GPU configuration if distributed mode is enabled
+            if distributed:
+                analyzer_config['distributed'] = True
+                # Get GPU IDs from environment or use all available
+                gpu_ids_str = os.environ.get("GPU_IDS", "")
+                if gpu_ids_str:
+                    try:
+                        analyzer_config['gpu_ids'] = [int(id.strip()) for id in gpu_ids_str.split(',')]
+                    except ValueError:
+                        warning_msg(f"Invalid GPU IDs format: {gpu_ids_str}, using default")
+                
+                # Add memory limit if specified
+                if memory_limit:
+                    analyzer_config['memory_limit'] = memory_limit
+            
+            analyzer = RepositoryAnalyzer(**analyzer_config)
             
             # Run analysis directly
             with tqdm(total=1, desc="Analyzing repository") as progress:
@@ -540,13 +785,53 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
                     }
                 progress.update(1)
             
-            # Initialize LLM processor in isolation to avoid memory conflicts with analyzer
+            # Initialize LLM processor with hardware config
             processor = None
             try:
                 # Import in function scope to avoid memory issues
                 from llm_processor.processor import LLMProcessor
-                processor = LLMProcessor(model_path_or_embedding_store=model_path)
+                
+                # Prepare LLM processor configuration with hardware settings
+                llm_config = {'model_path_or_embedding_store': model_path}
+                
+                # Add device configuration
+                if device != 'auto':
+                    llm_config['device'] = device
+                
+                # Add GPU ID if specified
+                if gpu_id is not None:
+                    llm_config['gpu_id'] = gpu_id
+                
+                # Add distributed configuration if enabled
+                if distributed:
+                    llm_config['distributed'] = True
+                    # Pass GPU IDs from environment or use all available
+                    gpu_ids_str = os.environ.get("GPU_IDS", "")
+                    if gpu_ids_str:
+                        try:
+                            llm_config['gpu_ids'] = [int(id.strip()) for id in gpu_ids_str.split(',')]
+                        except ValueError:
+                            warning_msg(f"Invalid GPU IDs format: {gpu_ids_str}, using default")
+                
+                # Add memory limit if specified
+                if memory_limit:
+                    llm_config['memory_limit'] = memory_limit
+                
+                processor = LLMProcessor(**llm_config)
                 info_msg(f"LLM processor initialized with model: {model_path}")
+                
+                # Log hardware configuration
+                if hasattr(processor, 'device') and processor.device == 'cuda':
+                    if hasattr(processor, 'gpu_id') and processor.gpu_id is not None:
+                        info_msg(f"LLM running on GPU {processor.gpu_id}")
+                    else:
+                        info_msg("LLM running on GPU")
+                    
+                    if hasattr(processor, 'distributed') and processor.distributed:
+                        info_msg("Using distributed processing across multiple GPUs")
+                elif hasattr(processor, 'device'):
+                    info_msg(f"LLM running on {processor.device}")
+                
             except Exception as e:
                 warning_msg(f"Failed to initialize LLM: {str(e)}")
                 warning_msg("Using fallback processor. Results will be limited.")
@@ -762,14 +1047,69 @@ def view(output_dir: str, port: int):
 def download_model_cmd(force: bool):
     """Download the CodeLlama model for local inference using huggingface_hub."""
     try:
+        from utils.model_config import get_model_info
+        
         info_msg("Starting model download...")
         model_path = get_default_model_path()
         
-        # Download the model using huggingface_hub
-        downloaded_path = download_model(model_path=model_path, force=force)
+        # Get model info to display requirements
+        from utils.env_utils import get_env_variable
+        model_name = get_env_variable("LLM_MODEL", "codellama-7b-instruct")
+        model_info = get_model_info(model_name)
         
-        success_msg(f"Model downloaded successfully to {downloaded_path}")
-        info_msg("You can now run `python -m cli analyze` to analyze a repository")
+        # Show hardware requirements
+        warning_msg(f"Model: {model_info['name']} - Hardware Requirements:")
+        
+        # RAM requirements
+        min_ram = model_info.get('min_ram_gb', 16)
+        info_msg(f"- Minimum RAM: {min_ram}GB")
+        
+        # GPU requirements
+        is_large_model = "70b" in model_name.lower()
+        if is_large_model:
+            warning_msg("- GPU: Recommended 24GB+ VRAM for GPU acceleration")
+            warning_msg("  Without sufficient GPU memory, the model will run on CPU (much slower)")
+        else:
+            info_msg("- GPU: Optional. 8GB+ VRAM recommended for acceleration")
+            info_msg("  Model will work on CPU-only systems but will be slower")
+        
+        # Check if user has enough RAM
+        system_ram = psutil.virtual_memory().total / (1024**3)  # in GB
+        if system_ram < min_ram:
+            warning_msg(f"⚠️ WARNING: Your system has {system_ram:.1f}GB RAM but model requires {min_ram}GB")
+            warning_msg("The model may not load or could cause system instability")
+            if not click.confirm("Continue with download anyway?", default=False):
+                info_msg("Download canceled")
+                return
+        
+        # Check if user has a GPU
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # in GB
+                if is_large_model and gpu_memory < 24:
+                    warning_msg(f"GPU has {gpu_memory:.1f}GB VRAM, which may be insufficient for the 70B model")
+                    warning_msg("The model will likely run on CPU or with limited GPU acceleration")
+                else:
+                    info_msg(f"Detected GPU with {gpu_memory:.1f}GB VRAM, which should be sufficient")
+            else:
+                if is_large_model:
+                    warning_msg("No GPU detected. 70B model will be very slow on CPU-only systems")
+                    if not click.confirm("Continue with download for CPU-only usage?", default=False):
+                        info_msg("Download canceled")
+                        return
+                else:
+                    info_msg("No GPU detected. Model will run on CPU (slower but functional)")
+        except ImportError:
+            info_msg("PyTorch not detected. Cannot check GPU capabilities")
+        
+        # Download the model using huggingface_hub
+        if click.confirm("Ready to download model? This may take a while depending on your connection", default=True):
+            downloaded_path = download_model(model_path=model_path, force=force)
+            success_msg(f"Model downloaded successfully to {downloaded_path}")
+            info_msg("You can now run `python -m cli analyze` to analyze a repository")
+        else:
+            info_msg("Download canceled")
     except Exception as e:
         error_msg(f"Failed to download model: {str(e)}")
         raise click.ClickException(str(e))
@@ -941,7 +1281,9 @@ def set_token():
         error_msg(f"Error setting token: {str(e)}")
 
 @cli.command()
-def gpu_info():
+@click.option('--detailed', is_flag=True, help='Show detailed GPU information')
+@click.option('--benchmark', is_flag=True, help='Run a quick benchmark to test GPU performance')
+def gpu_info(detailed: bool, benchmark: bool):
     """Show GPU information for embedding and model acceleration."""
     try:
         # Check for PyTorch
@@ -951,37 +1293,217 @@ def gpu_info():
                 gpu_count = torch.cuda.device_count()
                 success_msg(f"PyTorch detected {gpu_count} CUDA-capable GPU(s)")
                 
+                # Get current GPU configuration from environment
+                current_gpu_ids = os.environ.get("GPU_IDS", "")
+                if current_gpu_ids:
+                    info_msg(f"Currently selected GPUs: {current_gpu_ids}")
+                    
+                memory_limit = os.environ.get("GPU_MEMORY_LIMIT", "")
+                if memory_limit:
+                    info_msg(f"GPU memory limit: {memory_limit} GB")
+                    
+                distributed_mode = os.environ.get("DISTRIBUTED", "").lower() in ["true", "1", "yes"]
+                if distributed_mode:
+                    info_msg("Multi-GPU distributed mode is enabled")
+                
                 for i in range(gpu_count):
                     device_props = torch.cuda.get_device_properties(i)
                     gpu_name = device_props.name
                     gpu_memory = device_props.total_memory / (1024**3)  # Convert to GB
-                    info_msg(f"  GPU {i}: {gpu_name} with {gpu_memory:.2f} GB memory")
+                    
+                    # Check if this GPU is currently being used
+                    is_selected = str(i) in current_gpu_ids.split(",") if current_gpu_ids else False
+                    selection_marker = "→ " if is_selected else "  "
+                    
+                    info_msg(f"{selection_marker}GPU {i}: {gpu_name} with {gpu_memory:.2f} GB memory")
+                    
+                    # Show detailed information if requested
+                    if detailed:
+                        compute_capability = f"{device_props.major}.{device_props.minor}"
+                        multi_processor_count = device_props.multi_processor_count
+                        
+                        click.echo(f"     Compute capability: {compute_capability}")
+                        click.echo(f"     Multi-processors: {multi_processor_count}")
+                        click.echo(f"     Clock rate: {device_props.clock_rate / 1000:.0f} MHz")
+                        
+                        # Get current memory usage
+                        try:
+                            memory_allocated = torch.cuda.memory_allocated(i) / (1024**3)
+                            memory_reserved = torch.cuda.memory_reserved(i) / (1024**3)
+                            click.echo(f"     Memory allocated: {memory_allocated:.2f} GB")
+                            click.echo(f"     Memory reserved: {memory_reserved:.2f} GB")
+                            click.echo(f"     Memory available: {gpu_memory - memory_reserved:.2f} GB")
+                        except:
+                            click.echo("     Memory usage information not available")
+                
+                # Show recommended configuration based on hardware
+                if gpu_count > 1:
+                    info_msg("\nRecommended multi-GPU configuration:")
+                    for config_type, gpus in [
+                        ("High Performance", list(range(min(3, gpu_count)))),
+                        ("Balanced", list(range(min(2, gpu_count)))),
+                        ("Memory Efficient", [0])
+                    ]:
+                        gpu_ids_str = ",".join(str(i) for i in gpus)
+                        click.echo(f"  {config_type}: --gpu-ids {gpu_ids_str}" + 
+                                  (" --distributed" if len(gpus) > 1 else ""))
+                
+                # Run a quick benchmark if requested
+                if benchmark:
+                    info_msg("\nRunning quick GPU benchmark...")
+                    
+                    # Set benchmark device
+                    if current_gpu_ids:
+                        benchmark_device = int(current_gpu_ids.split(",")[0])
+                        info_msg(f"Using selected GPU {benchmark_device} for benchmark")
+                    else:
+                        benchmark_device = 0
+                        info_msg(f"Using GPU {benchmark_device} for benchmark")
+                    
+                    # Create a simple benchmark test
+                    try:
+                        # Benchmark matrix multiplication as a simple test
+                        torch.cuda.set_device(benchmark_device)
+                        
+                        # Test different sizes to see scaling
+                        sizes = [1000, 2000, 4000]
+                        for size in sizes:
+                            # Create random tensors
+                            a = torch.randn(size, size, device=f"cuda:{benchmark_device}")
+                            b = torch.randn(size, size, device=f"cuda:{benchmark_device}")
+                            
+                            # Warm-up
+                            torch.matmul(a, b)
+                            torch.cuda.synchronize()
+                            
+                            # Benchmark
+                            start_event = torch.cuda.Event(enable_timing=True)
+                            end_event = torch.cuda.Event(enable_timing=True)
+                            
+                            start_event.record()
+                            result = torch.matmul(a, b)
+                            end_event.record()
+                            
+                            torch.cuda.synchronize()
+                            elapsed_time = start_event.elapsed_time(end_event)
+                            
+                            success_msg(f"Matrix multiplication ({size}x{size}): {elapsed_time:.2f} ms")
+                            
+                        # Calculate theoretical FLOPS for matrix multiplication
+                        # For an NxN matrix multiplication: 2*N^3 operations
+                        largest_size = sizes[-1]
+                        flops = 2 * (largest_size ** 3)
+                        teraflops = (flops / elapsed_time) / 1e9  # Convert to TFLOPS
+                        info_msg(f"Approximate performance: {teraflops:.2f} TFLOPS")
+                        
+                        # Memory bandwidth test
+                        vector_size = 100_000_000  # 100M elements
+                        a = torch.randn(vector_size, device=f"cuda:{benchmark_device}")
+                        b = torch.randn(vector_size, device=f"cuda:{benchmark_device}")
+                        
+                        # Warm-up
+                        _ = a + b
+                        torch.cuda.synchronize()
+                        
+                        # Benchmark
+                        start_event = torch.cuda.Event(enable_timing=True)
+                        end_event = torch.cuda.Event(enable_timing=True)
+                        
+                        start_event.record()
+                        _ = a + b
+                        end_event.record()
+                        
+                        torch.cuda.synchronize()
+                        elapsed_time = start_event.elapsed_time(end_event)
+                        
+                        # Calculate memory bandwidth (read 2 vectors, write 1)
+                        bytes_processed = 3 * vector_size * 4  # 4 bytes per float32
+                        bandwidth_gb_s = (bytes_processed / (elapsed_time / 1000)) / 1e9
+                        
+                        success_msg(f"Memory bandwidth: {bandwidth_gb_s:.2f} GB/s")
+                        
+                    except Exception as bench_error:
+                        warning_msg(f"Benchmark error: {str(bench_error)}")
                     
                 # Test for sentence-transformers
                 try:
                     from sentence_transformers import SentenceTransformer
-                    info_msg("Testing small model load on CUDA...")
-                    model = SentenceTransformer('paraphrase-MiniLM-L3-v2', device='cuda')
-                    success_msg("✅ Successfully loaded embedding model on GPU")
+                    info_msg("\nTesting embedding model on GPU...")
+                    
+                    # Use the first GPU by default or the first selected one
+                    test_device = 0
+                    if current_gpu_ids:
+                        test_device = int(current_gpu_ids.split(",")[0])
+                        
+                    model = SentenceTransformer('paraphrase-MiniLM-L3-v2', device=f'cuda:{test_device}')
+                    success_msg(f"✅ Successfully loaded embedding model on GPU {test_device}")
+                    
                     # Test embedding
                     embedding = model.encode(["This is a test sentence"])
                     success_msg(f"✅ Generated embedding vector with shape: {embedding.shape}")
+                    
+                    # If there are multiple GPUs, suggest distributed setup
+                    if gpu_count > 1 and not distributed_mode:
+                        info_msg("You have multiple GPUs. For better performance, consider using:")
+                        info_msg("python -m cli configure-gpu --gpu-ids 0,1" + 
+                                ("" if gpu_count <= 2 else f",2..{gpu_count-1}") + 
+                                " --distributed")
                 except Exception as e:
                     warning_msg(f"Failed to load embedding model on GPU: {str(e)}")
             else:
                 info_msg("No CUDA-capable GPUs detected by PyTorch")
+                info_msg("The system will run in CPU-only mode, which is perfectly fine but slower")
+                # Check CPU information
+                try:
+                    import psutil
+                    cpu_count = psutil.cpu_count(logical=False)
+                    logical_cpu_count = psutil.cpu_count(logical=True)
+                    memory = psutil.virtual_memory()
+                    memory_gb = memory.total / (1024**3)
+                    
+                    info_msg(f"CPU: {cpu_count} physical cores, {logical_cpu_count} logical cores")
+                    info_msg(f"System memory: {memory_gb:.2f} GB")
+                    
+                    # Add CPU recommendation
+                    if memory_gb > 32:
+                        info_msg("Your system has sufficient RAM for CPU-based model execution")
+                    elif memory_gb > 16:
+                        info_msg("Your system has adequate RAM for smaller models in CPU mode")
+                    else:
+                        warning_msg("Limited RAM may affect performance with larger models")
+                except:
+                    pass
         except ImportError:
             warning_msg("PyTorch not installed. Cannot check GPU availability.")
+            info_msg("Run the setup script to install all dependencies")
             
         # Check for FAISS
         try:
             import faiss
             if hasattr(faiss, 'get_num_gpus') and faiss.get_num_gpus() > 0:
-                success_msg(f"FAISS detected {faiss.get_num_gpus()} GPUs")
+                success_msg(f"\nFAISS with GPU acceleration available")
             else:
-                info_msg("FAISS does not detect any GPUs or is using CPU version")
+                info_msg("\nFAISS is using CPU version (this is normal)")
+                
+                # Provide clear information about GPU usage
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        success_msg("Your system will still use GPU for all important operations:")
+                        info_msg("✓ GPU acceleration for the LLM model")
+                        info_msg("✓ GPU acceleration for embedding generation")
+                        info_msg("✓ Only vector similarity search uses CPU (minimal impact)")
+                except ImportError:
+                    pass
         except ImportError:
-            warning_msg("FAISS not installed. Cannot check FAISS GPU support.")
+            warning_msg("FAISS not installed.")
+            try:
+                if click.confirm("Would you like to install FAISS CPU version now?", default=True):
+                    info_msg("Installing faiss-cpu...")
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "faiss-cpu"])
+                    success_msg("FAISS CPU version installed successfully")
+            except Exception as e:
+                warning_msg(f"Failed to install FAISS: {str(e)}")
             
     except Exception as e:
         error_msg(f"Error checking GPU information: {str(e)}")
@@ -989,8 +1511,15 @@ def gpu_info():
 @cli.command()
 @click.option('--force-gpu', is_flag=True, help='Force GPU usage for LLM (overrides detection)')
 @click.option('--force-cpu', is_flag=True, help='Force CPU usage for LLM (overrides detection)')
-def configure_gpu(force_gpu: bool, force_cpu: bool):
-    """Configure GPU usage for LLaMA model and embeddings."""
+@click.option('--gpu-ids', help='Specify GPU IDs to use (comma-separated, e.g., "0,1,2")')
+@click.option('--memory-limit', type=float, help='Limit GPU memory usage (in GB)')
+@click.option('--distributed', is_flag=True, help='Enable multi-GPU distributed processing (experimental)')
+def configure_gpu(force_gpu: bool, force_cpu: bool, gpu_ids: str, memory_limit: float, distributed: bool):
+    """Configure GPU usage for LLaMA model and embeddings.
+    
+    For multi-GPU setups, you can specify which GPUs to use with --gpu-ids.
+    The --memory-limit option helps when sharing GPU resources with other applications.
+    """
     try:
         from utils.model_utils import detect_gpu_capabilities
         
@@ -998,6 +1527,53 @@ def configure_gpu(force_gpu: bool, force_cpu: bool):
         if force_gpu and force_cpu:
             error_msg("Cannot force both CPU and GPU at the same time")
             return
+        
+        # Process GPU IDs if provided
+        selected_gpus = None
+        if gpu_ids:
+            try:
+                selected_gpus = [int(gpu_id.strip()) for gpu_id in gpu_ids.split(',')]
+                info_msg(f"Selected GPUs: {selected_gpus}")
+                
+                # Quick validation of GPU IDs
+                import torch
+                if torch.cuda.is_available():
+                    available_gpus = torch.cuda.device_count()
+                    for gpu_id in selected_gpus:
+                        if gpu_id >= available_gpus:
+                            warning_msg(f"GPU {gpu_id} does not exist (only {available_gpus} GPUs available)")
+                            if not click.confirm("Continue with other valid GPUs?", default=True):
+                                info_msg("Operation canceled")
+                                return
+                            # Filter out invalid GPUs
+                            selected_gpus = [gpu_id for gpu_id in selected_gpus if gpu_id < available_gpus]
+                            if not selected_gpus:
+                                error_msg("No valid GPUs selected")
+                                return
+                            info_msg(f"Using GPUs: {selected_gpus}")
+            except Exception as e:
+                error_msg(f"Invalid GPU IDs format: {str(e)}")
+                info_msg("Please use comma-separated numbers, e.g., '0,1,2'")
+                return
+        
+        if force_gpu:
+            # First check if CUDA is available
+            cuda_available = False
+            try:
+                import torch
+                cuda_available = torch.cuda.is_available()
+                if not cuda_available:
+                    warning_msg("WARNING: No CUDA-capable GPU detected, but trying to force GPU mode")
+                    warning_msg("This may cause errors or falls back to CPU mode")
+                    if not click.confirm("Continue with force GPU mode anyway?", default=False):
+                        info_msg("Operation canceled")
+                        return
+            except ImportError:
+                warning_msg("PyTorch not installed, cannot verify GPU availability")
+                warning_msg("Run setup.sh to install all dependencies properly")
+                if not click.confirm("Continue with force GPU mode anyway?", default=False):
+                    info_msg("Operation canceled")
+                    return
             
         # Detect current settings
         current_gpu = os.environ.get("FORCE_GPU", "").lower() in ["true", "1", "yes"]
@@ -1017,9 +1593,29 @@ def configure_gpu(force_gpu: bool, force_cpu: bool):
             update_env_file("FORCE_GPU", "true")
             update_env_file("FORCE_CPU", "")
             
+            # Update GPU IDs if provided
+            if selected_gpus:
+                update_env_file("GPU_IDS", ",".join(str(gpu_id) for gpu_id in selected_gpus))
+                os.environ["GPU_IDS"] = ",".join(str(gpu_id) for gpu_id in selected_gpus)
+                success_msg(f"Selected GPUs {selected_gpus} will be used for processing")
+            
+            # Update memory limit if provided
+            if memory_limit:
+                update_env_file("GPU_MEMORY_LIMIT", str(memory_limit))
+                os.environ["GPU_MEMORY_LIMIT"] = str(memory_limit)
+                success_msg(f"GPU memory usage limited to {memory_limit} GB")
+            
+            # Update distributed flag
+            if distributed:
+                update_env_file("DISTRIBUTED", "true")
+                os.environ["DISTRIBUTED"] = "true"
+                success_msg("Multi-GPU distributed processing enabled (experimental)")
+                info_msg("This feature requires all selected GPUs to have sufficient memory")
+            
             success_msg("GPU acceleration FORCED ON for LLM")
             if not gpu_config['use_gpu']:
                 warning_msg("WARNING: No GPU detected but forcing GPU acceleration. This may cause errors.")
+                info_msg("If you encounter issues, use --force-cpu to switch back to CPU mode")
         elif force_cpu:
             # Set environment variable to force CPU
             os.environ["FORCE_CPU"] = "true"
@@ -1031,9 +1627,42 @@ def configure_gpu(force_gpu: bool, force_cpu: bool):
             update_env_file("FORCE_CPU", "true")
             update_env_file("FORCE_GPU", "")
             
+            # Clear any multi-GPU settings
+            update_env_file("GPU_IDS", "")
+            update_env_file("DISTRIBUTED", "")
+            update_env_file("GPU_MEMORY_LIMIT", "")
+            if "GPU_IDS" in os.environ:
+                del os.environ["GPU_IDS"]
+            if "DISTRIBUTED" in os.environ:
+                del os.environ["DISTRIBUTED"]
+            if "GPU_MEMORY_LIMIT" in os.environ:
+                del os.environ["GPU_MEMORY_LIMIT"]
+            
             success_msg("GPU acceleration FORCED OFF for LLM (using CPU only)")
+            info_msg("The system will run slower but can work on machines without GPU")
         else:
-            # No change, just display current status
+            # No change to force settings, but update other GPU options
+            
+            # Update GPU IDs if provided
+            if selected_gpus:
+                update_env_file("GPU_IDS", ",".join(str(gpu_id) for gpu_id in selected_gpus))
+                os.environ["GPU_IDS"] = ",".join(str(gpu_id) for gpu_id in selected_gpus)
+                success_msg(f"Selected GPUs {selected_gpus} will be used for processing")
+            
+            # Update memory limit if provided
+            if memory_limit:
+                update_env_file("GPU_MEMORY_LIMIT", str(memory_limit))
+                os.environ["GPU_MEMORY_LIMIT"] = str(memory_limit)
+                success_msg(f"GPU memory usage limited to {memory_limit} GB")
+            
+            # Update distributed flag
+            if distributed:
+                update_env_file("DISTRIBUTED", "true")
+                os.environ["DISTRIBUTED"] = "true"
+                success_msg("Multi-GPU distributed processing enabled (experimental)")
+                info_msg("This feature requires all selected GPUs to have sufficient memory")
+            
+            # Just display current status
             if current_gpu:
                 info_msg("Current setting: GPU acceleration FORCED ON")
             elif current_cpu:
@@ -1046,6 +1675,7 @@ def configure_gpu(force_gpu: bool, force_cpu: bool):
                 success_msg(f"Will use {gpu_config['n_gpu_layers']} GPU layers for LLM")
             else:
                 info_msg("No GPU detected or GPU not available. Using CPU.")
+                info_msg("The system will run slower but is fully functional in CPU-only mode")
     except Exception as e:
         error_msg(f"Error configuring GPU settings: {str(e)}")
 
@@ -1069,6 +1699,27 @@ def main():
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
         
+        # Check if this is the first run (no arguments) and provide helpful guidance
+        if len(sys.argv) == 1:
+            try:
+                import torch
+                cuda_available = torch.cuda.is_available()
+                if cuda_available:
+                    gpu_count = torch.cuda.device_count()
+                    gpu_name = torch.cuda.get_device_name(0) if gpu_count > 0 else "Unknown GPU"
+                    info_msg(f"Hardware acceleration available: {gpu_name}")
+                    info_msg("For optimal performance on this GPU, run:")
+                    info_msg("  python -m cli init --device cuda")
+                    info_msg("  python -m cli configure-gpu --force-gpu")
+                else:
+                    info_msg("Running in CPU-only mode (no GPU detected)")
+                    info_msg("This is perfectly fine and the tool will work normally, just slower")
+                    info_msg("For optimal CPU setup, run:")
+                    info_msg("  python -m cli init --device cpu")
+                    info_msg("  python -m cli configure-gpu --force-cpu")
+            except ImportError:
+                pass
+        
         # Check if using default model and show message about 70B option
         from utils.model_config import DEFAULT_MODEL_NAME, MODEL_REPOS
         from utils.env_utils import get_env_variable
@@ -1080,8 +1731,9 @@ def main():
         
         if is_analyze_command and (not env_model or env_model == "codellama-7b-instruct") and "70b" not in model_path.lower():
             info_msg("")
-            info_msg("ℹ️  TIP: This project now supports CodeLlama 70B for much better results!")
+            info_msg("ℹ️  TIP: This project supports CodeLlama 70B for much better results!")
             info_msg("To use it, run: python -m cli select_model codellama-70b-instruct --download")
+            info_msg("Note: 70B model requires more RAM and GPU memory")
             info_msg("")
         
         # Run the CLI
