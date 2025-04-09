@@ -207,55 +207,57 @@ def detect_gpu_capabilities(force_gpu: bool = False, force_cpu: bool = False) ->
             
             # Special case for multiple GPUs
             if gpu_count > 1:
-                # With multiple GPUs, be more aggressive with layer offloading
+                # Multi-GPU setup requires aggressive layer offloading
                 if is_large_model:
+                    # For 70B models with multiple GPUs
                     if gpu_count >= 4:
-                        # With 4+ GPUs, we can offload more layers for large models
-                        result['n_gpu_layers'] = 64
-                    else:
-                        # With 2-3 GPUs, be more conservative for 70B model
-                        result['n_gpu_layers'] = 32
+                        # With 4+ GPUs, we can offload all layers for large models
+                        result['n_gpu_layers'] = -1  # All layers
+                    elif gpu_count >= 2:
+                        # With 2-3 GPUs, be more aggressive for 70B model
+                        result['n_gpu_layers'] = -1  # All layers
                 else:
-                    # For smaller models, we can use more layers with fewer GPUs
-                    result['n_gpu_layers'] = 100  # All layers
+                    # For smaller models, definitely use all layers with multiple GPUs
+                    result['n_gpu_layers'] = -1  # All layers
+                
+                # Log special multi-GPU configuration
+                info_msg(f"Using multi-GPU configuration with {gpu_count} GPUs")
             # Single GPU case
             elif gpu_memory is not None:
                 # Decide based on GPU memory and model size
                 if is_large_model:
-                    # More conservative for large models
+                    # More aggressive for large models on single GPU
                     if gpu_memory < 8:
-                        result['n_gpu_layers'] = 1   # Very limited
+                        result['n_gpu_layers'] = 8   # Very limited
                     elif gpu_memory < 16:
-                        result['n_gpu_layers'] = 8   # Limited
+                        result['n_gpu_layers'] = 24  # Limited
                     elif gpu_memory < 24:
-                        result['n_gpu_layers'] = 16  # Moderate
+                        result['n_gpu_layers'] = 32  # Moderate
                     elif gpu_memory < 32:
-                        result['n_gpu_layers'] = 24  # Good
+                        result['n_gpu_layers'] = 60  # Good
                     else:
-                        result['n_gpu_layers'] = 32  # Very good
+                        result['n_gpu_layers'] = -1  # All layers (for 40GB+ cards)
                 else:
                     # More aggressive for smaller models
                     if gpu_memory < 4:
-                        result['n_gpu_layers'] = 1
-                    elif gpu_memory < 8:
                         result['n_gpu_layers'] = 8
-                    elif gpu_memory < 12:
-                        result['n_gpu_layers'] = 16
-                    elif gpu_memory < 24:
-                        result['n_gpu_layers'] = 32
+                    elif gpu_memory < 8:
+                        result['n_gpu_layers'] = 24
+                    elif gpu_memory < 16:
+                        result['n_gpu_layers'] = -1  # All layers
                     else:
-                        result['n_gpu_layers'] = 100  # All layers
+                        result['n_gpu_layers'] = -1  # All layers
             elif force_gpu:
                 # If forcing GPU but don't know memory, use conservative defaults
-                result['n_gpu_layers'] = is_large_model and 16 or 32
+                result['n_gpu_layers'] = is_large_model and 32 or -1
             else:
                 # Conservative default for unknown memory
-                result['n_gpu_layers'] = is_large_model and 8 or 16
+                result['n_gpu_layers'] = is_large_model and 24 or 32
             
             info_msg(f"🔥 NVIDIA GPU detected: {result['gpu_info']}")
-            info_msg(f"Will use CUDA with {result['n_gpu_layers']} GPU layers")
+            info_msg(f"Will use CUDA with {result['n_gpu_layers'] if result['n_gpu_layers'] != -1 else 'all'} GPU layers")
             if is_large_model:
-                info_msg("Using conservative GPU settings for 70B model")
+                info_msg(f"Using {'aggressive' if result['n_gpu_layers'] == -1 else 'conservative'} GPU settings for 70B model")
             return result
             
         # Next check for Metal Performance Shaders (Apple Silicon)
@@ -277,7 +279,7 @@ def detect_gpu_capabilities(force_gpu: bool = False, force_cpu: bool = False) ->
                     result['n_gpu_layers'] = 8  # Better for M2
                 elif "M3" in platform.processor():
                     result['gpu_info'] = "Apple M3"
-                    result['n_gpu_layers'] = 12  # More aggressive for M3
+                    result['n_gpu_layers'] = 16  # More aggressive for M3
             
             info_msg(f"🔥 Apple Silicon GPU detected: {result['gpu_info']}")
             info_msg(f"Will use Metal with {result['n_gpu_layers']} GPU layers")
@@ -303,13 +305,10 @@ def install_faiss_gpu() -> bool:
         if 'faiss' in sys.modules:
             del sys.modules['faiss']
         
-        # Now try to import and check for GPU support
-        import faiss
-        
-        if hasattr(faiss, 'StandardGpuResources'):
-            # GPU support already available
-            info_msg("FAISS with GPU support is already installed")
-            return True
+        # Completely clear any faiss related modules
+        for module_name in list(sys.modules.keys()):
+            if module_name == 'faiss' or module_name.startswith('faiss.'):
+                del sys.modules[module_name]
         
         # Check CUDA version to determine which package to install
         cuda_version = None
@@ -332,18 +331,30 @@ def install_faiss_gpu() -> bool:
         else:
             package = "faiss-gpu"  # Default if can't determine version
         
-        # Install the package
+        # First uninstall any existing faiss packages
+        info_msg("Uninstalling any existing FAISS packages...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "-y", "faiss", "faiss-cpu", "faiss-gpu"])
+        except:
+            # Ignore errors if packages weren't installed
+            pass
+        
+        # Install the package with --no-cache-dir to force fresh download
         info_msg(f"Installing {package}...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--force-reinstall", package])
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", package])
         success_msg(f"Successfully installed {package}")
         
-        # Force unload faiss completely to ensure clean import
-        for module_name in list(sys.modules.keys()):
-            if module_name == 'faiss' or module_name.startswith('faiss.'):
-                del sys.modules[module_name]
+        # Force Python to reload the site-packages directory
+        importlib.invalidate_caches()
         
         # Verify installation by importing fresh
         try:
+            # Clear module cache again to ensure clean import
+            for module_name in list(sys.modules.keys()):
+                if module_name == 'faiss' or module_name.startswith('faiss.'):
+                    del sys.modules[module_name]
+            
+            # Import faiss from scratch
             import faiss
             
             # Test creating a GPU resource to verify it works
@@ -359,11 +370,11 @@ def install_faiss_gpu() -> bool:
                     return False
             else:
                 warning_msg("FAISS installed but GPU support not available")
-                # Sometimes the module needs to be fully reloaded from scratch
-                # Try reinstalling one more time to ensure we get the GPU version
+                # Try more aggressive reinstall
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-cache-dir", package])
                 
-                # Force reload again
+                # Force reload again with complete cache clearing
+                importlib.invalidate_caches()
                 for module_name in list(sys.modules.keys()):
                     if module_name == 'faiss' or module_name.startswith('faiss.'):
                         del sys.modules[module_name]
