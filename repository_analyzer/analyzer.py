@@ -910,6 +910,9 @@ class RepositoryAnalyzer:
             analysis_results["analysis_time"] = elapsed_time
             logger.info(f"Repository analysis completed in {elapsed_time:.2f} seconds")
             
+            # Save the supported extensions to the results
+            analysis_results["supported_extensions"] = self.languages.keys()
+            
             return analysis_results
         except Exception as e:
             logger.error(f"Failed to analyze repository: {str(e)}")
@@ -961,6 +964,9 @@ class RepositoryAnalyzer:
             # Special info for PHP projects with .inc files
             if ".php" in supported_extensions and ".inc" in supported_extensions:
                 logger.info("Detected PHP project with .inc files - both file types will be analyzed and indexed")
+                
+            # Clarify that only files matching the primary language will be indexed for RAG
+            logger.info(f"ONLY files matching the primary language ({', '.join(supported_extensions)}) will be indexed for RAG")
             
             # First pass: Count files to determine if repository is too large
             total_files_approx = 0
@@ -1043,9 +1049,10 @@ class RepositoryAnalyzer:
                             results["architecture"]["file_types"][ext] = 0
                         results["architecture"]["file_types"][ext] += 1
                     
-                    # Add ALL files to our list for processing - not just supported ones
-                    # This ensures all code files get indexed for RAG
-                    all_files.append((rel_path, file_path, ext))
+                    # Add ONLY files with supported extensions to our list for processing
+                    # This ensures we only index files matching the primary language for RAG
+                    if ext in supported_extensions:
+                        all_files.append((rel_path, file_path, ext))
             
             # Save directory structure
             results["architecture"]["directory_structure"] = dir_structure
@@ -1112,7 +1119,20 @@ class RepositoryAnalyzer:
                     logger.warning("GPU acceleration is NOT enabled for RAG indexing - this will be slower")
                 
             # Log that all files will be indexed
-            logger.info(f"Indexing all files for RAG regardless of extension type or repository size")
+            logger.info(f"Indexing {len(all_files)} files for RAG...")
+            
+            # Count by extension for logging purposes
+            extension_counts = {}
+            for _, _, ext in all_files:
+                if ext not in extension_counts:
+                    extension_counts[ext] = 0
+                extension_counts[ext] += 1
+                
+            # Log the breakdown of file extensions being processed
+            if extension_counts:
+                logger.info("File types being indexed:")
+                for ext, count in sorted(extension_counts.items(), key=lambda x: x[1], reverse=True):
+                    logger.info(f"  - {ext}: {count} files")
             
             # For large repositories, prioritize and select a subset of files
             if len(all_files) > max_files_to_process:
@@ -1199,6 +1219,11 @@ class RepositoryAnalyzer:
                                       '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.tiff', '.pdf', '.mp3', '.mp4', '.wav']
                         if ext in binary_exts:
                             logger.info(f"Skipping binary file: {rel_path}")
+                            continue
+                        
+                        # CRITICAL CHECK: Only index files with supported extensions
+                        if ext not in supported_extensions:
+                            logger.info(f"Skipping file with unsupported extension: {rel_path}")
                             continue
                         
                         # Improved file reading that avoids loading entire files into memory
@@ -1307,31 +1332,8 @@ class RepositoryAnalyzer:
                     # If file isn't in a supported extension, we still want to index it for RAG
                     # but we'll skip the parsing/AST extraction
                     if ext not in supported_extensions:
-                        # Try to add the file to the embedding store for RAG
-                        if self.embedding_store:
-                            try:
-                                if not self.embedding_store.contains_file(rel_path):
-                                    with open(file_path, 'rb') as f:
-                                        content = f.read()
-                                    
-                                    # Try to decode with utf-8, fallback to latin-1
-                                    try:
-                                        decoded_content = content.decode('utf-8', errors='replace')
-                                    except UnicodeDecodeError:
-                                        decoded_content = content.decode('latin-1', errors='replace')
-                                    
-                                    # Add to embedding store
-                                    metadata = {
-                                        "extension": ext,
-                                        "language": self._get_language_name(ext),
-                                        "file_size": len(content),
-                                        "is_supported": False,
-                                        "path_components": rel_path.split(os.sep)
-                                    }
-                                    self.embedding_store.add_file(rel_path, decoded_content, metadata)
-                                    indexed_files += 1
-                            except Exception as e:
-                                logger.warning(f"Failed to index unsupported file {rel_path}: {str(e)}")
+                        # We should only index files that match the primary language
+                        # Skip indexing this file since it doesn't match any supported extension
                         continue
                         
                     # Only try to parse files with supported extensions
