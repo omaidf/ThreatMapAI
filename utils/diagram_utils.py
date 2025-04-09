@@ -7,6 +7,7 @@ This module provides functions for finding, viewing, and serving diagrams.
 import os
 import webbrowser
 import threading
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -107,7 +108,6 @@ def view_diagrams(output_dir: str, port: int = 8000) -> None:
     try:
         print("\nDiagram viewer server running on port 8000. Press Ctrl+C to exit.")
         while True:
-            import time
             time.sleep(1)
     except KeyboardInterrupt:
         print("Shutting down server...") 

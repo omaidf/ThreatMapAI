@@ -14,6 +14,12 @@ import json
 import faiss
 import numpy as np
 import argparse
+import gc
+import fnmatch
+import sys
+import torch
+from sentence_transformers import SentenceTransformer
+import sentence_transformers.util
 
 # Import utility modules
 from utils.common import success_msg, error_msg, warning_msg, info_msg
@@ -34,7 +40,6 @@ def detect_gpu() -> Tuple[bool, Optional[int]]:
         Tuple of (is_gpu_available, gpu_memory_gb)
     """
     try:
-        import torch
         if torch.cuda.is_available():
             gpu_count = torch.cuda.device_count()
             if gpu_count > 0:
@@ -105,7 +110,6 @@ class EmbeddingStore:
             
             # Try to disable multiprocessing in torch
             try:
-                import torch
                 torch.set_num_threads(1)  # Use only one thread
                 if hasattr(torch, 'set_num_interop_threads'):
                     torch.set_num_interop_threads(1)
@@ -114,7 +118,6 @@ class EmbeddingStore:
         elif self.device == 'cuda' and gpu_id is not None:
             # Set specific GPU device if specified
             try:
-                import torch
                 if torch.cuda.is_available() and gpu_id < torch.cuda.device_count():
                     torch.cuda.set_device(gpu_id)
                     info_msg(f"Set active GPU to device {gpu_id}")
@@ -125,19 +128,6 @@ class EmbeddingStore:
         
         # Initialize the embedding model
         try:
-            # Import here to avoid top-level import issues
-            from sentence_transformers import SentenceTransformer
-            import sentence_transformers.util
-            
-            if self.device == 'cpu':
-                # CPU-specific optimizations
-                # PATCH: Override the batch encoding utility to force sequential processing
-                original_batch_to_device = sentence_transformers.util.batch_to_device
-                def patched_batch_to_device(batch, target_device, cpu_pin_memory=False):
-                    # Process sequentially, never use multiple processes
-                    return original_batch_to_device(batch, target_device, cpu_pin_memory)
-                sentence_transformers.util.batch_to_device = patched_batch_to_device
-            
             # Use a smaller model for embeddings to avoid memory issues
             model_name = 'all-MiniLM-L6-v2'  # This is a small, efficient model (384 dimensions)
             
@@ -226,7 +216,6 @@ class EmbeddingStore:
                         if hasattr(faiss, 'get_num_gpus') and faiss.get_num_gpus() > 1:
                             try:
                                 # Try loading on multiple GPUs
-                                import torch
                                 if torch.cuda.is_available() and torch.cuda.device_count() > 1:
                                     # Create a list of GPU resources
                                     gpu_resources = []
@@ -278,13 +267,6 @@ class EmbeddingStore:
     def save(self) -> None:
         """Save embeddings to disk."""
         try:
-            # Explicitly import required libraries
-            import os
-            import json
-            import faiss
-            import pathlib  # Import pathlib directly
-            from pathlib import Path  # Also import Path explicitly
-            
             if self.index is None:
                 warning_msg("No index to save")
                 return
@@ -361,7 +343,6 @@ class EmbeddingStore:
                         if hasattr(faiss, 'GpuMultipleClonerOptions') and num_gpus > 1:
                             try:
                                 # Try to set up a multi-GPU index for better performance
-                                import torch
                                 if torch.cuda.is_available() and torch.cuda.device_count() > 1:
                                     info_msg(f"Setting up FAISS for multiple GPUs")
                                     # Create a list of GPU resources, one for each device
@@ -421,19 +402,10 @@ class EmbeddingStore:
         """
         try:
             # Check if Python is shutting down
-            import sys
             if sys is None or sys.meta_path is None:
                 print("Skipping clear during Python shutdown")
                 return
                 
-            # Explicitly import all required modules
-            import os
-            import json
-            import faiss
-            import numpy as np
-            import pathlib  # Add pathlib import
-            from pathlib import Path  # Explicitly import Path class
-
             # Reset in-memory data
             self.index = None
             self.file_mapping = []  # Changed from dictionary to list
@@ -441,8 +413,6 @@ class EmbeddingStore:
             # Re-initialize the embedding model if needed
             if not hasattr(self, 'model') or self.model is None:
                 try:
-                    from sentence_transformers import SentenceTransformer
-                    
                     # Set the specific CUDA device if needed
                     device_str = self.device
                     if self.device == 'cuda' and hasattr(self, 'gpu_id'):
@@ -535,7 +505,6 @@ class EmbeddingStore:
                     
                     # Try to determine optimal batch size based on GPU memory
                     try:
-                        import torch
                         if torch.cuda.is_available():
                             # Get GPU memory info - adjust batch size based on total memory
                             prop = torch.cuda.get_device_properties(self.gpu_id)
@@ -630,7 +599,6 @@ class EmbeddingStore:
                 
                 # Force garbage collection between batches to prevent memory leaks
                 if i % (batch_size * 4) == 0 and i > 0:
-                    import gc
                     gc.collect()
             
             # Save after each file to avoid losing work
@@ -641,7 +609,6 @@ class EmbeddingStore:
             logger.error(f"Failed to add file {file_path} to embedding store: {str(e)}")
             
             # Try to clean up any partial work
-            import gc
             gc.collect()
     
     def _split_content(self, content: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
@@ -833,7 +800,6 @@ class EmbeddingStore:
                     
                 # Match either exact path or pattern
                 if is_pattern:
-                    import fnmatch
                     if fnmatch.fnmatch(path, file_path_pattern):
                         file_paths.add(path)
                 elif file_path_pattern in path:
@@ -946,7 +912,6 @@ class EmbeddingStore:
         """Cleanup resources when the object is deleted."""
         try:
             # Check if Python is shutting down
-            import sys
             if sys is None or sys.meta_path is None:
                 # Python is shutting down, don't try to save
                 print("Skipping save during Python shutdown")
@@ -981,7 +946,6 @@ class EmbeddingStore:
                 self.index = None
                 
             # Force garbage collection
-            import gc
             gc.collect()
             
         except Exception as e:
@@ -1078,7 +1042,6 @@ class EmbeddingStore:
                 
                 # Force garbage collection between batches to prevent memory leaks
                 if i % (batch_size * 4) == 0 and i > 0:
-                    import gc
                     gc.collect()
             
             # Save after each batch to avoid losing work
@@ -1089,7 +1052,6 @@ class EmbeddingStore:
             logger.error(f"Failed to add documents to embedding store: {str(e)}")
             
             # Try to clean up any partial work
-            import gc
             gc.collect()
 
 def add_cli_args(parser: argparse.ArgumentParser) -> None:

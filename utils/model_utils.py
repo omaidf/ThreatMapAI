@@ -9,6 +9,10 @@ import os
 import logging
 import shutil
 import click
+import sys
+import subprocess
+import requests
+import dotenv
 from pathlib import Path
 from typing import Tuple, Optional
 from tqdm import tqdm
@@ -168,7 +172,6 @@ def download_model(model_path: str, force: bool = False) -> str:
         
         # Check if we need Hugging Face authentication token
         # First try to get it from the .env file directly
-        import dotenv
         dotenv.load_dotenv()  # Reload .env file to get the most current token
         
         hf_token = os.environ.get("HF_TOKEN", "")
@@ -216,8 +219,6 @@ def download_model(model_path: str, force: bool = False) -> str:
         
         # Second attempt: Direct download if huggingface_hub fails
         if not download_successful:
-            import requests
-            
             # Construct the direct download URL
             direct_url = model_info["url"]
             headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
@@ -296,9 +297,6 @@ def test_model_loading(model_path: str) -> bool:
             os.environ["LLM_N_GPU_LAYERS"] = "0"  # No GPU offloading in test
             
             # Create subprocess to test loading - safer approach to avoid segfaults in main process
-            import subprocess
-            import sys
-            
             # Create a simple Python command to try loading the model in a separate process
             cmd = [
                 sys.executable, 

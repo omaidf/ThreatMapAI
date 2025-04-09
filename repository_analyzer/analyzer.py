@@ -10,6 +10,7 @@ import logging
 import shutil
 import tempfile
 import platform
+import torch
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import tree_sitter
@@ -25,6 +26,7 @@ except ImportError:
 
 from .embedding_store import EmbeddingStore
 from utils import info_msg
+from utils.env_utils import update_env_file
 import re
 import json
 from tqdm import tqdm
@@ -74,7 +76,6 @@ class RepositoryAnalyzer:
         if self.distributed is None:
             # Auto-detect if distributed processing should be enabled
             try:
-                import torch
                 if torch.cuda.is_available():
                     gpu_count = torch.cuda.device_count()
                     if gpu_count > 1:
@@ -92,7 +93,6 @@ class RepositoryAnalyzer:
                             os.environ["GPU_IDS"] = ",".join(str(gpu_id) for gpu_id in self.gpu_ids)
                             
                             # Also set environment variable for distributed to ensure other components use it 
-                            from utils.env_utils import update_env_file
                             update_env_file("DISTRIBUTED", "true")
                             update_env_file("GPU_IDS", ",".join(str(gpu_id) for gpu_id in self.gpu_ids))
             except ImportError:

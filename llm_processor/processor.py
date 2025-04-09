@@ -8,13 +8,26 @@ using a local LLM to generate threat models and security insights.
 import os
 import json
 import logging
+import sys
+import subprocess
+import platform
 from typing import Dict, List, Optional, Any, Union
 from pathlib import Path
 from tqdm import tqdm
 from pydantic import BaseModel
+
+# LLM-related imports
 from langchain_community.llms import LlamaCpp
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+import torch
+import accelerate
+from accelerate import init_empty_weights
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import pipeline, BitsAndBytesConfig
+from langchain_community.llms import HuggingFacePipeline
+
+# Repository analyzer import
 from repository_analyzer.embedding_store import EmbeddingStore
 
 # Import utility modules
@@ -114,8 +127,6 @@ class LLMProcessor:
             # First try to use LlamaCpp, which is better for GGUF files
             info_msg("Loading model using LlamaCpp (better for GGUF files)")
             try:
-                from langchain_community.llms import LlamaCpp
-                
                 # Get model path from environment
                 model_path = self.model_path
                 info_msg(f"Loading model from path: {model_path}")
@@ -138,7 +149,6 @@ class LLMProcessor:
                 # Detect architecture (x86 vs ARM)
                 is_arm = False
                 try:
-                    import platform
                     machine = platform.machine().lower()
                     is_arm = "arm" in machine or "aarch" in machine
                 except:
@@ -224,12 +234,6 @@ class LLMProcessor:
                 low_mem = get_env_variable("LLM_LOW_MEM_USAGE", "true").lower() == "true"
                 use_quantization = get_env_variable("LLM_USE_QUANTIZATION", "true").lower() == "true"
                 
-                # Add torch import to ensure it's available
-                import torch
-                
-                # Use accelerate for better model loading
-                from accelerate import init_empty_weights
-                
                 # Determine device based on GPU detection
                 device = gpu_config['device'] if gpu_config['use_gpu'] else "cpu"
                 
@@ -247,11 +251,8 @@ class LLMProcessor:
                         # Install bitsandbytes if not available
                         warning_msg("bitsandbytes not found or incompatible, attempting to install latest version")
                         try:
-                            import subprocess
-                            import sys  # Add missing sys import
                             subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "bitsandbytes"])
                             import bitsandbytes as bnb
-                            from transformers import BitsAndBytesConfig
                             
                             # Set up quantization config with more robust defaults
                             quantization_config = BitsAndBytesConfig(

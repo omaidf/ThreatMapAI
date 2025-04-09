@@ -8,6 +8,8 @@ variants, and default settings to avoid duplication across the codebase.
 import platform
 import logging
 import os
+import sys
+import subprocess
 from typing import Dict, Tuple, Any
 
 # Configure logger
@@ -276,9 +278,6 @@ def download_model(model_path: str = None, model_name: str = None, variant: str 
     
     try:
         # Use wget or curl depending on availability
-        import sys
-        import subprocess
-        
         if sys.platform.startswith('win'):
             # Use PowerShell on Windows
             cmd = f'powershell -Command "Invoke-WebRequest -Uri "{model_info["url"]}" -OutFile "{model_path}"'
