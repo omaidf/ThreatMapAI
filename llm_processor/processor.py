@@ -140,6 +140,12 @@ class LLMProcessor:
                 
                 n_batch = int(get_env_variable("LLM_N_BATCH", "512"))  # Batch size
                 n_gpu_layers = gpu_config['n_gpu_layers']  # Use detected GPU layers
+                
+                # Special handling for -1 value (all layers)
+                if n_gpu_layers == -1:
+                    n_gpu_layers = 100  # LlamaCpp needs a high number to use all layers
+                    info_msg("Using all available GPU layers")
+                
                 temperature = float(get_env_variable("LLM_TEMPERATURE", "0.7"))
                 max_tokens = int(get_env_variable("LLM_MAX_TOKENS", "1024"))
                 top_p = float(get_env_variable("LLM_TOP_P", "0.95"))
@@ -154,8 +160,16 @@ class LLMProcessor:
                 
                 # Set environment variables to help CUDA detection in llama.cpp
                 if n_gpu_layers > 0 and gpu_config['use_gpu']:
-                    # Force CUDA detection on with environment variables
-                    os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use first GPU by default
+                    # Get selected GPU IDs from environment or use default
+                    gpu_ids_str = os.environ.get("GPU_IDS", "")
+                    visible_devices = gpu_ids_str if gpu_ids_str else "0"
+                    
+                    # Set the visible devices for CUDA
+                    os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+                    info_msg(f"Setting CUDA_VISIBLE_DEVICES to {visible_devices}")
+                    
+                    # Force enable CUBLAS for NVIDIA GPUs
+                    os.environ["LLAMA_CUBLAS"] = "1"
                     
                     # Unset CPU-specific environment variables that might interfere
                     for env_var in ["LLAMA_CLBLAST", "LLAMA_METAL", "LLAMA_CPU_ONLY"]:
@@ -193,7 +207,8 @@ class LLMProcessor:
                     f16_kv=True,  # Use half-precision for key/value cache
                     streaming=False,  # Disable streaming for now as it can cause issues
                     seed=42,  # Set a fixed seed for reproducibility
-                    use_mlock=True  # Use mlock to keep the model in memory
+                    use_mlock=True,  # Use mlock to keep the model in memory
+                    n_threads=int(os.cpu_count() * 0.75) if os.cpu_count() else 4  # Use 75% of available CPU cores
                 )
                 
                 success_msg("Successfully loaded model using LlamaCpp")

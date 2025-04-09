@@ -158,41 +158,11 @@ def create_embedding_store(try_load: bool = True, device: Optional[str] = None, 
                 
                 if not gpu_supported:
                     info_msg("FAISS GPU support not detected. Installing faiss-gpu...")
-                    try:
-                        # Try to install the right version of faiss-gpu based on CUDA version
-                        try:
-                            # Check CUDA version to install the right package
-                            cuda_version = torch.version.cuda
-                            
-                            # Get major version for package selection
-                            cuda_major = cuda_version.split('.')[0] if cuda_version else None
-                            
-                            if cuda_major == '11':
-                                package = "faiss-gpu"
-                            elif cuda_major == '12':
-                                package = "faiss-gpu>=1.7.3"  # For CUDA 12 compatibility
-                            else:
-                                package = "faiss-gpu"  # Default
-                                
-                            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-                            success_msg(f"Successfully installed {package} for CUDA {cuda_version}")
-                            
-                            # Reload faiss after installation
-                            importlib.reload(sys.modules['faiss'])
-                            gpu_supported = hasattr(faiss, 'StandardGpuResources')
-                        except Exception as cuda_error:
-                            # If we can't determine the CUDA version, just try the general package
-                            warning_msg(f"Could not detect CUDA version: {str(cuda_error)}")
-                            subprocess.check_call([sys.executable, "-m", "pip", "install", "faiss-gpu"])
-                            success_msg("Installed faiss-gpu (default version)")
-                            
-                            # Reload faiss after installation
-                            importlib.reload(sys.modules['faiss'])
-                            gpu_supported = hasattr(faiss, 'StandardGpuResources')
-                    except Exception as install_error:
-                        warning_msg(f"Failed to install faiss-gpu: {str(install_error)}")
-                        warning_msg("FAISS will use CPU mode for vector similarity search")
-                        warning_msg("This is not ideal for performance but embedding generation will still use GPU")
+                    # Use our centralized function for FAISS-GPU installation
+                    if install_faiss_gpu():
+                        success_msg("Successfully installed faiss-gpu for CUDA")
+                    else:
+                        warning_msg("Failed to install faiss-gpu, will use CPU for vector search")
             except ImportError:
                 # If faiss isn't imported at all, we'll install it below
                 pass
@@ -240,7 +210,7 @@ def create_embedding_store(try_load: bool = True, device: Optional[str] = None, 
                 try:
                     if torch.cuda.is_available() and not use_cpu:
                         info_msg("CUDA detected, installing GPU version of FAISS...")
-                        subprocess.check_call([sys.executable, "-m", "pip", "install", "faiss-gpu"])
+                        install_faiss_gpu()
                         info_msg("FAISS-GPU installed successfully. Retrying...")
                     else:
                         subprocess.check_call([sys.executable, "-m", "pip", "install", "faiss-cpu"])
@@ -299,85 +269,32 @@ def init(device: str, gpu_ids: str):
                 warning_msg(f"Invalid GPU IDs format: {str(e)}")
                 warning_msg("Using default GPU selection")
         
-        # Check hardware capabilities first
-        try:
-            cuda_available = torch.cuda.is_available()
-            if cuda_available:
-                gpu_count = torch.cuda.device_count()
-                
-                # Check if the selected GPUs are valid
-                if selected_gpus:
-                    for gpu_id in selected_gpus:
-                        if gpu_id >= gpu_count:
-                            warning_msg(f"GPU {gpu_id} does not exist (only {gpu_count} GPUs available)")
-                            warning_msg("Ignoring invalid GPU IDs")
-                            # Reset to use all available GPUs
-                            selected_gpus = list(range(gpu_count))
-                            break
-                
-                # Use all available GPUs if none specified
-                if not selected_gpus:
-                    selected_gpus = list(range(gpu_count))
-                
-                # Show information about detected GPUs
-                info_msg(f"Detected {gpu_count} GPU(s):")
-                total_memory = 0
-                for i in range(gpu_count):
-                    gpu_props = torch.cuda.get_device_properties(i)
-                    gpu_name = gpu_props.name
-                    gpu_memory = gpu_props.total_memory / (1024**3)  # Convert to GB
-                    total_memory += gpu_memory
-                    
-                    # Mark if this GPU is selected
-                    is_selected = i in selected_gpus
-                    marker = "→ " if is_selected else "  "
-                    info_msg(f"{marker}GPU {i}: {gpu_name} with {gpu_memory:.2f} GB VRAM")
-                
-                # Set environment variables for selected GPUs
-                os.environ["GPU_IDS"] = ",".join(str(gpu_id) for gpu_id in selected_gpus)
-                from utils.env_utils import update_env_file
-                update_env_file("GPU_IDS", ",".join(str(gpu_id) for gpu_id in selected_gpus))
-                
-                # Provide recommendations based on detected hardware
-                success_msg(f"Hardware acceleration available: {gpu_count} GPU(s) with {total_memory:.2f} GB total VRAM")
-                
-                # Check for multi-GPU capabilities
-                if gpu_count > 1:
-                    if total_memory >= 24:  # Generous threshold for good multi-GPU performance
-                        success_msg("Multi-GPU configuration detected with good memory capacity")
-                        success_msg("Enabling distributed processing for better performance")
-                        os.environ["DISTRIBUTED"] = "true"
-                        update_env_file("DISTRIBUTED", "true")
-                        
-                        # When detecting multiple GPUs, automatically install FAISS-GPU
-                        if device != 'cpu':  # Skip if user explicitly requested CPU
-                            info_msg("Installing GPU-accelerated libraries for multi-GPU support...")
-                            install_faiss_gpu()
-                    else:
-                        info_msg("Multi-GPU configuration detected but with limited memory")
-                        info_msg("For optimal performance with large models, consider:")
-                        info_msg("python -m cli configure-gpu --gpu-ids 0")
-                elif gpu_memory and gpu_memory < 6:
-                    warning_msg("GPU memory is limited. You may experience better performance with CPU mode for large models.")
-                    info_msg("Consider using --device cpu for analysis of large codebases")
-            else:
-                info_msg("No GPU detected. Running in CPU-only mode, which is perfectly fine but slower.")
-                # Set environment variable to force CPU
-                if device == 'auto' or device == 'cpu':
-                    os.environ["FORCE_CPU"] = "true"
-                    from utils.env_utils import update_env_file
-                    update_env_file("FORCE_CPU", "true")
-                    update_env_file("FORCE_GPU", "")
-        except ImportError:
-            info_msg("PyTorch not installed. Cannot detect GPU capabilities.")
+        # Use our centralized GPU utilities for detection and setup
+        force_gpu = device == 'cuda'
+        force_cpu = device == 'cpu'
         
-        # Set the selected device
-        if device != 'auto':
-            os.environ["FORCE_CPU"] = "true" if device == "cpu" else ""
-            os.environ["FORCE_GPU"] = "true" if device == "cuda" else ""
-            from utils.env_utils import update_env_file
-            update_env_file("FORCE_CPU", "true" if device == "cpu" else "")
-            update_env_file("FORCE_GPU", "true" if device == "cuda" else "")
+        # Get optimal GPU configuration based on hardware
+        if device == 'auto':
+            optimal_config = get_optimal_gpu_configuration()
+            info_msg(f"Detected optimal GPU configuration: {optimal_config['device']} device")
+            if optimal_config['device'] == 'cuda':
+                info_msg(f"Recommended GPUs: {optimal_config['gpu_ids']}")
+        
+        # Configure the GPU environment using our centralized utility
+        gpu_config = configure_gpu_environment(
+            force_gpu=force_gpu,
+            force_cpu=force_cpu,
+            gpu_ids=selected_gpus,
+            distributed=selected_gpus and len(selected_gpus) > 1
+        )
+        
+        # Display the applied configuration
+        if gpu_config['device'] == 'cpu':
+            info_msg("Framework initialized for CPU-only operation")
+        else:
+            success_msg(f"GPU acceleration enabled: using {len(gpu_config['selected_gpus'])} GPU(s)")
+            if gpu_config['distributed']:
+                success_msg(f"Multi-GPU distributed processing enabled for GPUs: {gpu_config['selected_gpus']}")
         
         # Setup tree-sitter grammars
         success_msg("Initializing tree-sitter grammars...")
@@ -397,8 +314,8 @@ def init(device: str, gpu_ids: str):
             
             # Use first selected GPU if specified
             gpu_id_param = None
-            if selected_gpus:
-                gpu_id_param = selected_gpus[0]
+            if gpu_config['selected_gpus']:
+                gpu_id_param = gpu_config['selected_gpus'][0]
                 
             embedding_store = create_embedding_store(try_load=True, device=device_param, gpu_id=gpu_id_param)
             if embedding_store:
@@ -406,6 +323,11 @@ def init(device: str, gpu_ids: str):
                     success_msg(f"Embedding store initialized using {embedding_store.device}")
                     if hasattr(embedding_store, 'use_gpu_for_faiss') and embedding_store.use_gpu_for_faiss:
                         success_msg(f"FAISS index using GPU acceleration (GPU {embedding_store.gpu_id if embedding_store.gpu_id is not None else 0})")
+                        
+                        # Check if multi-GPU FAISS is available
+                        faiss_multi_gpu = os.environ.get("FAISS_MULTI_GPU", "0") == "1"
+                        if faiss_multi_gpu and gpu_config['distributed']:
+                            success_msg("FAISS configured for multi-GPU operation")
                 else:
                     success_msg("Embedding store initialized using CPU")
                     if device_param == 'cuda':
@@ -423,14 +345,18 @@ def init(device: str, gpu_ids: str):
             cpu_count = psutil.cpu_count(logical=False)
             memory_gb = psutil.virtual_memory().total / (1024**3)
             
-            if cuda_available:
+            if gpu_config['device'] == 'cuda':
+                gpu_count = len(gpu_config['selected_gpus'])
                 if gpu_count > 1:
-                    info_msg("\nMulti-GPU setup detected with automatic optimization enabled!")
-                    info_msg(f"The system will automatically use all {gpu_count} GPUs with distributed processing")
+                    info_msg("\nMulti-GPU setup configured with automatic optimization!")
+                    info_msg(f"The system will use {gpu_count} GPUs with distributed processing")
                     info_msg("Simply run: python -m cli analyze")
                 else:
-                    info_msg("\nSingle GPU setup detected. For best performance:")
+                    info_msg("\nSingle GPU setup configured. For best performance:")
                     info_msg("python -m cli analyze")
+                    
+                # If there's any GPU issues or incompatibilities, suggest the fix script
+                info_msg(f"\nIf you encounter GPU-related issues, run: ./fix_gpu.sh")
             elif memory_gb > 32 and cpu_count >= 8:
                 info_msg("\nHigh-performance CPU setup detected. For best performance:")
                 info_msg("python -m cli analyze --device cpu")
@@ -960,6 +886,16 @@ def gpu_info(detailed: bool, benchmark: bool):
                 if distributed_mode:
                     info_msg("Multi-GPU distributed mode is enabled")
                 
+                # Check for FAISS multi-GPU configuration
+                faiss_multi_gpu = os.environ.get("FAISS_MULTI_GPU", "0") == "1"
+                faiss_use_sharding = os.environ.get("FAISS_USE_SHARDING", "0") == "1"
+                if faiss_multi_gpu and distributed_mode:
+                    success_msg("FAISS multi-GPU mode is enabled")
+                    if faiss_use_sharding:
+                        info_msg("FAISS is using index sharding across GPUs")
+                    else:
+                        info_msg("FAISS is using index replication across GPUs (no sharding)")
+                
                 for i in range(gpu_count):
                     device_props = torch.cuda.get_device_properties(i)
                     gpu_name = device_props.name
@@ -1006,78 +942,17 @@ def gpu_info(detailed: bool, benchmark: bool):
                 if benchmark:
                     info_msg("\nRunning quick GPU benchmark...")
                     
-                    # Set benchmark device
-                    if current_gpu_ids:
-                        benchmark_device = int(current_gpu_ids.split(",")[0])
-                        info_msg(f"Using selected GPU {benchmark_device} for benchmark")
-                    else:
-                        benchmark_device = 0
-                        info_msg(f"Using GPU {benchmark_device} for benchmark")
-                    
-                    # Create a simple benchmark test
-                    try:
-                        # Benchmark matrix multiplication as a simple test
-                        torch.cuda.set_device(benchmark_device)
-                        
-                        # Test different sizes to see scaling
-                        sizes = [1000, 2000, 4000]
-                        for size in sizes:
-                            # Create random tensors
-                            a = torch.randn(size, size, device=f"cuda:{benchmark_device}")
-                            b = torch.randn(size, size, device=f"cuda:{benchmark_device}")
-                            
-                            # Warm-up
-                            torch.matmul(a, b)
-                            torch.cuda.synchronize()
-                            
-                            # Benchmark
-                            start_event = torch.cuda.Event(enable_timing=True)
-                            end_event = torch.cuda.Event(enable_timing=True)
-                            
-                            start_event.record()
-                            result = torch.matmul(a, b)
-                            end_event.record()
-                            
-                            torch.cuda.synchronize()
-                            elapsed_time = start_event.elapsed_time(end_event)
-                            
-                            success_msg(f"Matrix multiplication ({size}x{size}): {elapsed_time:.2f} ms")
-                            
-                        # Calculate theoretical FLOPS for matrix multiplication
-                        # For an NxN matrix multiplication: 2*N^3 operations
-                        largest_size = sizes[-1]
-                        flops = 2 * (largest_size ** 3)
-                        teraflops = (flops / elapsed_time) / 1e9  # Convert to TFLOPS
-                        info_msg(f"Approximate performance: {teraflops:.2f} TFLOPS")
-                        
-                        # Memory bandwidth test
-                        vector_size = 100_000_000  # 100M elements
-                        a = torch.randn(vector_size, device=f"cuda:{benchmark_device}")
-                        b = torch.randn(vector_size, device=f"cuda:{benchmark_device}")
-                        
-                        # Warm-up
-                        _ = a + b
-                        torch.cuda.synchronize()
-                        
-                        # Benchmark
-                        start_event = torch.cuda.Event(enable_timing=True)
-                        end_event = torch.cuda.Event(enable_timing=True)
-                        
-                        start_event.record()
-                        _ = a + b
-                        end_event.record()
-                        
-                        torch.cuda.synchronize()
-                        elapsed_time = start_event.elapsed_time(end_event)
-                        
-                        # Calculate memory bandwidth (read 2 vectors, write 1)
-                        bytes_processed = 3 * vector_size * 4  # 4 bytes per float32
-                        bandwidth_gb_s = (bytes_processed / (elapsed_time / 1000)) / 1e9
-                        
-                        success_msg(f"Memory bandwidth: {bandwidth_gb_s:.2f} GB/s")
-                        
-                    except Exception as bench_error:
-                        warning_msg(f"Benchmark error: {str(bench_error)}")
+                    # Use our improved benchmark function
+                    for i in range(min(2, gpu_count)):  # Benchmark up to 2 GPUs
+                        info_msg(f"Benchmarking GPU {i}...")
+                        benchmark_result = run_gpu_benchmark(gpu_id=i)
+                        if benchmark_result['success']:
+                            success_msg(f"GPU {i} performance:")
+                            info_msg(f"Matrix multiplication: {benchmark_result['matrix_multiply_time_ms']:.2f} ms")
+                            info_msg(f"Estimated TFLOPS: {benchmark_result['estimated_tflops']:.2f}")
+                            info_msg(f"Memory bandwidth: {benchmark_result['memory_bandwidth_gb_s']:.2f} GB/s")
+                        else:
+                            warning_msg(f"Benchmark failed for GPU {i}: {benchmark_result.get('error', 'Unknown error')}")
                     
                 # Test for sentence-transformers
                 try:
@@ -1133,7 +1008,28 @@ def gpu_info(detailed: bool, benchmark: bool):
         # Check for FAISS
         try:
             if hasattr(faiss, 'get_num_gpus') and faiss.get_num_gpus() > 0:
-                success_msg(f"\nFAISS with GPU acceleration available")
+                success_msg(f"\nFAISS with GPU acceleration available ({faiss.get_num_gpus()} GPUs)")
+                
+                # Check if multi-GPU mode is enabled
+                faiss_multi_gpu = os.environ.get("FAISS_MULTI_GPU", "0") == "1"
+                if faiss_multi_gpu:
+                    success_msg("FAISS is configured for multi-GPU operation")
+                    # Check if FAISS is having issues
+                    faiss_success = True
+                    try:
+                        # Try to create a small test index to verify functionality
+                        import numpy as np
+                        dim = 128
+                        res = faiss.StandardGpuResources()
+                        index = faiss.GpuIndexFlatL2(res, dim)
+                        test_data = np.random.random((10, dim)).astype(np.float32)
+                        index.add(test_data)
+                    except Exception as e:
+                        faiss_success = False
+                        warning_msg(f"FAISS GPU test failed: {str(e)}")
+                    
+                    if not faiss_success:
+                        warning_msg("For GPU issues with FAISS, try: ./fix_gpu.sh --force-single-gpu")
             else:
                 info_msg("\nFAISS is using CPU version (this is normal)")
                 
@@ -1144,6 +1040,10 @@ def gpu_info(detailed: bool, benchmark: bool):
                         info_msg("✓ GPU acceleration for the LLM model")
                         info_msg("✓ GPU acceleration for embedding generation")
                         info_msg("✓ Only vector similarity search uses CPU (minimal impact)")
+                        
+                        # Suggest installing FAISS-GPU
+                        if not hasattr(faiss, 'get_num_gpus'):
+                            info_msg("To enable GPU for FAISS: ./fix_gpu.sh")
                 except ImportError:
                     pass
         except ImportError:
@@ -1158,6 +1058,13 @@ def gpu_info(detailed: bool, benchmark: bool):
             
     except Exception as e:
         error_msg(f"Error checking GPU information: {str(e)}")
+        
+        # Provide help when errors occur
+        info_msg("\nIf you're experiencing GPU-related issues:")
+        info_msg("1. Run: ./fix_gpu.sh --test-only    (to diagnose without making changes)")
+        info_msg("2. Run: ./fix_gpu.sh --force-single-gpu  (to use only one GPU)")
+        info_msg("3. Run: ./fix_gpu.sh --force-cpu    (as a last resort)")
+        info_msg("4. For more options: ./fix_gpu.sh --help")
 
 @cli.command()
 @click.option('--force-gpu', is_flag=True, help='Force GPU usage for LLM (overrides detection)')
