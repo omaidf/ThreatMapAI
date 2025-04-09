@@ -11,8 +11,8 @@ import logging
 import subprocess
 import platform
 import json
-import pathlib  # Import the pathlib module
-from pathlib import Path  # Import the Path class
+import pathlib
+from pathlib import Path
 from typing import Optional, Tuple, List
 import click
 import threading
@@ -20,9 +20,14 @@ import time
 import re
 import webbrowser
 from tqdm import tqdm
+import importlib
 import importlib.util
 import signal
 import psutil
+import gc
+import faiss
+import torch
+from dotenv import load_dotenv
 
 # Import utility modules
 from utils import (
@@ -31,31 +36,27 @@ from utils import (
     detect_architecture, get_default_model_path, validate_model_path,
     set_token_interactive, test_model_loading, check_model_file
 )
-# Import download_model from model_config (not model_utils) to ensure consistency
-from utils.model_config import download_model
+
+# Import specialized modules
+from utils.model_config import download_model, DEFAULT_MODEL_NAME, MODEL_REPOS, get_model_info, get_available_models, set_default_model
 from utils.file_utils import (
     check_output_directory, clean_previous_run, check_required_files,
     check_dependencies
 )
-# Explicitly import diagram utilities with clear source
+from utils.env_utils import get_env_variable, update_env_file
+from utils.model_utils import detect_gpu_capabilities
 from utils.diagram_utils import (
     find_diagrams, start_server_and_open_diagrams, view_diagrams
 )
 
-# Import core modules when needed
+# Import core processing modules
 from repository_analyzer.embedding_store import EmbeddingStore
-
-# Delay loading of other optional/heavyweight modules into functions where needed
-# from dotenv import load_dotenv
-# from repository_analyzer.analyzer import RepositoryAnalyzer
-# from llm_processor.processor import LLMProcessor
-# from visualizer.visualizer import ThreatModelVisualizer
-# from view_diagram import convert_to_html, start_server
-# from tqdm import tqdm
+from repository_analyzer.analyzer import RepositoryAnalyzer
+from llm_processor.processor import LLMProcessor
+from visualizer.visualizer import ThreatModelVisualizer
 
 # Load environment variables from .env file if it exists
 if os.path.exists('.env'):
-    from dotenv import load_dotenv
     load_dotenv()
 
 # Configure logging - reduce verbosity
@@ -68,12 +69,6 @@ logging.getLogger('repository_analyzer').setLevel(logging.INFO)
 logging.getLogger('llm_processor').setLevel(logging.INFO)
 logging.getLogger('visualizer').setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Define colored output styles for click
-SUCCESS_STYLE = {'fg': 'green', 'bold': True}
-ERROR_STYLE = {'fg': 'red', 'bold': True}
-WARNING_STYLE = {'fg': 'yellow', 'bold': False}
-INFO_STYLE = {'fg': 'blue', 'bold': False}
 
 class CLIError(Exception):
     """Custom exception for CLI-related errors."""
@@ -92,46 +87,10 @@ def validate_output_dir(ctx, param, value: str) -> str:
         pathlib.Path("output").mkdir(exist_ok=True)
         return "output"
 
-def check_requirements() -> None:
-    """Check if all required dependencies are installed."""
-    try:
-        from importlib.metadata import version, PackageNotFoundError
-        with open('requirements.txt') as f:
-            requirements = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-            missing_deps = []
-            for req in requirements:
-                try:
-                    # Parse the requirement string
-                    req_name = req.split('>=')[0].split('==')[0].strip()
-                    if ';' in req_name:  # Handle environment markers
-                        req_name = req_name.split(';')[0].strip()
-                    
-                    # Try to get the version - will raise an exception if missing
-                    version(req_name)
-                except PackageNotFoundError:
-                    missing_deps.append(req)
-            
-            if missing_deps:
-                logger.warning(f"Missing dependencies: {', '.join(missing_deps)}")
-                if not click.confirm("Install missing dependencies?", default=True):
-                    logger.warning("Continuing without installing dependencies. This may cause errors.")
-                    return
-                
-                for req in missing_deps:
-                    logger.info(f"Installing missing dependency: {req}")
-                    try:
-                        subprocess.check_call([sys.executable, "-m", "pip", "install", req])
-                    except subprocess.CalledProcessError:
-                        logger.error(f"Failed to install {req}. Continuing anyway.")
-    except Exception as e:
-        logger.error(f"Failed to check/install requirements: {str(e)}")
-        logger.warning("Continuing without checking dependencies. This may cause errors.")
-
 def setup_tree_sitter() -> None:
     """Set up tree-sitter grammars."""
     try:
         # Import here to avoid circular imports
-        from repository_analyzer.analyzer import RepositoryAnalyzer
         analyzer = RepositoryAnalyzer()
         
         # During initialization, we don't load any specific languages
@@ -146,7 +105,6 @@ def setup_tree_sitter() -> None:
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "gitpython"])
                 logger.info("GitPython installed, retrying setup...")
                 # Try again after installing GitPython
-                from repository_analyzer.analyzer import RepositoryAnalyzer
                 analyzer = RepositoryAnalyzer()
                 analyzer._setup_tree_sitter(specific_languages=[])
             except Exception:
@@ -173,7 +131,6 @@ def create_embedding_store(try_load: bool = True, device: Optional[str] = None, 
         # Handle GPU detection gracefully
         cuda_available = False
         try:
-            import torch
             cuda_available = torch.cuda.is_available()
             if cuda_available:
                 gpu_count = torch.cuda.device_count()
@@ -189,7 +146,6 @@ def create_embedding_store(try_load: bool = True, device: Optional[str] = None, 
         if not use_cpu:
             try:
                 # Try to import faiss and check if GPU support is available
-                import faiss
                 gpu_supported = hasattr(faiss, 'StandardGpuResources')
                 
                 if not gpu_supported:
@@ -198,7 +154,6 @@ def create_embedding_store(try_load: bool = True, device: Optional[str] = None, 
                         # Try to install the right version of faiss-gpu based on CUDA version
                         try:
                             # Check CUDA version to install the right package
-                            import torch
                             cuda_version = torch.version.cuda
                             
                             # Get major version for package selection
@@ -215,7 +170,6 @@ def create_embedding_store(try_load: bool = True, device: Optional[str] = None, 
                             success_msg(f"Successfully installed {package} for CUDA {cuda_version}")
                             
                             # Reload faiss after installation
-                            import importlib
                             importlib.reload(sys.modules['faiss'])
                             gpu_supported = hasattr(faiss, 'StandardGpuResources')
                         except Exception as cuda_error:
@@ -225,7 +179,6 @@ def create_embedding_store(try_load: bool = True, device: Optional[str] = None, 
                             success_msg("Installed faiss-gpu (default version)")
                             
                             # Reload faiss after installation
-                            import importlib
                             importlib.reload(sys.modules['faiss'])
                             gpu_supported = hasattr(faiss, 'StandardGpuResources')
                     except Exception as install_error:
@@ -277,7 +230,6 @@ def create_embedding_store(try_load: bool = True, device: Optional[str] = None, 
             try:
                 # First check if we should install GPU version instead
                 try:
-                    import torch
                     if torch.cuda.is_available() and not use_cpu:
                         info_msg("CUDA detected, installing GPU version of FAISS...")
                         subprocess.check_call([sys.executable, "-m", "pip", "install", "faiss-gpu"])
@@ -315,7 +267,6 @@ def install_faiss_gpu() -> bool:
     try:
         # First check if faiss is already installed with GPU support
         try:
-            import faiss
             if hasattr(faiss, 'StandardGpuResources'):
                 # GPU support already available
                 info_msg("FAISS with GPU support is already installed")
@@ -327,7 +278,6 @@ def install_faiss_gpu() -> bool:
         # Check CUDA version to determine which package to install
         cuda_version = None
         try:
-            import torch
             if torch.cuda.is_available():
                 cuda_version = torch.version.cuda
                 info_msg(f"Detected CUDA version: {cuda_version}")
@@ -358,7 +308,6 @@ def install_faiss_gpu() -> bool:
         # Verify installation
         try:
             # Force reload of faiss module if it was already imported
-            import importlib
             if 'faiss' in sys.modules:
                 importlib.reload(sys.modules['faiss'])
             else:
@@ -401,7 +350,6 @@ def init(device: str, gpu_ids: str):
         
         # Check hardware capabilities first
         try:
-            import torch
             cuda_available = torch.cuda.is_available()
             if cuda_available:
                 gpu_count = torch.cuda.device_count()
@@ -521,7 +469,6 @@ def init(device: str, gpu_ids: str):
         
         # Provide specific recommendations based on detected hardware
         try:
-            import psutil
             cpu_count = psutil.cpu_count(logical=False)
             memory_gb = psutil.virtual_memory().total / (1024**3)
             
@@ -608,7 +555,6 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
         if device != 'cpu':
             # Check if GPU is available
             try:
-                import torch
                 if torch.cuda.is_available():
                     # For CUDA operations, force GPU
                     os.environ["FORCE_GPU"] = "true"
@@ -707,12 +653,10 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
             
             # Import and initialize analyzer
             info_msg("Initializing repository analyzer...")
-            from repository_analyzer.analyzer import RepositoryAnalyzer
             analyzer = RepositoryAnalyzer(embedding_store=embedding_store)
             
             # Import processor for LLM-based analysis
             info_msg("Initializing LLM processor...")
-            from llm_processor.processor import LLMProcessor
             processor = LLMProcessor(model_path=model_path)
             progress.update(1)
             
@@ -735,7 +679,6 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
                 
             # Generate visualizations
             info_msg("Generating visualizations...")
-            from visualizer.visualizer import ThreatModelVisualizer
             visualizer = ThreatModelVisualizer()
             diagrams = visualizer.generate_visualizations_from_dir(output_dir)
             progress.update(1)
@@ -776,21 +719,15 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
         if embedding_store:
             try:
                 # Check if Python is shutting down
-                import sys
                 if sys is None or sys.meta_path is None:
                     info_msg("Skipping final save during Python shutdown")
                 else:
-                    # Explicitly import required libraries to ensure they're available
-                    import os
-                    import json
-                    import faiss
-                    import pathlib  # Add pathlib import
-                    from pathlib import Path  # Make sure Path class is available
                     info_msg("Saving final embedding store state...")
                     embedding_store.save()
                     info_msg("Final embedding store save completed")
             except Exception as save_error:
                 warning_msg(f"Failed to save embedding store during cleanup: {str(save_error)}")
+            
             # Set to None to release reference
             embedding_store = None
             
@@ -798,7 +735,6 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
             analyzer = None
             
         # Force final garbage collection
-        import gc
         gc.collect()
 
 @cli.command()
@@ -806,10 +742,7 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
               help='Directory containing analysis results')
 def visualize(output_dir: str):
     """Generate visualizations from analysis results."""
-    from tqdm import tqdm
-    import pathlib  # Add pathlib module
-    from pathlib import Path  # Import Path class
-    from visualizer.visualizer import ThreatModelVisualizer
+    visualizer = ThreatModelVisualizer()
     
     try:
         info_msg("Generating visualizations...")
@@ -865,7 +798,6 @@ def download_model_cmd(force: bool):
         model_path = get_default_model_path()
         
         # Get model info to display requirements
-        from utils.env_utils import get_env_variable
         model_name = get_env_variable("LLM_MODEL", "codellama-7b-instruct")
         model_info = get_model_info(model_name)
         
@@ -896,7 +828,6 @@ def download_model_cmd(force: bool):
         
         # Check if user has a GPU
         try:
-            import torch
             if torch.cuda.is_available():
                 gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # in GB
                 if is_large_model and gpu_memory < 24:
@@ -1097,7 +1028,6 @@ def gpu_info(detailed: bool, benchmark: bool):
     try:
         # Check for PyTorch
         try:
-            import torch
             if torch.cuda.is_available():
                 gpu_count = torch.cuda.device_count()
                 success_msg(f"PyTorch detected {gpu_count} CUDA-capable GPU(s)")
@@ -1264,7 +1194,6 @@ def gpu_info(detailed: bool, benchmark: bool):
                 info_msg("The system will run in CPU-only mode, which is perfectly fine but slower")
                 # Check CPU information
                 try:
-                    import psutil
                     cpu_count = psutil.cpu_count(logical=False)
                     logical_cpu_count = psutil.cpu_count(logical=True)
                     memory = psutil.virtual_memory()
@@ -1288,7 +1217,6 @@ def gpu_info(detailed: bool, benchmark: bool):
             
         # Check for FAISS
         try:
-            import faiss
             if hasattr(faiss, 'get_num_gpus') and faiss.get_num_gpus() > 0:
                 success_msg(f"\nFAISS with GPU acceleration available")
             else:
@@ -1296,7 +1224,6 @@ def gpu_info(detailed: bool, benchmark: bool):
                 
                 # Provide clear information about GPU usage
                 try:
-                    import torch
                     if torch.cuda.is_available():
                         success_msg("Your system will still use GPU for all important operations:")
                         info_msg("✓ GPU acceleration for the LLM model")
@@ -1345,7 +1272,6 @@ def configure_gpu(force_gpu: bool, force_cpu: bool, gpu_ids: str, memory_limit: 
                 info_msg(f"Selected GPUs: {selected_gpus}")
                 
                 # Quick validation of GPU IDs
-                import torch
                 if torch.cuda.is_available():
                     available_gpus = torch.cuda.device_count()
                     for gpu_id in selected_gpus:
@@ -1369,7 +1295,6 @@ def configure_gpu(force_gpu: bool, force_cpu: bool, gpu_ids: str, memory_limit: 
             # First check if CUDA is available
             cuda_available = False
             try:
-                import torch
                 cuda_available = torch.cuda.is_available()
                 if not cuda_available:
                     warning_msg("WARNING: No CUDA-capable GPU detected, but trying to force GPU mode")
@@ -1502,10 +1427,7 @@ def configure_gpu(force_gpu: bool, force_cpu: bool, gpu_ids: str, memory_limit: 
               help='Output directory for analysis results')
 def report(output_dir: str):
     """Generate a comprehensive security report from analysis results."""
-    import webbrowser
-    import pathlib  # Add pathlib import
-    from pathlib import Path  # Import Path explicitly 
-    from visualizer.visualizer import ThreatModelVisualizer
+    visualizer = ThreatModelVisualizer()
     
     try:
         info_msg(f"Generating report from {output_dir}")
@@ -1539,9 +1461,6 @@ def main():
             """Handle signals to ensure clean shutdown."""
             logger.info("Received signal to terminate, cleaning up...")
             # Force cleanup of any global resources
-            import gc
-            
-            # Release threading resources
             gc.collect()
             
             # Exit with success code
@@ -1554,7 +1473,6 @@ def main():
         # Check if this is the first run (no arguments) and provide helpful guidance
         if len(sys.argv) == 1:
             try:
-                import torch
                 cuda_available = torch.cuda.is_available()
                 if cuda_available:
                     gpu_count = torch.cuda.device_count()
@@ -1573,10 +1491,6 @@ def main():
                 pass
         
         # Check if using default model and show message about 70B option
-        from utils.model_config import DEFAULT_MODEL_NAME, MODEL_REPOS
-        from utils.env_utils import get_env_variable
-        
-        # Check if this is an analyze command that could benefit from 70B model
         is_analyze_command = len(sys.argv) > 1 and sys.argv[1] == "analyze"
         env_model = get_env_variable("LLM_MODEL")
         model_path = get_env_variable("LLM_MODEL_PATH", "")
@@ -1593,7 +1507,6 @@ def main():
     except Exception as e:
         error_msg(f"CLI error: {str(e)}")
         # Clean up and exit with error
-        import gc
         gc.collect()
         sys.exit(1)
 
