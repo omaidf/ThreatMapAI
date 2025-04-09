@@ -272,68 +272,11 @@ def install_faiss_gpu() -> bool:
     Returns:
         True if installation was successful, False otherwise
     """
-    try:
-        # First check if faiss is already installed with GPU support
-        try:
-            if hasattr(faiss, 'StandardGpuResources'):
-                # GPU support already available
-                info_msg("FAISS with GPU support is already installed")
-                return True
-        except ImportError:
-            # FAISS not installed at all
-            pass
-        
-        # Check CUDA version to determine which package to install
-        cuda_version = None
-        try:
-            if torch.cuda.is_available():
-                cuda_version = torch.version.cuda
-                info_msg(f"Detected CUDA version: {cuda_version}")
-            else:
-                warning_msg("No CUDA available, cannot install FAISS-GPU")
-                return False
-        except ImportError:
-            warning_msg("PyTorch not installed, cannot detect CUDA version")
-            warning_msg("Installing default FAISS-GPU package")
-        
-        # Select appropriate package based on CUDA version
-        if cuda_version:
-            major_version = cuda_version.split('.')[0]
-            if major_version == '11':
-                package = "faiss-gpu"
-            elif major_version == '12':
-                package = "faiss-gpu>=1.7.3"  # For CUDA 12 compatibility
-            else:
-                package = "faiss-gpu"  # Default
-        else:
-            package = "faiss-gpu"  # Default if can't determine version
-        
-        # Install the package
-        info_msg(f"Installing {package}...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-        success_msg(f"Successfully installed {package}")
-        
-        # Verify installation
-        try:
-            # Force reload of faiss module if it was already imported
-            if 'faiss' in sys.modules:
-                importlib.reload(sys.modules['faiss'])
-            else:
-                import faiss
-                
-            if hasattr(faiss, 'StandardGpuResources'):
-                success_msg("FAISS GPU support successfully installed")
-                return True
-            else:
-                warning_msg("FAISS installed but GPU support not available")
-                return False
-        except ImportError:
-            warning_msg("Failed to import FAISS after installation")
-            return False
-            
-    except Exception as e:
-        warning_msg(f"Failed to install FAISS-GPU: {str(e)}")
-        return False
+    # Import the function from gpu_utils to avoid code duplication
+    from utils.gpu_utils import install_faiss_gpu as gpu_utils_install_faiss_gpu
+    
+    # Call the function from utils
+    return gpu_utils_install_faiss_gpu()
 
 @cli.command()
 @click.option('--device', type=click.Choice(['auto', 'cpu', 'cuda']), default='auto',
@@ -1223,175 +1166,72 @@ def gpu_info(detailed: bool, benchmark: bool):
 @click.option('--memory-limit', type=float, help='Limit GPU memory usage (in GB)')
 @click.option('--distributed', is_flag=True, help='Enable multi-GPU distributed processing (experimental)')
 def configure_gpu(force_gpu: bool, force_cpu: bool, gpu_ids: str, memory_limit: float, distributed: bool):
-    """Configure GPU usage for LLaMA model and embeddings.
-    
-    For multi-GPU setups, you can specify which GPUs to use with --gpu-ids.
-    The --memory-limit option helps when sharing GPU resources with other applications.
-    """
+    """Configure GPU acceleration settings for model inference."""
     try:
-        # Use the function from gpu_utils instead of model_utils
-        from utils.gpu_utils import detect_gpu_capabilities
-        
-        # Can't force both CPU and GPU
-        if force_gpu and force_cpu:
-            error_msg("Cannot force both CPU and GPU at the same time")
-            return
-        
-        # Process GPU IDs if provided
+        # Parse GPU IDs if provided
         selected_gpus = None
         if gpu_ids:
             try:
                 selected_gpus = [int(gpu_id.strip()) for gpu_id in gpu_ids.split(',')]
                 info_msg(f"Selected GPUs: {selected_gpus}")
-                
-                # Quick validation of GPU IDs
-                if torch.cuda.is_available():
-                    available_gpus = torch.cuda.device_count()
-                    for gpu_id in selected_gpus:
-                        if gpu_id >= available_gpus:
-                            warning_msg(f"GPU {gpu_id} does not exist (only {available_gpus} GPUs available)")
-                            if not click.confirm("Continue with other valid GPUs?", default=True):
-                                info_msg("Operation canceled")
-                                return
-                            # Filter out invalid GPUs
-                            selected_gpus = [gpu_id for gpu_id in selected_gpus if gpu_id < available_gpus]
-                            if not selected_gpus:
-                                error_msg("No valid GPUs selected")
-                                return
-                            info_msg(f"Using GPUs: {selected_gpus}")
             except Exception as e:
-                error_msg(f"Invalid GPU IDs format: {str(e)}")
-                info_msg("Please use comma-separated numbers, e.g., '0,1,2'")
-                return
+                warning_msg(f"Invalid GPU IDs format: {str(e)}")
+                warning_msg("Using default GPU selection")
         
-        if force_gpu:
-            # First check if CUDA is available
-            cuda_available = False
-            try:
-                cuda_available = torch.cuda.is_available()
-                if not cuda_available:
-                    warning_msg("WARNING: No CUDA-capable GPU detected, but trying to force GPU mode")
-                    warning_msg("This may cause errors or falls back to CPU mode")
-                    if not click.confirm("Continue with force GPU mode anyway?", default=False):
-                        info_msg("Operation canceled")
-                        return
-            except ImportError:
-                warning_msg("PyTorch not installed, cannot verify GPU availability")
-                warning_msg("Run setup.sh to install all dependencies properly")
-                if not click.confirm("Continue with force GPU mode anyway?", default=False):
-                    info_msg("Operation canceled")
-                    return
-            
-        # Detect current settings
+        # Check current settings
         current_gpu = os.environ.get("FORCE_GPU", "").lower() in ["true", "1", "yes"]
         current_cpu = os.environ.get("FORCE_CPU", "").lower() in ["true", "1", "yes"]
         
-        # Check current GPU capabilities
-        gpu_config = detect_gpu_capabilities(force_gpu=force_gpu, force_cpu=force_cpu)
+        # Detect if CUDA is available for status reporting
+        try:
+            cuda_available = torch.cuda.is_available()
+        except ImportError:
+            cuda_available = False
         
-        if force_gpu:
-            # Set environment variable to force GPU
-            os.environ["FORCE_GPU"] = "true"
-            if "FORCE_CPU" in os.environ:
-                del os.environ["FORCE_CPU"]
+        # Call the centralized GPU configuration utility
+        gpu_config = configure_gpu_environment(
+            force_gpu=force_gpu,
+            force_cpu=force_cpu,
+            gpu_ids=selected_gpus,
+            memory_limit=memory_limit,
+            distributed=distributed
+        )
+        
+        # Display results based on the configuration
+        if gpu_config['device'] == 'cpu':
+            success_msg("System configured for CPU-only operation")
+            info_msg("The system will run slower but is fully functional in CPU-only mode")
+        else:
+            success_msg(f"GPU acceleration enabled: using {len(gpu_config['selected_gpus'])} GPU(s)")
+            if gpu_config['distributed']:
+                success_msg(f"Multi-GPU distributed processing enabled for GPUs: {gpu_config['selected_gpus']}")
+            if gpu_config['memory_limit']:
+                info_msg(f"GPU memory limit set to {gpu_config['memory_limit']} GB per GPU")
                 
-            # Also update the .env file if it exists
-            from utils.env_utils import update_env_file
-            update_env_file("FORCE_GPU", "true")
-            update_env_file("FORCE_CPU", "")
-            
-            # Update GPU IDs if provided
-            if selected_gpus:
-                update_env_file("GPU_IDS", ",".join(str(gpu_id) for gpu_id in selected_gpus))
-                os.environ["GPU_IDS"] = ",".join(str(gpu_id) for gpu_id in selected_gpus)
-                success_msg(f"Selected GPUs {selected_gpus} will be used for processing")
-            
-            # Update memory limit if provided
-            if memory_limit:
-                update_env_file("GPU_MEMORY_LIMIT", str(memory_limit))
-                os.environ["GPU_MEMORY_LIMIT"] = str(memory_limit)
-                success_msg(f"GPU memory usage limited to {memory_limit} GB")
-            
-            # Update distributed flag
-            if distributed:
-                update_env_file("DISTRIBUTED", "true")
-                os.environ["DISTRIBUTED"] = "true"
-                success_msg("Multi-GPU distributed processing enabled (experimental)")
-                info_msg("This feature requires all selected GPUs to have sufficient memory")
-            
-            # When forcing GPU mode, automatically install FAISS-GPU
-            if cuda_available:
+            # When configuring for GPU, try to install FAISS-GPU for better performance
+            if cuda_available and gpu_config['device'] == 'cuda':
                 info_msg("Installing GPU-accelerated libraries for FAISS...")
                 if install_faiss_gpu():
                     success_msg("GPU acceleration packages installed successfully")
+                    
+                    # Ensure we set the appropriate environment variables for multi-GPU FAISS
+                    if gpu_config['distributed'] and len(gpu_config['selected_gpus']) > 1:
+                        info_msg("Testing FAISS multi-GPU compatibility...")
+                        from utils.gpu_utils import detect_gpu_capabilities
+                        gpu_capabilities = detect_gpu_capabilities()
+                        if gpu_capabilities['use_gpu']:
+                            info_msg(f"FAISS will use {gpu_capabilities['n_gpu_layers'] if gpu_capabilities['n_gpu_layers'] != -1 else 'all'} GPU layers")
                 else:
                     warning_msg("Failed to install GPU acceleration packages")
-                    warning_msg("System will still use GPU for model inference and embedding generation")
-            
-            success_msg("GPU acceleration FORCED ON for LLM")
-            if not gpu_config['use_gpu']:
-                warning_msg("WARNING: No GPU detected but forcing GPU acceleration. This may cause errors.")
-                info_msg("If you encounter issues, use --force-cpu to switch back to CPU mode")
+                    warning_msg("System will still use GPU for model inference but not for embeddings")
+                    
+        # Display help information
+        info_msg("\nGPU settings applied. These settings will be used for all future operations.")
+        if force_gpu:
+            info_msg("To revert to CPU-only mode: python -m cli configure-gpu --force-cpu")
         elif force_cpu:
-            # Set environment variable to force CPU
-            os.environ["FORCE_CPU"] = "true"
-            if "FORCE_GPU" in os.environ:
-                del os.environ["FORCE_GPU"]
-                
-            # Also update the .env file if it exists
-            from utils.env_utils import update_env_file
-            update_env_file("FORCE_CPU", "true")
-            update_env_file("FORCE_GPU", "")
+            info_msg("To enable GPU mode: python -m cli configure-gpu --force-gpu")
             
-            # Clear any multi-GPU settings
-            update_env_file("GPU_IDS", "")
-            update_env_file("DISTRIBUTED", "")
-            update_env_file("GPU_MEMORY_LIMIT", "")
-            if "GPU_IDS" in os.environ:
-                del os.environ["GPU_IDS"]
-            if "DISTRIBUTED" in os.environ:
-                del os.environ["DISTRIBUTED"]
-            if "GPU_MEMORY_LIMIT" in os.environ:
-                del os.environ["GPU_MEMORY_LIMIT"]
-            
-            success_msg("GPU acceleration FORCED OFF for LLM (using CPU only)")
-            info_msg("The system will run slower but can work on machines without GPU")
-        else:
-            # No change to force settings, but update other GPU options
-            
-            # Update GPU IDs if provided
-            if selected_gpus:
-                update_env_file("GPU_IDS", ",".join(str(gpu_id) for gpu_id in selected_gpus))
-                os.environ["GPU_IDS"] = ",".join(str(gpu_id) for gpu_id in selected_gpus)
-                success_msg(f"Selected GPUs {selected_gpus} will be used for processing")
-            
-            # Update memory limit if provided
-            if memory_limit:
-                update_env_file("GPU_MEMORY_LIMIT", str(memory_limit))
-                os.environ["GPU_MEMORY_LIMIT"] = str(memory_limit)
-                success_msg(f"GPU memory usage limited to {memory_limit} GB")
-            
-            # Update distributed flag
-            if distributed:
-                update_env_file("DISTRIBUTED", "true")
-                os.environ["DISTRIBUTED"] = "true"
-                success_msg("Multi-GPU distributed processing enabled (experimental)")
-                info_msg("This feature requires all selected GPUs to have sufficient memory")
-            
-            # Just display current status
-            if current_gpu:
-                info_msg("Current setting: GPU acceleration FORCED ON")
-            elif current_cpu:
-                info_msg("Current setting: GPU acceleration FORCED OFF (CPU only)")
-            else:
-                info_msg("Current setting: AUTO-DETECT GPU")
-                
-            if gpu_config['use_gpu']:
-                success_msg(f"GPU detected: {gpu_config['gpu_info']}")
-                success_msg(f"Will use {gpu_config['n_gpu_layers']} GPU layers for LLM")
-            else:
-                info_msg("No GPU detected or GPU not available. Using CPU.")
-                info_msg("The system will run slower but is fully functional in CPU-only mode")
     except Exception as e:
         error_msg(f"Error configuring GPU settings: {str(e)}")
 
