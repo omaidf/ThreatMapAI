@@ -657,7 +657,14 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
             
             # Import processor for LLM-based analysis
             info_msg("Initializing LLM processor...")
-            processor = LLMProcessor(model_path=model_path)
+            processor = LLMProcessor(
+                model_path_or_embedding_store=model_path,
+                distributed=use_distributed,
+                gpu_id=gpu_id,
+                gpu_ids=selected_gpu_ids,
+                memory_limit=memory_limit,
+                device=device if device != 'auto' else None
+            )
             progress.update(1)
             
             # Analyze repository
