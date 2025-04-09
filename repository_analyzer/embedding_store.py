@@ -20,37 +20,19 @@ import sys
 import torch
 from sentence_transformers import SentenceTransformer
 import sentence_transformers.util
+from langchain_core.vectorstores import VectorStore
 
 # Import utility modules
 from utils.common import success_msg, error_msg, warning_msg, info_msg
 from utils.env_utils import get_env_variable
 from utils.file_utils import check_output_directory
+from utils.gpu_utils import detect_gpu  # Import the centralized GPU detection function
 
 logger = logging.getLogger(__name__)
 
 class EmbeddingStoreError(Exception):
     """Custom exception for embedding store errors."""
     pass
-
-def detect_gpu() -> Tuple[bool, Optional[int]]:
-    """
-    Detect if GPU is available and return its memory in GB.
-    
-    Returns:
-        Tuple of (is_gpu_available, gpu_memory_gb)
-    """
-    try:
-        if torch.cuda.is_available():
-            gpu_count = torch.cuda.device_count()
-            if gpu_count > 0:
-                # Get memory of first GPU in GB
-                gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                info_msg(f"Detected GPU with {gpu_memory:.2f} GB memory")
-                return True, gpu_memory
-    except Exception as e:
-        warning_msg(f"Error detecting GPU: {str(e)}")
-    
-    return False, None
 
 class EmbeddingStore:
     """
@@ -98,80 +80,30 @@ class EmbeddingStore:
             # Auto-detect: use GPU if available and has sufficient memory (>2GB)
             self.device = 'cuda' if gpu_available and gpu_memory and gpu_memory > 2 else 'cpu'
         
-        info_msg(f"Using device: {self.device}{f' (GPU {self.gpu_id})' if self.device == 'cuda' else ''}")
+        # Use the specified GPU ID if available
+        if self.device == 'cuda' and gpu_id is not None and torch.cuda.is_available():
+            if gpu_id < torch.cuda.device_count():
+                torch.cuda.set_device(gpu_id)
+                info_msg(f"Using GPU {gpu_id} for sentence transformers")
+            else:
+                warning_msg(f"Specified GPU {gpu_id} not available, using default GPU")
         
-        # Configure resources based on device
-        if self.device == 'cpu':
-            # Set environment variables to disable all parallelism
-            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
-            os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Disable parallelism warnings
-            os.environ["OMP_NUM_THREADS"] = "1"  # Limit OpenMP threads
-            os.environ["MKL_NUM_THREADS"] = "1"  # Limit MKL threads
-            
-            # Try to disable multiprocessing in torch
-            try:
-                torch.set_num_threads(1)  # Use only one thread
-                if hasattr(torch, 'set_num_interop_threads'):
-                    torch.set_num_interop_threads(1)
-            except:
-                pass
-        elif self.device == 'cuda' and gpu_id is not None:
-            # Set specific GPU device if specified
-            try:
-                if torch.cuda.is_available() and gpu_id < torch.cuda.device_count():
-                    torch.cuda.set_device(gpu_id)
-                    info_msg(f"Set active GPU to device {gpu_id}")
-                else:
-                    warning_msg(f"Requested GPU {gpu_id} is not available")
-            except ImportError:
-                pass
-        
-        # Initialize the embedding model
+        # Initialize the sentence transformer model for embeddings
         try:
-            # Use a smaller model for embeddings to avoid memory issues
-            model_name = 'all-MiniLM-L6-v2'  # This is a small, efficient model (384 dimensions)
+            if self.device == 'cuda':
+                device_str = f'cuda:{self.gpu_id}' if self.gpu_id is not None else 'cuda'
+            else:
+                device_str = 'cpu'
             
-            try:
-                # Set the specific CUDA device if needed
-                device_str = self.device
-                if self.device == 'cuda' and gpu_id is not None:
-                    device_str = f"cuda:{gpu_id}"
-                
-                # Load model with selected device
-                self.model = SentenceTransformer(model_name, device=device_str)
-                
-                # Configure model based on device
-                if self.device == 'cpu' and hasattr(self.model, 'max_seq_length'):
-                    self.model.max_seq_length = min(self.model.max_seq_length, 256)  # Limit sequence length
-                
-                self.vector_size = self.model.get_sentence_embedding_dimension()
-                info_msg(f"Embedding model initialized with dimension {self.vector_size} on {device_str}")
-            except Exception as model_e:
-                # Fallback to a simpler model
-                warning_msg(f"Failed to load {model_name}: {str(model_e)}, trying alternative model")
-                try:
-                    device_str = self.device
-                    if self.device == 'cuda' and gpu_id is not None:
-                        device_str = f"cuda:{gpu_id}"
-                    
-                    self.model = SentenceTransformer('paraphrase-MiniLM-L3-v2', device=device_str)
-                    if self.device == 'cpu' and hasattr(self.model, 'max_seq_length'):
-                        self.model.max_seq_length = min(self.model.max_seq_length, 256)  # Limit sequence length
-                    self.vector_size = self.model.get_sentence_embedding_dimension()
-                    info_msg(f"Loaded fallback embedding model with dimension {self.vector_size} on {device_str}")
-                except Exception as e2:
-                    # Create a dummy embedding model that returns zeros
-                    warning_msg(f"Failed to load embedding model: {str(e2)}")
-                    info_msg("⚠️ Creating dummy embedding model")
-                    self.vector_size = 384  # Standard dimension for embeddings
-                    self.model = None
+            self.model = SentenceTransformer('all-MiniLM-L6-v2', device=device_str)
+            self.vector_size = self.model.get_sentence_embedding_dimension()
+            info_msg(f"Embedding model initialized with dimension {self.vector_size} on {device_str}")
         except Exception as e:
-            warning_msg(f"Failed to initialize embedding model: {str(e)}")
-            # Set default values for minimal functionality
-            self.vector_size = 384 
+            warning_msg(f"Failed to initialize SentenceTransformer: {str(e)}")
             self.model = None
-            info_msg("ℹ️ Embedding store will use dummy embeddings")
-            
+            # Set a default vector size for FAISS initialization
+            self.vector_size = 384  # Default dimension for embeddings
+        
         # Set up FAISS index - handle errors gracefully
         try:
             self._setup_index()
