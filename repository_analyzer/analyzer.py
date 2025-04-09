@@ -933,8 +933,22 @@ class RepositoryAnalyzer:
                 try:
                     initial_files = self.embedding_store._get_all_files()
                     print(f"CRITICAL DEBUG: Embedding store contains {len(initial_files)} files at start of analysis")
+                    if hasattr(self.embedding_store, 'model') and self.embedding_store.model is None:
+                        print("CRITICAL DEBUG: ERROR - Embedding model is None, attempting to reinitialize")
+                        self.embedding_store.initialize_model()
+                        if hasattr(self.embedding_store, 'model') and self.embedding_store.model is not None:
+                            print("CRITICAL DEBUG: Successfully reinitialized embedding model")
+                        else:
+                            print("CRITICAL DEBUG: Failed to reinitialize embedding model")
                 except Exception as e:
                     print(f"CRITICAL DEBUG: Error checking embedding store: {str(e)}")
+                    print("CRITICAL DEBUG: Attempting to reinitialize embedding store model")
+                    try:
+                        if hasattr(self.embedding_store, 'initialize_model'):
+                            self.embedding_store.initialize_model()
+                            print("CRITICAL DEBUG: Reinitialized embedding store model")
+                    except Exception as e2:
+                        print(f"CRITICAL DEBUG: Failed to reinitialize embedding store model: {str(e2)}")
             
             results = {
                 "components": [],
@@ -1121,6 +1135,14 @@ class RepositoryAnalyzer:
             # Log that all files will be indexed
             logger.info(f"Indexing {len(all_files)} files for RAG...")
             
+            # DIAGNOSTIC: Count PHP files specifically
+            php_files = [f for f in all_files if f[2] == '.php']
+            if php_files:
+                print(f"CRITICAL DEBUG: Found {len(php_files)} PHP files to index")
+                print(f"CRITICAL DEBUG: First 5 PHP files: {php_files[:5]}")
+            else:
+                print("CRITICAL DEBUG: NO PHP FILES FOUND FOR INDEXING")
+                
             # Count by extension for logging purposes
             extension_counts = {}
             for _, _, ext in all_files:
@@ -1223,9 +1245,11 @@ class RepositoryAnalyzer:
                         
                         # CRITICAL CHECK: Only index files with supported extensions
                         if ext not in supported_extensions:
+                            print(f"CRITICAL DEBUG: Skipping unsupported extension: {rel_path} (ext: {ext}), supported_extensions: {supported_extensions}")
                             logger.info(f"Skipping file with unsupported extension: {rel_path}")
                             continue
                         
+                        print(f"CRITICAL DEBUG: Processing file for indexing: {rel_path} (ext: {ext})")
                         # Improved file reading that avoids loading entire files into memory
                         with open(file_path, 'rb') as f:
                             # Read first chunk to determine if it's text
@@ -1275,9 +1299,18 @@ class RepositoryAnalyzer:
                             metadata["is_entry_point"] = True
                         
                         # Add file to embedding store with metadata
-                        self.embedding_store.add_file(rel_path, decoded_content, metadata)
-                        new_files += 1
-                        indexed_files += 1
+                        try:
+                            if self.embedding_store:
+                                print(f"CRITICAL DEBUG: Adding file to embedding store: {rel_path}")
+                                self.embedding_store.add_file(rel_path, decoded_content, metadata)
+                                print(f"CRITICAL DEBUG: Successfully added file to embedding store: {rel_path}")
+                                new_files += 1
+                                indexed_files += 1
+                            else:
+                                print(f"CRITICAL DEBUG: Embedding store is None, cannot add file: {rel_path}")
+                        except Exception as e:
+                            print(f"CRITICAL DEBUG: Error adding file to embedding store: {rel_path} - {str(e)}")
+                            logger.warning(f"Failed to add file to embedding store: {rel_path}: {str(e)}")
                     except Exception as e:
                         logger.warning(f"Failed to index {rel_path}: {str(e)}")
                         skipped_files += 1
@@ -1611,7 +1644,7 @@ class RepositoryAnalyzer:
             ".git", ".github", "__pycache__", ".pytest_cache", 
             ".vscode", ".idea", "node_modules", "venv", "env",
             "*.pyc", "*.pyo", "*.pyd", "*.so", "*.dylib", "*.dll",
-            "*.class", "*.jar", "*.war", "*.ear", "*.zip", "*.tar.gz",
+            "*.class", "*.jar", "*.war", "*.ear", "*.zip", ".tar.gz",
             "*.log", ".DS_Store", "Thumbs.db"
         ]
         
