@@ -211,35 +211,87 @@ class EmbeddingStore:
                         # Create GPU resources
                         self.gpu_resources = faiss.StandardGpuResources()
                         
-                        # Try multi-GPU approach first if multiple GPUs are available
+                        # Check if multi-GPU mode is enabled
+                        faiss_multi_gpu = os.environ.get("FAISS_MULTI_GPU", "0") == "1"
+                        use_sharding = os.environ.get("FAISS_USE_SHARDING", "0") == "1"
+                        
+                        # Try multi-GPU approach first if enabled and multiple GPUs are available
                         multi_gpu_success = False
-                        if hasattr(faiss, 'get_num_gpus') and faiss.get_num_gpus() > 1:
+                        
+                        # Only try multi-GPU if it's explicitly enabled
+                        if (faiss_multi_gpu and 
+                            hasattr(faiss, 'get_num_gpus') and 
+                            faiss.get_num_gpus() > 1 and
+                            torch.cuda.device_count() > 1):
                             try:
-                                # Try loading on multiple GPUs
-                                if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-                                    # Create a list of GPU resources
-                                    gpu_resources = []
-                                    for i in range(min(4, torch.cuda.device_count())):  # Limit to 4 GPUs 
-                                        res = faiss.StandardGpuResources()
-                                        gpu_resources.append(res)
-                                    
-                                    # Create config for multi-GPU
-                                    co = faiss.GpuMultipleClonerOptions()
-                                    co.useFloat16 = True
-                                    co.shard = True  # Shard index across GPUs
-                                    
-                                    # Create multi-GPU index
-                                    self.index = faiss.index_cpu_to_gpu_multiple_py(gpu_resources, cpu_index, co)
-                                    self.use_gpu_for_faiss = True
-                                    info_msg("Successfully loaded FAISS index to multiple GPUs")
-                                    multi_gpu_success = True
+                                # Clear CUDA cache first
+                                torch.cuda.empty_cache()
+                                
+                                # Create a list of GPU resources
+                                gpu_resources = []
+                                for i in range(min(4, torch.cuda.device_count())):  # Limit to 4 GPUs 
+                                    res = faiss.StandardGpuResources()
+                                    gpu_resources.append(res)
+                                
+                                # Create config for multi-GPU with careful options
+                                co = faiss.GpuMultipleClonerOptions()
+                                co.useFloat16 = True  # Use half precision for memory efficiency
+                                co.shard = use_sharding  # Only use sharding if enabled
+                                if use_sharding:
+                                    info_msg("Using index sharding across multiple GPUs")
+                                else:
+                                    info_msg("Using index replication across multiple GPUs (no sharding)")
+                                
+                                info_msg(f"Loading FAISS index to multiple GPUs...")
+                                
+                                # Direct approach without threading
+                                self.index = faiss.index_cpu_to_gpu_multiple_py(gpu_resources, cpu_index, co)
+                                self.use_gpu_for_faiss = True
+                                
+                                # Store resources to prevent garbage collection issues
+                                self.multi_gpu_resources = gpu_resources
+                                
+                                # Run a simple test to verify the index is working
+                                if self.index.ntotal > 0:
+                                    # Create a random query vector for testing
+                                    test_query = np.random.random((1, self.vector_size)).astype(np.float32)
+                                    try:
+                                        # Try a search with small k to validate index
+                                        D, I = self.index.search(test_query, min(1, self.index.ntotal))
+                                        info_msg(f"Successfully validated multi-GPU index with test query")
+                                    except Exception as test_e:
+                                        warning_msg(f"Multi-GPU index failed validation: {str(test_e)}")
+                                        raise RuntimeError("Index validation failed")
+                                
+                                info_msg("Successfully loaded FAISS index to multiple GPUs")
+                                multi_gpu_success = True
                             except Exception as multi_e:
-                                warning_msg(f"Failed to load multi-GPU FAISS index: {str(multi_e)}")
+                                error_details = str(multi_e)
+                                if "CUDA error" in error_details:
+                                    warning_msg(f"CUDA error during multi-GPU initialization: {error_details}")
+                                elif "out of memory" in error_details.lower():
+                                    warning_msg(f"GPU out of memory during multi-GPU initialization")
+                                else:
+                                    warning_msg(f"Failed to load multi-GPU FAISS index: {error_details}")
+                                
                                 warning_msg("Falling back to single GPU")
+                                
+                                # Explicitly clean up resources to avoid CUDA OOM errors
+                                try:
+                                    if hasattr(self, 'multi_gpu_resources'):
+                                        del self.multi_gpu_resources
+                                    if hasattr(self, 'index') and self.index is not None:
+                                        del self.index
+                                    import gc
+                                    gc.collect()
+                                    torch.cuda.empty_cache()
+                                except:
+                                    pass
                         
                         # If multi-GPU failed or not available, use single GPU
                         if not multi_gpu_success:
                             # Convert CPU index to GPU index using specified GPU ID
+                            info_msg(f"Loading FAISS index to GPU {self.gpu_id}...")
                             self.index = faiss.index_cpu_to_gpu(self.gpu_resources, self.gpu_id, cpu_index)
                             self.use_gpu_for_faiss = True
                             info_msg(f"Successfully moved FAISS index to GPU {self.gpu_id}")
@@ -339,34 +391,67 @@ class EmbeddingStore:
                         gpu_config.device = self.gpu_id  # Use specified GPU
                         gpu_config.useFloat16 = True  # Use half-precision for memory efficiency
                         
-                        # Try a multi-GPU approach if available
-                        if hasattr(faiss, 'GpuMultipleClonerOptions') and num_gpus > 1:
+                        # Check if multi-GPU is allowed based on environment variable
+                        faiss_multi_gpu = os.environ.get("FAISS_MULTI_GPU", "0") == "1"
+                        use_sharding = os.environ.get("FAISS_USE_SHARDING", "0") == "1"
+                        
+                        # Only attempt multi-GPU if enabled in environment and we have multiple GPUs
+                        multi_gpu_available = (
+                            faiss_multi_gpu and 
+                            torch.cuda.device_count() > 1 and 
+                            hasattr(faiss, 'GpuMultipleClonerOptions') and 
+                            num_gpus > 1
+                        )
+                        
+                        if multi_gpu_available:
                             try:
-                                # Try to set up a multi-GPU index for better performance
-                                if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-                                    info_msg(f"Setting up FAISS for multiple GPUs")
-                                    # Create a list of GPU resources, one for each device
-                                    gpu_resources = []
-                                    for i in range(min(4, torch.cuda.device_count())):  # Limit to 4 GPUs max
-                                        res = faiss.StandardGpuResources()
-                                        gpu_resources.append(res)
-                                    
-                                    # Create configuration for multi-GPU
-                                    co = faiss.GpuMultipleClonerOptions()
-                                    co.useFloat16 = True
-                                    co.shard = True  # Shard the index across GPUs
-                                    
-                                    # Create multi-GPU index
-                                    self.index = faiss.index_cpu_to_gpu_multiple_py(gpu_resources, cpu_index, co)
-                                    self.use_gpu_for_faiss = True
-                                    info_msg("Successfully created multi-GPU FAISS index")
-                                    return
+                                # Create a list of GPU resources, one for each device
+                                gpu_resources = []
+                                for i in range(min(4, torch.cuda.device_count())):
+                                    # Create separate GPU resources for each device
+                                    res = faiss.StandardGpuResources()
+                                    gpu_resources.append(res)
+                                
+                                # Create configuration for multi-GPU
+                                co = faiss.GpuMultipleClonerOptions()
+                                co.useFloat16 = True
+                                
+                                # Only use sharding if explicitly enabled
+                                co.shard = use_sharding
+                                if use_sharding:
+                                    info_msg("Using index sharding across multiple GPUs")
+                                else:
+                                    info_msg("Using index replication across multiple GPUs (no sharding)")
+                                
+                                info_msg("Creating multi-GPU FAISS index...")
+                                
+                                # Use simple direct approach without threading which can cause deadlocks
+                                self.index = faiss.index_cpu_to_gpu_multiple_py(gpu_resources, cpu_index, co)
+                                self.use_gpu_for_faiss = True
+                                info_msg("Successfully created multi-GPU FAISS index")
+                                
+                                # Store resources to prevent garbage collection issues
+                                self.multi_gpu_resources = gpu_resources
+                                return
                             except Exception as multi_gpu_error:
                                 warning_msg(f"Failed to create multi-GPU FAISS index: {str(multi_gpu_error)}")
                                 warning_msg("Falling back to single GPU")
+                                
+                                # Explicitly clean up resources to avoid CUDA OOM errors
+                                try:
+                                    if hasattr(self, 'multi_gpu_resources'):
+                                        del self.multi_gpu_resources
+                                    import gc
+                                    gc.collect()
+                                    torch.cuda.empty_cache()
+                                except:
+                                    pass
                         
                         # Create GPU index with a single GPU
+                        info_msg("Initializing single-GPU FAISS index...")
                         self.index = faiss.GpuIndexFlatL2(self.gpu_resources, self.vector_size, gpu_config)
+                        self.use_gpu_for_faiss = True
+                        info_msg("Successfully created single-GPU FAISS index")
                         return
                     else:
                         warning_msg("FAISS GPU support not available (install faiss-gpu instead of faiss-cpu)")
@@ -378,6 +463,7 @@ class EmbeddingStore:
             # If we get here, use CPU index
             self.index = cpu_index
             self.use_gpu_for_faiss = False
+            info_msg("Using CPU index for FAISS")
             
         except ImportError as e:
             warning_msg(f"Failed to import FAISS: {str(e)}")

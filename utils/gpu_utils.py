@@ -14,6 +14,7 @@ import importlib
 import importlib.util
 from typing import Tuple, List, Dict, Optional, Union, Any
 from pathlib import Path
+import numpy as np
 
 # Import internal utilities
 from utils.common import success_msg, error_msg, warning_msg, info_msg
@@ -362,11 +363,145 @@ def install_faiss_gpu() -> bool:
                 try:
                     # Try to actually create a GPU resource to fully verify
                     res = faiss.StandardGpuResources()
+                    
+                    # Force CUDA initialization to make sure GPU is truly available
+                    if torch.cuda.is_available():
+                        # Reset CUDA for clean state
+                        torch.cuda.empty_cache()
+                        # Initialize CUDA context on each device before FAISS uses them
+                        for i in range(torch.cuda.device_count()):
+                            with torch.cuda.device(i):
+                                torch.tensor([1.0], device=f"cuda:{i}")  # Force context initialization
+                        
+                        # Set critical FAISS GPU environment options
+                        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(torch.cuda.device_count()))
+                        info_msg(f"CUDA devices set to: {os.environ['CUDA_VISIBLE_DEVICES']}")
+                    
+                    # Now attempt to check multi-GPU compatibility if we have multiple GPUs
+                    if hasattr(faiss, 'get_num_gpus') and faiss.get_num_gpus() > 1 and torch.cuda.device_count() > 1:
+                        # Get FAISS version for debugging
+                        faiss_version = getattr(faiss, '__version__', 'unknown')
+                        info_msg(f"Testing FAISS {faiss_version} with multiple GPUs...")
+                        
+                        # Check if the system has enough memory for multi-GPU FAISS
+                        total_gpu_memory = 0
+                        for i in range(torch.cuda.device_count()):
+                            mem = torch.cuda.get_device_properties(i).total_memory / (1024**3)  # in GB
+                            total_gpu_memory += mem
+                            info_msg(f"GPU {i}: {mem:.2f} GB memory")
+                            
+                        # Check if any individual GPU has less than 4GB - multi-GPU often fails with limited memory
+                        has_small_gpu = False
+                        for i in range(torch.cuda.device_count()):
+                            mem = torch.cuda.get_device_properties(i).total_memory / (1024**3)  # in GB
+                            if mem < 4.0:
+                                has_small_gpu = True
+                                warning_msg(f"GPU {i} has only {mem:.2f} GB memory, which may be insufficient for multi-GPU FAISS")
+                                
+                        # If we have FAISS 1.7.2 or higher, use newer API which is more stable
+                        if hasattr(faiss, 'GpuMultipleClonerOptions'):
+                            # Check GPU architecture compatibility 
+                            archs_compatible = True
+                            arch_types = set()
+                            for i in range(torch.cuda.device_count()):
+                                arch = torch.cuda.get_device_properties(i).major * 10 + torch.cuda.get_device_properties(i).minor
+                                arch_types.add(arch)
+                            
+                            if len(arch_types) > 1:
+                                warning_msg(f"Found heterogeneous GPU architectures {arch_types}, which may cause issues with multi-GPU FAISS")
+                                archs_compatible = False
+                            
+                            # Only attempt multi-GPU if architectures are compatible, no small GPUs, and sufficient total memory
+                            if archs_compatible and not has_small_gpu and total_gpu_memory >= 16:
+                                info_msg("System appears suitable for multi-GPU FAISS")
+                                
+                                # Create small test data for verification
+                                dim = 128
+                                num_vectors = 100
+                                test_data = np.random.random((num_vectors, dim)).astype(np.float32)
+                                
+                                # First test single GPU to establish baseline
+                                single_res = faiss.StandardGpuResources()
+                                
+                                # Create a test index on a single GPU
+                                faiss.GpuIndexFlatL2(single_res, dim)
+                                info_msg("Basic single-GPU FAISS test successful")
+                                
+                                # Now try multi-GPU index initialization with small data
+                                # First init separate resources for each GPU
+                                gpu_resources = []
+                                for i in range(min(4, torch.cuda.device_count())):
+                                    info_msg(f"Initializing FAISS resource for GPU {i}")
+                                    single_res = faiss.StandardGpuResources()
+                                    gpu_resources.append(single_res)
+                                
+                                # Very basic, minimalistic index to test initialization only
+                                cpu_index = faiss.IndexFlatL2(dim)
+                                
+                                # Add test data to CPU index first
+                                cpu_index.add(test_data)
+                                info_msg(f"Successfully created CPU index with {cpu_index.ntotal} vectors")
+                                
+                                # Conservative options - avoid sharding which can cause lockups
+                                co = faiss.GpuMultipleClonerOptions()
+                                co.useFloat16 = False  # Use full precision for stability
+                                co.shard = False  # IMPORTANT: Disable sharding which often causes lockups
+                                co.indicesOptions = faiss.INDICES_CPU
+                                
+                                # Attempt multi-GPU initialization with controlled error handling
+                                try:
+                                    info_msg("Attempting multi-GPU index initialization...")
+                                    multi_index = faiss.index_cpu_to_gpu_multiple_py(gpu_resources, cpu_index, co)
+                                    info_msg(f"Successfully initialized multi-GPU FAISS with {multi_index.ntotal} vectors")
+                                    
+                                    # Now try a simple search to verify functionality
+                                    query = np.random.random((1, dim)).astype(np.float32)
+                                    D, I = multi_index.search(query, 1)
+                                    info_msg(f"FAISS multi-GPU search test successful: {D[0][0]:.4f}")
+                                    
+                                    # Success! Multi-GPU FAISS is working properly
+                                    os.environ["FAISS_MULTI_GPU"] = "1"  # Enable multi-GPU mode
+                                    os.environ["FAISS_USE_SHARDING"] = "0"  # Disable sharding by default for stability
+                                except RuntimeError as e:
+                                    # Specific handling for common FAISS runtime errors
+                                    if "out of memory" in str(e).lower():
+                                        warning_msg(f"Multi-GPU initialization failed due to insufficient GPU memory")
+                                    elif "device-side assert" in str(e).lower():
+                                        warning_msg(f"Multi-GPU initialization failed due to CUDA device-side assert")
+                                    else:
+                                        warning_msg(f"Multi-GPU initialization failed with runtime error: {str(e)}")
+                                    
+                                    # Disable multi-GPU mode after failure
+                                    os.environ["FAISS_MULTI_GPU"] = "0"
+                                except Exception as e:
+                                    warning_msg(f"Multi-GPU initialization failed: {str(e)}")
+                                    os.environ["FAISS_MULTI_GPU"] = "0"
+                            else:
+                                # System not suitable for multi-GPU FAISS
+                                if has_small_gpu:
+                                    warning_msg("Some GPUs have insufficient memory for multi-GPU FAISS")
+                                elif not archs_compatible:
+                                    warning_msg("Heterogeneous GPU architectures detected, using single-GPU mode")
+                                else:
+                                    warning_msg(f"Insufficient total GPU memory ({total_gpu_memory:.2f} GB) for multi-GPU FAISS")
+                                
+                                os.environ["FAISS_MULTI_GPU"] = "0"
+                        else:
+                            warning_msg("FAISS installation lacks GpuMultipleClonerOptions, using single-GPU mode")
+                            os.environ["FAISS_MULTI_GPU"] = "0"
+                    else:
+                        # Only single GPU available
+                        if torch.cuda.device_count() <= 1:
+                            info_msg("Only single GPU detected, skipping multi-GPU tests")
+                        else:
+                            info_msg("FAISS does not support multi-GPU operations with this build")
+                        os.environ["FAISS_MULTI_GPU"] = "0"
+                    
                     success_msg("FAISS GPU support successfully verified")
-                    # Keep the resource around to ensure module stays loaded correctly
                     return True
                 except Exception as e:
                     warning_msg(f"FAISS GPU support detected but initialization failed: {str(e)}")
+                    os.environ["FAISS_MULTI_GPU"] = "0"
                     return False
             else:
                 warning_msg("FAISS installed but GPU support not available")
