@@ -22,6 +22,10 @@ from utils.common import success_msg, error_msg, warning_msg, info_msg
 from utils.env_utils import get_env_variable, update_env_file
 from utils.model_config import detect_architecture, get_model_info, get_default_model_path
 
+# Import the function from the new gpu_utils module for backward compatibility
+# This ensures existing code will continue to work when importing from model_utils
+from utils.gpu_utils import detect_gpu_capabilities
+
 # Configure logger
 logger = logging.getLogger(__name__)
 
@@ -336,157 +340,9 @@ def test_model_loading(model_path: str) -> bool:
         logger.error(f"Failed to test model loading: {str(e)}")
         return False 
 
-def detect_gpu_capabilities(force_gpu: bool = False, force_cpu: bool = False) -> dict:
-    """
-    Detect GPU capabilities and return appropriate configurations for LLMs.
-    
-    This function detects if CUDA/GPU is available and returns appropriate
-    configuration settings for model loading.
-    
-    Args:
-        force_gpu: Force GPU usage even if detection fails
-        force_cpu: Force CPU usage even if GPU is available
-        
-    Returns:
-        Dictionary with configuration including:
-        - 'device': 'cuda', 'mps', or 'cpu'
-        - 'n_gpu_layers': Number of layers to offload to GPU
-        - 'use_gpu': Boolean indicating if GPU is available
-        - 'gpu_info': Information about detected GPU
-    """
-    result = {
-        'device': 'cpu',
-        'n_gpu_layers': 0,
-        'use_gpu': False,
-        'gpu_info': 'No GPU detected'
-    }
-    
-    # Handle forced settings
-    if force_cpu:
-        info_msg("Forcing CPU usage as requested")
-        return result
-    
-    try:
-        # Try importing torch to check for CUDA/MPS availability
-        import torch
-        
-        # First check for CUDA (NVIDIA GPUs)
-        if torch.cuda.is_available() or force_gpu:
-            # Get CUDA information
-            if torch.cuda.is_available():
-                gpu_count = torch.cuda.device_count()
-                gpu_name = torch.cuda.get_device_name(0) if gpu_count > 0 else "Unknown NVIDIA GPU"
-                gpu_memory = None
-                
-                try:
-                    # Try to get GPU memory info if available
-                    gpu_properties = torch.cuda.get_device_properties(0)
-                    if hasattr(gpu_properties, 'total_memory'):
-                        gpu_memory = gpu_properties.total_memory / (1024 ** 3)  # Convert to GB
-                except:
-                    pass
-            elif force_gpu:
-                # If forcing GPU but CUDA not available, use placeholder values
-                gpu_count = 1
-                gpu_name = "Forced NVIDIA GPU"
-                gpu_memory = 8  # Assume 8GB
-            
-            # Configure based on GPU capabilities
-            result['device'] = 'cuda'
-            result['use_gpu'] = True
-            result['gpu_info'] = f"{gpu_name} ({gpu_count} available)"
-            
-            # Check if we're using the 70B model
-            try:
-                from utils.model_config import get_model_info
-                model_info = get_model_info()
-                is_large_model = "70b" in model_info["name"].lower()
-            except:
-                is_large_model = True  # Assume large model to be safer
-            
-            # Special case for multiple GPUs
-            if gpu_count > 1:
-                # With multiple GPUs, be more aggressive with layer offloading
-                if is_large_model:
-                    if gpu_count >= 4:
-                        # With 4+ GPUs, we can offload more layers for large models
-                        result['n_gpu_layers'] = 64
-                    else:
-                        # With 2-3 GPUs, be more conservative for 70B model
-                        result['n_gpu_layers'] = 32
-                else:
-                    # For smaller models, we can use more layers with fewer GPUs
-                    result['n_gpu_layers'] = 100  # All layers
-            # Single GPU case
-            elif gpu_memory is not None:
-                # Decide based on GPU memory and model size
-                if is_large_model:
-                    # More conservative for large models
-                    if gpu_memory < 8:
-                        result['n_gpu_layers'] = 1   # Very limited
-                    elif gpu_memory < 16:
-                        result['n_gpu_layers'] = 8   # Limited
-                    elif gpu_memory < 24:
-                        result['n_gpu_layers'] = 16  # Moderate
-                    elif gpu_memory < 32:
-                        result['n_gpu_layers'] = 24  # Good
-                    else:
-                        result['n_gpu_layers'] = 32  # Very good
-                else:
-                    # More aggressive for smaller models
-                    if gpu_memory < 4:
-                        result['n_gpu_layers'] = 1
-                    elif gpu_memory < 8:
-                        result['n_gpu_layers'] = 8
-                    elif gpu_memory < 12:
-                        result['n_gpu_layers'] = 16
-                    elif gpu_memory < 24:
-                        result['n_gpu_layers'] = 32
-                    else:
-                        result['n_gpu_layers'] = 100  # All layers
-            elif force_gpu:
-                # If forcing GPU but don't know memory, use conservative defaults
-                result['n_gpu_layers'] = is_large_model and 16 or 32
-            else:
-                # Conservative default for unknown memory
-                result['n_gpu_layers'] = is_large_model and 8 or 16
-            
-            info_msg(f"🔥 NVIDIA GPU detected: {result['gpu_info']}")
-            info_msg(f"Will use CUDA with {result['n_gpu_layers']} GPU layers")
-            if is_large_model:
-                info_msg("Using conservative GPU settings for 70B model")
-            return result
-            
-        # Next check for Metal Performance Shaders (Apple Silicon)
-        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            result['device'] = 'mps'
-            result['use_gpu'] = True
-            result['n_gpu_layers'] = 1  # Start conservative with Apple Silicon
-            result['gpu_info'] = "Apple Silicon GPU (MPS)"
-            
-            # Determine device by platform
-            import platform
-            mac_model = platform.machine()
-            if mac_model == "arm64":
-                # This is Apple Silicon
-                if "M1" in platform.processor():
-                    result['gpu_info'] = "Apple M1"
-                    result['n_gpu_layers'] = 4  # Conservative for M1
-                elif "M2" in platform.processor():
-                    result['gpu_info'] = "Apple M2"
-                    result['n_gpu_layers'] = 8  # Better for M2
-                elif "M3" in platform.processor():
-                    result['gpu_info'] = "Apple M3"
-                    result['n_gpu_layers'] = 12  # More aggressive for M3
-            
-            info_msg(f"🔥 Apple Silicon GPU detected: {result['gpu_info']}")
-            info_msg(f"Will use Metal with {result['n_gpu_layers']} GPU layers")
-            return result
-    
-    except ImportError:
-        warning_msg("PyTorch not available, defaulting to CPU")
-    except Exception as e:
-        warning_msg(f"Error detecting GPU capabilities: {str(e)}")
-    
-    info_msg("Using CPU for inference (no GPU acceleration)")
-    return result 
+# The following is a compatibility layer for backward compatibility
+# but the actual implementation is now in gpu_utils.py
+# DO NOT modify this function - it's just a wrapper over the gpu_utils implementation
+def _detect_gpu_capabilities_compat(*args, **kwargs):
+    """Compatibility function that forwards to gpu_utils.detect_gpu_capabilities"""
+    return detect_gpu_capabilities(*args, **kwargs) 

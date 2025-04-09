@@ -37,6 +37,15 @@ from utils import (
     set_token_interactive, test_model_loading, check_model_file
 )
 
+# Import GPU utilities
+from utils.gpu_utils import (
+    detect_gpu, detect_gpu_capabilities, get_gpu_info,
+    configure_gpu_environment, install_faiss_gpu,
+    get_optimal_gpu_configuration, parse_gpu_ids,
+    is_distributed_available, get_gpu_memory_limit,
+    run_gpu_benchmark
+)
+
 # Import specialized modules
 from utils.model_config import download_model, DEFAULT_MODEL_NAME, MODEL_REPOS, get_model_info, get_available_models, set_default_model
 from utils.file_utils import (
@@ -44,7 +53,6 @@ from utils.file_utils import (
     check_dependencies
 )
 from utils.env_utils import get_env_variable, update_env_file
-from utils.model_utils import detect_gpu_capabilities
 from utils.diagram_utils import (
     find_diagrams, start_server_and_open_diagrams, view_diagrams
 )
@@ -547,72 +555,33 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
         # Set environment variables
         os.environ["OUTPUT_DIR"] = output_dir
         
-        # Determine optimal GPU configuration
-        selected_gpu_ids = None
-        use_distributed = distributed  # Start with user preference
+        # Configure GPU environment using the centralized utility
+        force_gpu = device == 'cuda'
+        force_cpu = device == 'cpu'
         
-        # Force GPU usage when available (unless explicitly set to CPU)
-        if device != 'cpu':
-            # Check if GPU is available
-            try:
-                if torch.cuda.is_available():
-                    # For CUDA operations, force GPU
-                    os.environ["FORCE_GPU"] = "true"
-                    if "FORCE_CPU" in os.environ:
-                        del os.environ["FORCE_CPU"]
-                    
-                    # Get number of available GPUs
-                    gpu_count = torch.cuda.device_count()
-                    
-                    # For multi-GPU setups, automatically enable distributed mode 
-                    # unless user specifically provided a single GPU ID
-                    if gpu_count > 1:
-                        # Auto-determine if distributed should be enabled
-                        if gpu_id is None:  # If no specific GPU was requested
-                            use_distributed = True  # Enable by default for multiple GPUs
-                            selected_gpu_ids = list(range(gpu_count))
-                            info_msg(f"Multi-GPU setup detected: automatically using all {gpu_count} GPUs with distributed processing")
-                            os.environ["DISTRIBUTED"] = "true"
-                            os.environ["GPU_IDS"] = ",".join(str(id) for id in selected_gpu_ids)
-                        else:
-                            # User specified a specific GPU, use only that one
-                            if gpu_id < gpu_count:
-                                selected_gpu_ids = [gpu_id]
-                                info_msg(f"Using specific GPU {gpu_id} as requested (out of {gpu_count} available)")
-                                os.environ["GPU_IDS"] = str(gpu_id)
-                            else:
-                                warning_msg(f"GPU {gpu_id} not available (only {gpu_count} GPUs detected)")
-                                warning_msg(f"Using default GPU 0 instead")
-                                selected_gpu_ids = [0]
-                                os.environ["GPU_IDS"] = "0"
-                    else:
-                        # Single GPU setup
-                        info_msg(f"Single GPU detected: using GPU 0")
-                        selected_gpu_ids = [0]
-                        os.environ["GPU_IDS"] = "0"
-                    
-                    # Set memory limit if provided
-                    if memory_limit:
-                        os.environ["GPU_MEMORY_LIMIT"] = str(memory_limit)
-                        info_msg(f"GPU memory limit set to {memory_limit} GB")
-                    
-                    success_msg("GPU acceleration enabled for analysis")
-                else:
-                    warning_msg("No GPU detected, falling back to CPU")
-                    os.environ["FORCE_CPU"] = "true"
-                    if "FORCE_GPU" in os.environ:
-                        del os.environ["FORCE_GPU"]
-            except ImportError:
-                warning_msg("PyTorch not installed, cannot detect GPU. Falling back to CPU")
-                os.environ["FORCE_CPU"] = "true"
-                if "FORCE_GPU" in os.environ:
-                    del os.environ["FORCE_GPU"]
+        # Parse gpu_ids if a single gpu_id is provided
+        selected_gpu_ids = None
+        if gpu_id is not None:
+            selected_gpu_ids = [gpu_id]
+        
+        # Configure the GPU environment with our new utility
+        gpu_config = configure_gpu_environment(
+            force_gpu=force_gpu,
+            force_cpu=force_cpu,
+            gpu_ids=selected_gpu_ids,
+            memory_limit=memory_limit,
+            distributed=distributed
+        )
+        
+        # Log the configuration that was applied
+        if gpu_config['device'] == 'cpu':
+            info_msg("Using CPU for analysis (no GPU acceleration)")
         else:
-            # Explicitly requested CPU mode
-            info_msg("Using CPU as requested")
-            os.environ["FORCE_CPU"] = "true"
-            if "FORCE_GPU" in os.environ:
-                del os.environ["FORCE_GPU"]
+            success_msg(f"GPU acceleration enabled: using {len(gpu_config['selected_gpus'])} GPU(s)")
+            if gpu_config['distributed']:
+                success_msg(f"Multi-GPU distributed processing enabled for GPUs: {gpu_config['selected_gpus']}")
+            if gpu_config['memory_limit']:
+                info_msg(f"GPU memory limit set to {gpu_config['memory_limit']} GB per GPU")
         
         # Ensure model exists
         model_path = validate_model_path(model_path)
@@ -659,11 +628,11 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
             info_msg("Initializing LLM processor...")
             processor = LLMProcessor(
                 model_path_or_embedding_store=model_path,
-                distributed=use_distributed,
+                distributed=gpu_config['distributed'],
                 gpu_id=gpu_id,
-                gpu_ids=selected_gpu_ids,
-                memory_limit=memory_limit,
-                device=device if device != 'auto' else None
+                gpu_ids=gpu_config['selected_gpus'],
+                memory_limit=gpu_config['memory_limit'],
+                device=gpu_config['device']
             )
             progress.update(1)
             
@@ -1264,7 +1233,8 @@ def configure_gpu(force_gpu: bool, force_cpu: bool, gpu_ids: str, memory_limit: 
     The --memory-limit option helps when sharing GPU resources with other applications.
     """
     try:
-        from utils.model_utils import detect_gpu_capabilities
+        # Use the function from gpu_utils instead of model_utils
+        from utils.gpu_utils import detect_gpu_capabilities
         
         # Can't force both CPU and GPU
         if force_gpu and force_cpu:

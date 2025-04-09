@@ -25,6 +25,15 @@ from utils.diagram_utils import (
     find_diagrams, start_server_and_open_diagrams, view_diagrams
 )
 
+# Import GPU utilities
+from utils.gpu_utils import (
+    detect_gpu, detect_gpu_capabilities, get_gpu_info, 
+    configure_gpu_environment, install_faiss_gpu, 
+    get_optimal_gpu_configuration, parse_gpu_ids,
+    is_distributed_available, get_gpu_memory_limit,
+    run_gpu_benchmark
+)
+
 __all__ = [
     # Common utils
     'success_msg',
@@ -63,4 +72,11 @@ __all__ = [
     'update_env_file',
     'load_dotenv',
     'get_all_env_vars',
+    
+    # GPU utilities
+    'detect_gpu', 'detect_gpu_capabilities', 'get_gpu_info',
+    'configure_gpu_environment', 'install_faiss_gpu',
+    'get_optimal_gpu_configuration', 'parse_gpu_ids',
+    'is_distributed_available', 'get_gpu_memory_limit',
+    'run_gpu_benchmark'
 ] 
