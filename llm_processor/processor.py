@@ -155,9 +155,15 @@ class LLMProcessor:
                 
                 # Special handling for -1 value (all layers)
                 if n_gpu_layers == -1:
-                    # Your model has 80 layers total, using 90% of them = 72 layers
-                    n_gpu_layers = 72  # 90% of the 80 layers in CodeLlama-70B model
-                    info_msg(f"Using {n_gpu_layers} GPU layers (90% of model's 80 layers)")
+                    # For multi-GPU setups, use more aggressive settings
+                    if self.gpu_ids and len(self.gpu_ids) > 1:
+                        # Force maximum layer usage with multiple GPUs
+                        n_gpu_layers = 80  # Use all 80 layers of the CodeLlama-70B model
+                        info_msg(f"Multi-GPU setup: Using all {n_gpu_layers} layers across {len(self.gpu_ids)} GPUs")
+                    else:
+                        # Default for single GPU
+                        n_gpu_layers = 72  # 90% of the 80 layers in CodeLlama-70B model
+                        info_msg(f"Using {n_gpu_layers} GPU layers (90% of model's 80 layers)")
                 
                 # Set a memory limit based on detected GPUs if not manually specified
                 memory_limit_mb = None
@@ -166,19 +172,20 @@ class LLMProcessor:
                     memory_limit_mb = int(self.memory_limit * 1024)
                     info_msg(f"Using user-specified memory limit: {self.memory_limit:.2f} GB ({memory_limit_mb} MiB)")
                 elif n_gpu_layers > 0 and gpu_config['use_gpu']:
-                    # For RTX A5000 GPUs (24GB), use 90% of memory to leave headroom
+                    # For RTX A5000 GPUs (24GB), use 95% of memory to maximize usage
                     rtx_a5000_memory = 24564  # MiB from nvidia-smi output
-                    memory_limit_mb = int(rtx_a5000_memory * 0.9)  # Use 90% of available memory
-                    info_msg(f"Setting memory limit to 90% of RTX A5000 memory: {memory_limit_mb} MiB")
+                    memory_limit_mb = int(rtx_a5000_memory * 0.95)  # Use 95% of available memory
+                    info_msg(f"Setting memory limit to 95% of RTX A5000 memory: {memory_limit_mb} MiB")
                     
                     # If specific GPU IDs are set, adjust memory limit based on GPU count
                     if self.gpu_ids and len(self.gpu_ids) > 1:
+                        # For multi-GPU, use higher per-GPU memory to better utilize resources
                         # When using multiple GPUs, memory is divided across them
                         memory_limit_mb = int(memory_limit_mb / len(self.gpu_ids))
                         info_msg(f"Adjusted per-GPU memory limit for {len(self.gpu_ids)} GPUs: {memory_limit_mb} MiB each")
                 
                 temperature = float(get_env_variable("LLM_TEMPERATURE", "0.7"))
-                max_tokens = int(get_env_variable("LLM_MAX_TOKENS", "41024"))
+                max_tokens = int(get_env_variable("LLM_MAX_TOKENS", "4096"))
                 top_p = float(get_env_variable("LLM_TOP_P", "0.95"))
                 
                 # Detect architecture (x86 vs ARM)
@@ -2451,21 +2458,32 @@ Pay special attention to:
             # Log that we're activating GPUs for processing
             info_msg(f"Activating {gpu_count} GPUs for text embedding and processing")
             
-            # Simple warm-up operations to ensure GPU is active
-            # This ensures the GPU context is created and maintained
-            device = torch.device("cuda")
-            
-            # Create a small tensor on GPU and perform operations
-            # This ensures CUDA context is initialized
-            dummy_tensor = torch.zeros(100, 768, device=device)
-            _ = torch.nn.functional.normalize(dummy_tensor, p=2, dim=1)
-            
-            # Verify GPU usage and report
+            # Create more substantial tensors on all available GPUs to ensure they're utilized
             for i in range(gpu_count):
-                mem_info = torch.cuda.memory_reserved(i) / 1024**2
-                if mem_info > 0:
-                    info_msg(f"GPU {i} activated with {mem_info:.2f} MB reserved")
-                    
+                device = torch.device(f"cuda:{i}")
+                # Create a larger dummy tensor on each GPU and perform operations
+                # This helps activate the GPU more aggressively
+                dummy_tensor = torch.zeros(2000, 2000, device=device)
+                _ = torch.nn.functional.normalize(dummy_tensor, p=2, dim=1)
+                
+                # Second operation to ensure the GPU is fully engaged
+                _ = torch.matmul(dummy_tensor, dummy_tensor.t())
+                
+                # Force sync on this specific GPU
+                torch.cuda.synchronize(device)
+                
+                # Log allocation
+                mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
+                mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
+                info_msg(f"GPU {i} activated with {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved")
+            
+            # Additional operations on GPU 0 to ensure layers are loaded
+            device = torch.device("cuda:0")
+            
+            # Create another substantial tensor
+            large_tensor = torch.rand(4000, 4000, device=device)
+            _ = torch.nn.functional.relu(large_tensor)
+            
             # Force sync to ensure GPU operations complete
             torch.cuda.synchronize()
             
