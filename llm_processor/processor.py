@@ -104,7 +104,7 @@ class LLMProcessor:
         
         # Set a default max_context_size to prevent errors
         self.max_context_size = 2048
-        self.max_tokens_out = 1024
+        self.max_tokens_out = 41024
         
         # Handle model path or embedding store
         if isinstance(model_path_or_embedding_store, str):
@@ -155,11 +155,30 @@ class LLMProcessor:
                 
                 # Special handling for -1 value (all layers)
                 if n_gpu_layers == -1:
-                    n_gpu_layers = 100  # LlamaCpp needs a high number to use all layers
-                    info_msg("Using all available GPU layers")
+                    # Your model has 80 layers total, using 90% of them = 72 layers
+                    n_gpu_layers = 72  # 90% of the 80 layers in CodeLlama-70B model
+                    info_msg(f"Using {n_gpu_layers} GPU layers (90% of model's 80 layers)")
+                
+                # Set a memory limit based on detected GPUs if not manually specified
+                memory_limit_mb = None
+                if self.memory_limit:
+                    # Use the user-specified memory limit
+                    memory_limit_mb = int(self.memory_limit * 1024)
+                    info_msg(f"Using user-specified memory limit: {self.memory_limit:.2f} GB ({memory_limit_mb} MiB)")
+                elif n_gpu_layers > 0 and gpu_config['use_gpu']:
+                    # For RTX A5000 GPUs (24GB), use 90% of memory to leave headroom
+                    rtx_a5000_memory = 24564  # MiB from nvidia-smi output
+                    memory_limit_mb = int(rtx_a5000_memory * 0.9)  # Use 90% of available memory
+                    info_msg(f"Setting memory limit to 90% of RTX A5000 memory: {memory_limit_mb} MiB")
+                    
+                    # If specific GPU IDs are set, adjust memory limit based on GPU count
+                    if self.gpu_ids and len(self.gpu_ids) > 1:
+                        # When using multiple GPUs, memory is divided across them
+                        memory_limit_mb = int(memory_limit_mb / len(self.gpu_ids))
+                        info_msg(f"Adjusted per-GPU memory limit for {len(self.gpu_ids)} GPUs: {memory_limit_mb} MiB each")
                 
                 temperature = float(get_env_variable("LLM_TEMPERATURE", "0.7"))
-                max_tokens = int(get_env_variable("LLM_MAX_TOKENS", "1024"))
+                max_tokens = int(get_env_variable("LLM_MAX_TOKENS", "41024"))
                 top_p = float(get_env_variable("LLM_TOP_P", "0.95"))
                 
                 # Detect architecture (x86 vs ARM)
@@ -228,7 +247,8 @@ class LLMProcessor:
                     streaming=False,  # Disable streaming for now as it can cause issues
                     seed=42,  # Set a fixed seed for reproducibility
                     use_mlock=True,  # Use mlock to keep the model in memory
-                    n_threads=int(os.cpu_count() * 0.75) if os.cpu_count() else 4  # Use 75% of available CPU cores
+                    n_threads=int(os.cpu_count() * 0.75) if os.cpu_count() else 4,  # Use 75% of available CPU cores
+                    **({"gpu_vram_limited": memory_limit_mb} if memory_limit_mb else {})  # Add memory limit if set
                 )
                 
                 success_msg("Successfully loaded model using LlamaCpp")
