@@ -638,11 +638,7 @@ def analyze(repository_url: str, output_dir: str, model_path: str, local: bool, 
             
             # Analyze repository
             info_msg(f"Analyzing repository: {repository_url}")
-            analysis_results = analyzer.analyze_repository(
-                repository_url, 
-                local=local, 
-                output_dir=output_dir
-            )
+            analysis_results = analyzer.analyze_repository(repository_url)
             progress.update(1)
             
             # Generate threat model

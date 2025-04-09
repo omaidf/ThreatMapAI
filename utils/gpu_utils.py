@@ -11,12 +11,34 @@ import logging
 import subprocess
 import platform
 import importlib
+import importlib.util
 from typing import Tuple, List, Dict, Optional, Union, Any
 from pathlib import Path
 
 # Import internal utilities
 from utils.common import success_msg, error_msg, warning_msg, info_msg
 from utils.env_utils import get_env_variable, update_env_file
+
+# Try to import torch and related libraries at module level
+# These are handled gracefully when not available
+try:
+    import torch
+    import torch.cuda
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+try:
+    import faiss
+    HAS_FAISS = True
+except ImportError:
+    HAS_FAISS = False
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -29,8 +51,6 @@ def detect_gpu() -> Tuple[bool, Optional[float]]:
         Tuple of (is_gpu_available, gpu_memory_gb)
     """
     try:
-        import torch
-        
         if torch.cuda.is_available():
             gpu_count = torch.cuda.device_count()
             if gpu_count > 0:
@@ -61,8 +81,6 @@ def get_gpu_info() -> Dict[str, Any]:
     }
     
     try:
-        import torch
-        
         if torch.cuda.is_available():
             result['has_gpu'] = True
             result['gpu_count'] = torch.cuda.device_count()
@@ -154,9 +172,6 @@ def detect_gpu_capabilities(force_gpu: bool = False, force_cpu: bool = False) ->
     
     try:
         # Try importing torch to check for CUDA/MPS availability
-        import torch
-        
-        # First check for CUDA (NVIDIA GPUs)
         if torch.cuda.is_available() or force_gpu:
             # Get CUDA information
             if torch.cuda.is_available():
@@ -251,7 +266,6 @@ def detect_gpu_capabilities(force_gpu: bool = False, force_cpu: bool = False) ->
             result['gpu_info'] = "Apple Silicon GPU (MPS)"
             
             # Determine device by platform
-            import platform
             mac_model = platform.machine()
             if mac_model == "arm64":
                 # This is Apple Silicon
@@ -285,31 +299,19 @@ def install_faiss_gpu() -> bool:
         True if installation was successful, False otherwise
     """
     try:
-        import faiss
-        
-        # First check if faiss is already installed with GPU support
-        try:
-            if hasattr(faiss, 'StandardGpuResources'):
-                # GPU support already available
-                info_msg("FAISS with GPU support is already installed")
-                return True
-        except ImportError:
-            # FAISS not installed at all
-            pass
+        if hasattr(faiss, 'StandardGpuResources'):
+            # GPU support already available
+            info_msg("FAISS with GPU support is already installed")
+            return True
         
         # Check CUDA version to determine which package to install
         cuda_version = None
-        try:
-            import torch
-            if torch.cuda.is_available():
-                cuda_version = torch.version.cuda
-                info_msg(f"Detected CUDA version: {cuda_version}")
-            else:
-                warning_msg("No CUDA available, cannot install FAISS-GPU")
-                return False
-        except ImportError:
-            warning_msg("PyTorch not installed, cannot detect CUDA version")
-            warning_msg("Installing default FAISS-GPU package")
+        if torch.cuda.is_available():
+            cuda_version = torch.version.cuda
+            info_msg(f"Detected CUDA version: {cuda_version}")
+        else:
+            warning_msg("No CUDA available, cannot install FAISS-GPU")
+            return False
         
         # Select appropriate package based on CUDA version
         if cuda_version:
@@ -412,8 +414,6 @@ def configure_gpu_environment(force_gpu: bool = False,
             return result
         
         # Now handle GPU configuration
-        import torch
-        
         if torch.cuda.is_available() or force_gpu:
             result['gpu_count'] = torch.cuda.device_count() if torch.cuda.is_available() else 1
             
@@ -500,8 +500,6 @@ def get_optimal_gpu_configuration() -> Dict[str, Any]:
     }
     
     try:
-        import torch
-        
         if torch.cuda.is_available():
             gpu_count = torch.cuda.device_count()
             result['device'] = 'cuda'
@@ -600,8 +598,6 @@ def run_gpu_benchmark(gpu_id: int = 0) -> Dict[str, Any]:
     }
     
     try:
-        import torch
-        
         if not torch.cuda.is_available():
             result['error'] = "CUDA not available"
             return result
@@ -769,8 +765,6 @@ def is_distributed_available() -> bool:
         
     # Check GPU availability
     try:
-        import torch
-        
         if not torch.cuda.is_available():
             return False
             
