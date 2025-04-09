@@ -1143,7 +1143,7 @@ class RepositoryAnalyzer:
                     skipped_test_files += 1
                     continue
                     
-                if self.embedding_store and not is_large_repo:
+                if self.embedding_store:
                     try:
                         # Check if this file is already in the embedding store to avoid re-indexing
                         # when reusing embeddings
@@ -1258,7 +1258,7 @@ class RepositoryAnalyzer:
                 gc.collect()
             
             # Build file relationship graph
-            if self.embedding_store and not is_large_repo:
+            if self.embedding_store:
                 try:
                     relationships = self.embedding_store.get_file_relationships()
                     results["file_relationships"] = relationships
