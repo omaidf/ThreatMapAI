@@ -1,75 +1,116 @@
-# AI Threat Model Map Generator
+# ThreatMapAI
 
-**Version: 1.2.0**
+<div align="center">
+  <img src="https://raw.githubusercontent.com/omaid/ThreatMapAI/main/visualizer/templates/logo.png" alt="ThreatMapAI Logo" width="200"/>
+  <h3>AI-Powered Security Threat Modeling and Visualization</h3>
+  <p><em>Automatically analyze codebases to generate comprehensive threat models with attack vectors, data flow diagrams, and security recommendations.</em></p>
+</div>
 
-Automatically analyze code repositories to generate comprehensive threat models with attack vectors, data flow diagrams, and security recommendations.
+![Version](https://img.shields.io/badge/version-1.2.0-blue)
+![Python](https://img.shields.io/badge/python-3.8%2B-green)
+![License](https://img.shields.io/badge/license-MIT-orange)
 
-### Updated Features (v1.2.0)
+## Table of Contents
 
-* **Latest Dependency Updates**: Using LangChain 0.2.x series with simplified API
-* **Improved Language Parsing**: Integrated with tree-sitter-languages for better code analysis
-* **Enhanced Performance**: Updated to use the newest versions of all dependencies
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Output Files](#output-files)
+- [Advanced Configuration](#advanced-configuration)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
 
-### Key Features
+## Overview
 
-- **Code Repository Analysis**: Analyze repositories from GitHub URLs or local paths
-- **Language Support**: Python, JavaScript, TypeScript, Java, Go, PHP
-- **RAG-Based Analysis**: Unlimited repository size analysis through retrieval augmented generation
-- **Security Boundary Detection**: Identifies security domains and boundaries 
-- **Dynamic RAG Exploration**: Performs targeted queries to understand security-critical components
-- **Cross-Boundary Data Flows**: Identifies and analyzes data flows crossing security boundaries
-- **Mermaid Diagrams**: Generates class structure, data flow, and threat relationship diagrams
-- **Detailed HTML Reports**: Comprehensive security findings in an organized HTML report
+ThreatMapAI is an advanced tool that leverages large language models (LLMs) to automatically analyze code repositories and generate comprehensive security threat models. Using a combination of static code analysis, Retrieval Augmented Generation (RAG), and graph-based visualization, it identifies potential security vulnerabilities, maps data flows across security boundaries, and provides detailed security recommendations.
 
-### Requirements
+The tool is designed to be language-agnostic and can analyze repositories of any size through efficient embedding-based RAG techniques.
 
-- Python 3.8+ 
+## Architecture
+
+```mermaid
+graph TD
+    A[Repository Source] --> B[Repository Analyzer]
+    B --> C[Code Structure Analysis]
+    B --> D[Data Flow Mapping]
+    B --> E[Security Boundary Detection]
+    
+    C --> F[Embedding Store]
+    D --> F
+    E --> F
+    
+    F --> G[LLM Processor]
+    G --> H[Code Analysis]
+    G --> I[Threat Detection]
+    G --> J[Security Recommendations]
+    
+    H --> K[Threat Model]
+    I --> K
+    J --> K
+    
+    K --> L[Visualizer]
+    L --> M[Class Diagrams]
+    L --> N[Data Flow Diagrams]
+    L --> O[Threat Relationship Diagrams]
+    L --> P[HTML Security Report]
+```
+
+## Features
+
+### Core Capabilities
+- **Unlimited Repository Size Analysis**: Process repositories of any size through efficient embedding-based RAG techniques
+- **Multi-Language Support**: Python, JavaScript, TypeScript, Java, Go, PHP, and more
+- **Security Boundary Detection**: Automatically identifies security domains and trust boundaries
+- **Cross-Boundary Data Flow Analysis**: Identifies and analyzes data flows crossing security boundaries
+- **AI-Powered Vulnerability Detection**: Uses LLMs to identify potential security vulnerabilities
+
+### Analysis Components
+- **Static Code Analysis**: Parses and analyzes code structure, dependencies, and patterns
+- **Data Flow Mapping**: Traces how data moves through the application
+- **Security Control Detection**: Identifies existing security controls and gaps
+- **Vulnerability Prioritization**: Ranks vulnerabilities by severity and impact
+
+### Visualization & Reporting
+- **Interactive Mermaid Diagrams**: Generates class structure, data flow, and threat relationship diagrams
+- **Comprehensive HTML Reports**: Detailed security findings with recommendations
+- **Exportable Results**: All analysis results available in structured JSON format
+
+## Requirements
+
+- Python 3.8+
 - 16GB+ RAM recommended for larger repositories
 - 10GB disk space (for model storage)
 - GraphViz (for diagram generation)
+- GPU support (optional but recommended for larger codebases)
 
-### Installation
+## Installation
 
-#### Quick Install (Recommended)
+### Quick Install (Recommended)
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/AIThreatMap.git
-cd AIThreatMap
+git clone https://github.com/omaid/ThreatMapAI.git
+cd ThreatMapAI
 
 # Run the installer (automatically sets up a virtual environment)
-chmod +x install.sh
-./install.sh
+chmod +x setup.sh
+./setup.sh
 ```
 
-This will automatically:
+This will:
 1. Create a virtual environment in the `venv` directory
 2. Install all dependencies within the virtual environment
 3. Download the required model files
 4. Set up the configuration
 
-#### Hugging Face Authentication
-
-The CodeLlama models sometimes require authentication with a Hugging Face token:
-
-1. Create a free account at [Hugging Face](https://huggingface.co/join)
-2. Generate a token at [https://huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
-3. Set your token using one of these methods:
-   ```bash
-   # Option 1: Set in your environment
-   export HF_TOKEN=your_token_here
-   
-   # Option 2: Use the CLI tool to save it permanently
-   python -m cli set_token
-   ```
-
-The installation and download scripts will automatically detect authentication failures and prompt you to provide a token when needed.
-
-#### Manual Installation
+### Manual Installation
 
 If you prefer to set up manually:
 
-1. Create and activate a virtual environment (required with newer Python versions):
+1. Create and activate a virtual environment:
 
 ```bash
 # Create a virtual environment
@@ -86,32 +127,30 @@ source venv/bin/activate
 
 ```bash
 pip install -r requirements.txt
-pip install tree-sitter-languages  # Ensure tree-sitter-languages is installed
 ```
 
-2. Download the CodeLlama model:
+3. Initialize the environment and download required models:
 
 ```bash
-# Create model directory
-mkdir -p models
-
-# For ARM/Apple Silicon with HF token
-curl -L -H "Authorization: Bearer $HF_TOKEN" https://huggingface.co/TheBloke/CodeLlama-2-7b-Instruct-GGUF/resolve/main/codellama-2-7b-instruct.Q4_0.gguf -o models/codellama-2-7b-instruct.Q4_0.gguf
-
-# For x86 architectures with HF token
-curl -L -H "Authorization: Bearer $HF_TOKEN" https://huggingface.co/TheBloke/CodeLlama-2-7b-Instruct-GGUF/resolve/main/codellama-2-7b-instruct.Q4_K_M.gguf -o models/codellama-2-7b-instruct.Q4_K_M.gguf
+python -m cli init
 ```
 
-3. Create the necessary directories:
+### Hugging Face Authentication
 
-```bash
-mkdir -p output
-mkdir -p visualizer/templates
-```
+Some models require authentication with a Hugging Face token:
 
-### Usage
+1. Create a free account at [Hugging Face](https://huggingface.co/join)
+2. Generate a token at [https://huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
+3. Set your token:
+   ```bash
+   python -m cli set_token
+   ```
 
-#### CLI
+## Usage
+
+### CLI Interface
+
+The primary way to interact with ThreatMapAI is through its command-line interface:
 
 ```bash
 # Initialize environment and download required models
@@ -130,7 +169,20 @@ python -m cli visualize --output-dir output
 python -m cli view
 ```
 
-#### API
+### API Interface
+
+ThreatMapAI can also be used as an API service:
+
+```bash
+# Start the API server
+python main.py
+```
+
+The API server provides endpoints for:
+- POST `/analyze` - Analyze a repository
+- GET `/health` - Health check
+
+### Python Library Usage
 
 ```python
 from repository_analyzer.analyzer import RepositoryAnalyzer
@@ -152,32 +204,9 @@ analysis_results = analyzer.analyze_code()
 threat_model = llm_processor.generate_threat_model(analysis_results)
 
 # Generate visualizations and report
-diagrams = visualizer.generate_visualizations_from_dir("output")
 report_path = visualizer.generate_report(threat_model)
-
 print(f"Report generated at: {report_path}")
-print(f"Diagrams generated at: {', '.join(diagrams.values())}")
 ```
-
-### Viewing Diagrams
-
-The tool generates Mermaid diagrams in the output directory:
-
-1. **Using Mermaid Live Editor**:
-   - Copy diagram content from .mmd files
-   - Paste into [Mermaid Live Editor](https://mermaid.live/)
-
-2. **Using GitHub**:
-   - GitHub natively supports Mermaid in Markdown files
-   - Create a Markdown file with content like:
-     ```
-     ```mermaid
-     (content of your .mmd file)
-     ```
-     ```
-
-3. **Using VS Code**:
-   - Install [Mermaid Preview Extension](https://marketplace.visualstudio.com/items?itemName=bierner.markdown-mermaid)
 
 ## Output Files
 
@@ -189,6 +218,64 @@ All output is saved to the `output` directory (configurable):
 - `flow_diagram.mmd`: Data flow diagram
 - `threat_diagram.mmd`: Threat relationship diagram
 - `threat_analysis_report.html`: Comprehensive HTML report
+
+### Viewing Diagrams
+
+There are several ways to view the generated Mermaid diagrams:
+
+1. **Using the built-in viewer**:
+   ```bash
+   python -m cli view
+   ```
+
+2. **Using Mermaid Live Editor**:
+   - Copy diagram content from .mmd files
+   - Paste into [Mermaid Live Editor](https://mermaid.live/)
+
+3. **Using GitHub**:
+   - GitHub natively supports Mermaid in Markdown files
+
+4. **Using VS Code**:
+   - Install [Mermaid Preview Extension](https://marketplace.visualstudio.com/items?itemName=bierner.markdown-mermaid)
+
+## Advanced Configuration
+
+### GPU Configuration
+
+ThreatMapAI can utilize GPU acceleration for faster processing:
+
+```bash
+# Configure GPU settings
+python -m cli configure_gpu
+
+# Check GPU information
+python -m cli gpu_info --detailed
+
+# Run benchmark
+python -m cli gpu_info --benchmark
+```
+
+### Model Selection
+
+You can select different models for analysis:
+
+```bash
+# List available models
+python -m cli select_model --list
+
+# Select a specific model
+python -m cli select_model CodeLlama-2-7b-Instruct --variant Q4_0 --download
+```
+
+### Environment Variables
+
+Create a `.env` file to configure:
+
+```
+MODEL_PATH=/path/to/model
+OUTPUT_DIR=output
+HF_TOKEN=your_huggingface_token
+```
 
 ## Troubleshooting
 
@@ -203,107 +290,24 @@ All output is saved to the `output` directory (configurable):
    - Install tree-sitter-languages package explicitly: `pip install tree-sitter-languages`
    - Make sure you have a C compiler installed on your system
 
-3. **llama-cpp-python installation fails**:
-   - Ensure you have a C++ compiler installed
-   - On macOS: Install Xcode Command Line Tools
-   - On Ubuntu/Debian: `sudo apt-get install build-essential`
-   - Try: `CMAKE_ARGS="-DLLAMA_METAL=on" pip install llama-cpp-python` (on macOS)
-
-4. **Model download fails**:
+3. **Model download fails**:
    - Hugging Face may require authentication - use `python -m cli set_token` to set up your token
-   - Get a free Hugging Face token at [https://huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
-   - You can also download models manually from [Hugging Face](https://huggingface.co/TheBloke)
-   - Check network connection and proxy settings
    - Ensure enough disk space (10GB+ free)
 
 ### Runtime Issues
 
 1. **Out of memory**:
-   - The tool uses a RAG approach to efficiently analyze large repositories
+   - Use RAG approach: `python -m cli analyze https://github.com/username/repo --memory-limit 4.0`
    - Close other memory-intensive applications
    - Ensure you have at least 16GB of RAM for large codebases
 
-### Model Loading Issues
+2. **GPU issues**:
+   - Force CPU mode if GPU is causing problems: `python -m cli analyze URL --force-cpu`
+   - Check GPU support: `python -m cli gpu_info`
 
-If you encounter the following error:
-```
-Failed to initialize embedding model: name 'init_empty_weights' is not defined
-```
-
-This is caused by a compatibility issue with newer versions of the transformers library. You can fix it by:
-
-1. Making sure you have the correct transformers version by running:
-   ```
-   pip install 'transformers>=4.36.0,<4.52.0'
-   ```
-   
-2. If you still encounter issues, try installing an older version of transformers:
-   ```
-   pip install transformers==4.35.0
-   ```
-
-### Bitsandbytes and Quantization Issues
-
-If you see errors related to bitsandbytes or quantization such as:
-```
-'NoneType' object has no attribute 'cadam32bit_grad_fp32'
-The installed version of bitsandbytes was compiled without GPU support
-```
-
-You can resolve these by:
-
-1. Disabling quantization by adding the following to your `.env` file:
-   ```
-   LLM_USE_QUANTIZATION=false
-   ```
-
-2. Trying to upgrade bitsandbytes to the latest version:
-   ```
-   pip install -U bitsandbytes
-   ```
-
-3. If you still have issues, you may need to compile bitsandbytes for your specific system:
-   ```
-   pip uninstall bitsandbytes -y
-   pip install bitsandbytes --no-binary bitsandbytes
-   ```
-
-## License
-
-MIT
-
-## Author
-
-- **Omaid F** ([@omaidf](https://github.com/omaidf))
-
-## Acknowledgments
-
-- [CodeLlama](https://github.com/facebookresearch/codellama) for code analysis
-- [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for code parsing
-- [Mermaid](https://mermaid.js.org/) for diagram generation 
-
-## 🔑 Setting Up Your Hugging Face Token (REQUIRED)
-
-This project requires a Hugging Face token to download the LLM models. Here's how to set it up:
-
-1. **Create a Hugging Face account** if you don't have one at [https://huggingface.co/join](https://huggingface.co/join)
-
-2. **Generate a token** at [https://huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
-   - Click "New token"
-   - Name it (e.g., "AIThreatMap")
-   - Role can be "Read" (no need for write permissions)
-   - Click "Generate token" and copy it
-
-3. **Set your token** using one of these methods:
-
-   **Method 1: Using the CLI tool (Recommended)**
-   ```bash
-   # Run the token setup command
-   python -m cli set_token
-   
-   # Follow the prompts to enter your token
-   # The token will be saved to your .env file
-   ```
+3. **Analysis taking too long**:
+   - Check your system resources
+   - Try analyzing a smaller subset of the codebase
 
    **Method 2: Set in your environment**
    ```bash

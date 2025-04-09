@@ -1,0 +1,78 @@
+# ThreatMapAI Configuration
+# Copy this file to config.yml and customize as needed
+
+# Model Configuration
+model:
+  # Path to the model file
+  path: "models/codellama-2-7b-instruct.Q4_0.gguf"
+  
+  # Model parameters
+  context_length: 8192     # Maximum context length in tokens
+  max_tokens: 4096         # Maximum output tokens
+  temperature: 0.2         # Lower values = more deterministic output
+  top_p: 0.9               # Nucleus sampling parameter
+  repetition_penalty: 1.1  # Prevents repetitive text
+
+# GPU Configuration
+gpu:
+  enabled: true           # Set to false to force CPU usage
+  device: "auto"          # "auto", "cpu", or "cuda"
+  gpu_id: null            # Specific GPU ID to use (null = auto-select)
+  memory_limit: null      # Memory limit in GB (null = auto-detect)
+  distributed: false      # Use multiple GPUs if available
+
+# Embedding Configuration
+embedding:
+  model: "all-MiniLM-L6-v2"  # Embedding model to use
+  chunk_size: 1024           # Code chunk size for embeddings
+  chunk_overlap: 128         # Overlap between chunks
+  device: "auto"             # "auto", "cpu", or "cuda"
+
+# Analysis Configuration
+analysis:
+  max_files: 500             # Maximum files to analyze in detail
+  prioritize_extensions:     # File extensions to prioritize
+    - ".py"
+    - ".js"
+    - ".ts"
+    - ".java"
+    - ".go"
+    - ".php"
+  ignore_patterns:           # Files/dirs to ignore
+    - "node_modules/"
+    - "venv/"
+    - "dist/"
+    - "*.min.*"
+    - "*.test.*"
+    - "*_test.go"
+  
+  # Security-focused patterns
+  sensitive_patterns:       # Additional patterns to flag as sensitive
+    - "password"
+    - "secret"
+    - "token"
+    - "auth"
+    - "key"
+    - "credential"
+    - "api_key"
+
+# Visualization Configuration
+visualization:
+  diagrams:
+    enabled: true
+    theme: "default"    # "default", "dark", "forest"
+  
+  report:
+    enabled: true
+    include_code: true  # Include code snippets in report
+    include_recommendations: true
+
+# Paths Configuration
+paths:
+  output_dir: "output"
+  temp_dir: "temp_repo"
+
+# Logging Configuration
+logging:
+  level: "INFO"         # DEBUG, INFO, WARNING, ERROR
+  file: "threatmap.log" 
