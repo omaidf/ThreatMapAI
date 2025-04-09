@@ -300,6 +300,184 @@ def install_deps_in_batches(req_file):
     
     return True
 
+def fix_sentence_transformers():
+    """Apply fixes for sentence_transformers installation issues"""
+    print_status("Checking sentence_transformers installation...")
+    
+    # First check if we can import it at all
+    try:
+        import sentence_transformers
+        print_status("sentence_transformers seems to be installed correctly")
+        return True
+    except ImportError:
+        print_warning("sentence_transformers issues detected, applying fixes...")
+    
+    # Fix 1: Try reinstalling with explicit dependencies
+    print_status("Fix 1: Reinstalling with explicit dependencies...")
+    run_command(f"{PYTHON_CMD} -m pip install -q --no-cache-dir --force-reinstall -U transformers torch numpy scipy")
+    run_command(f"{PYTHON_CMD} -m pip install -q --no-cache-dir --force-reinstall -U sentence-transformers")
+    
+    # Try importing again
+    try:
+        import sentence_transformers
+        print_success("Fix 1 succeeded!")
+        return True
+    except ImportError:
+        pass
+    
+    # Fix 2: Try with a specific version
+    print_status("Fix 2: Trying specific version...")
+    run_command(f"{PYTHON_CMD} -m pip install -q --no-cache-dir --force-reinstall 'sentence-transformers==2.2.2'")
+    
+    # Try importing again
+    try:
+        import sentence_transformers
+        print_success("Fix 2 succeeded!")
+        return True
+    except ImportError:
+        pass
+    
+    # Fix 3: Try building from source
+    print_status("Fix 3: Building from source...")
+    run_command(f"{PYTHON_CMD} -m pip install -q --no-cache-dir git+https://github.com/UKPLab/sentence-transformers.git")
+    
+    # Final check
+    try:
+        import sentence_transformers
+        print_success("Fix 3 succeeded!")
+        return True
+    except ImportError:
+        print_error("All fixes failed for sentence_transformers")
+        return False
+
+def install_faiss():
+    """Install FAISS with GPU support if available"""
+    print_status("Installing FAISS for vector search...")
+    
+    # First ensure we have a compatible NumPy version (< 2.0)
+    print_status("Installing compatible NumPy for FAISS...")
+    run_command(f"{PYTHON_CMD} -m pip install 'numpy<2.0.0'")
+    
+    # Check if PyTorch with CUDA is available for GPU version
+    cuda_available = False
+    print_status("Checking for CUDA availability...")
+    
+    try:
+        import torch
+        if torch.cuda.is_available():
+            cuda_available = True
+            print_success("CUDA detected via PyTorch! Will install GPU-enabled FAISS.")
+    except ImportError:
+        # If torch isn't installed, check for CUDA via system
+        if shutil.which("nvcc") or os.path.exists("/usr/local/cuda"):
+            cuda_available = True
+            print_success("CUDA detected via nvcc/cuda directory! Will install GPU-enabled FAISS.")
+        else:
+            print_status("No CUDA detected, using CPU version of FAISS.")
+    
+    # Install appropriate FAISS version
+    if cuda_available:
+        # Install PyTorch with CUDA first if needed
+        try:
+            import torch
+        except ImportError:
+            print_status("Installing PyTorch with CUDA support first...")
+            run_command(f"{PYTHON_CMD} -m pip install torch --index-url https://download.pytorch.org/whl/cu118")
+        
+        # Install faiss-gpu
+        print_status("Installing FAISS with GPU support...")
+        success, _ = run_command(f"{PYTHON_CMD} -m pip install -q faiss-gpu")
+        
+        if not success:
+            print_warning("Failed to install faiss-gpu, trying with specific CUDA version...")
+            # Try with specific pinned version
+            success, _ = run_command(f"{PYTHON_CMD} -m pip install -q 'faiss-gpu>=1.7.0'")
+            
+            if not success:
+                print_warning("Failed to install faiss-gpu. Falling back to CPU version.")
+                run_command(f"{PYTHON_CMD} -m pip install -q faiss-cpu")
+        
+        # Verify GPU FAISS installation
+        try:
+            import faiss
+            if hasattr(faiss, 'get_num_gpus') and faiss.get_num_gpus() > 0:
+                print_success("Successfully installed FAISS with GPU support!")
+                detected_gpus = faiss.get_num_gpus()
+                print_status(f"Detected {detected_gpus} GPUs for FAISS acceleration")
+                mark_as_installed("faiss_gpu")
+                
+                # Set environment variable for the application
+                os.environ["FAISS_MULTI_GPU"] = "1" if detected_gpus > 1 else "0"
+                
+                return True
+            else:
+                print_warning("FAISS installed but GPU support not detected. Using CPU version.")
+                mark_as_installed("faiss_cpu")
+        except ImportError:
+            print_error("Failed to import FAISS after installation. Vector search will be limited.")
+    else:
+        # Now install faiss-cpu
+        print_status("Installing FAISS CPU version...")
+        success, _ = run_command(f"{PYTHON_CMD} -m pip install -q faiss-cpu")
+        
+        if not success:
+            print_warning("Failed to install faiss-cpu, trying alternative method...")
+            # Try with specific pinned version
+            success, _ = run_command(f"{PYTHON_CMD} -m pip install -q 'faiss-cpu==1.7.4'")
+            
+            if not success:
+                # Try with known-compatible versions
+                run_command(f"{PYTHON_CMD} -m pip install -q 'numpy==1.24.3'")
+                run_command(f"{PYTHON_CMD} -m pip install -q 'faiss-cpu==1.7.4'")
+        
+        # Verify faiss installation
+        try:
+            import faiss
+            print_success("Successfully installed FAISS CPU version")
+            mark_as_installed("faiss_cpu")
+            return True
+        except ImportError:
+            print_error("Failed to import FAISS after installation. Vector search will be limited.")
+            return False
+
+def install_llama_cpp_python():
+    """Install llama-cpp-python with hardware acceleration if available"""
+    print_status("Installing llama-cpp-python...")
+    
+    # Check if we're on a system with CUDA
+    if shutil.which("nvcc") or os.path.exists("/usr/local/cuda"):
+        print_status("CUDA detected, installing llama-cpp-python with CUDA support...")
+        os.environ["CMAKE_ARGS"] = "-DLLAMA_CUBLAS=on"
+        success, _ = run_command(f"{PYTHON_CMD} -m pip install --force-reinstall llama-cpp-python")
+        
+        if success:
+            print_success("Installed llama-cpp-python with CUDA support!")
+            return True
+        else:
+            print_warning("Failed to install with CUDA. Installing standard version...")
+    # Check if we're on a Mac with Metal (Apple Silicon)
+    elif platform.system() == "Darwin" and platform.machine() == "arm64":
+        print_status("Apple Silicon detected, installing llama-cpp-python with Metal support...")
+        os.environ["CMAKE_ARGS"] = "-DLLAMA_METAL=on"
+        success, _ = run_command(f"{PYTHON_CMD} -m pip install --force-reinstall llama-cpp-python")
+        
+        if success:
+            print_success("Installed llama-cpp-python with Metal support!")
+            return True
+        else:
+            print_warning("Failed to install with Metal. Installing standard version...")
+    
+    # Fall back to standard version
+    print_status("Installing standard llama-cpp-python...")
+    success, _ = run_command(f"{PYTHON_CMD} -m pip install --force-reinstall llama-cpp-python")
+    
+    if success:
+        print_success("Installed standard llama-cpp-python")
+        return True
+    else:
+        print_warning("Failed to install llama-cpp-python.")
+        return False
+
 def verify_installation():
     """Verify that all critical packages are installed and working"""
     print_status("Verifying dependencies...")
@@ -339,7 +517,11 @@ except Exception as e:
 # Special check for faiss - critical for vector search
 try:
     import faiss
-    print(f'✓ faiss-cpu')
+    has_gpu = hasattr(faiss, 'get_num_gpus') and faiss.get_num_gpus() > 0
+    print(f'✓ faiss-{"gpu" if has_gpu else "cpu"}')
+    if has_gpu:
+        gpu_count = faiss.get_num_gpus()
+        print(f'  → {gpu_count} GPUs available for FAISS')
 except ImportError as e:
     print(f'✗ faiss-cpu - {str(e)}')
     print('  → This is critical for vector search functionality')
@@ -347,6 +529,14 @@ except ImportError as e:
 except Exception as e:
     print(f'⚠ faiss-cpu - imports but has issues: {str(e)}')
     print('  → May have limited functionality')
+
+# Check llama-cpp-python
+try:
+    import llama_cpp
+    print(f'✓ llama_cpp (Python binding for llama.cpp)')
+except ImportError:
+    print(f'○ llama_cpp - not installed or not found')
+    print('  → LLM functionality may be limited')
 
 # Check optional packages
 optional_packages = [
@@ -406,7 +596,8 @@ def install_dependencies():
     if (is_already_installed("core_packages") and 
         is_already_installed("sentence_transformers") and 
         is_already_installed("tree_sitter") and 
-        is_already_installed("faiss_cpu")):
+        (is_already_installed("faiss_cpu") or is_already_installed("faiss_gpu")) and
+        is_already_installed("llama_cpp_python")):
         print_success("All critical dependencies are already installed. Skipping installation.")
         return True
     
@@ -419,7 +610,7 @@ def install_dependencies():
     detect_system_resources()
     
     # Define total steps for progress tracking
-    total_steps = 9
+    total_steps = 10  # Increased to account for new steps
     current_step = 0
     
     # Upgrade pip first
@@ -458,13 +649,14 @@ def install_dependencies():
         show_progress(total_steps, current_step, "Installing critical packages")
         
         # Install critical packages
+        import threading
+        threads = []
+        
         cmd1 = f"{PYTHON_CMD} -m pip install -q click python-dotenv colorama tqdm"
         cmd2 = f"{PYTHON_CMD} -m pip install -q pydantic huggingface_hub joblib"
         cmd3 = f"{PYTHON_CMD} -m pip install -q requests"
         
         # Run in parallel using threading
-        import threading
-        threads = []
         for cmd in [cmd1, cmd2, cmd3]:
             thread = threading.Thread(target=run_command, args=(cmd,))
             thread.start()
@@ -487,9 +679,78 @@ def install_dependencies():
         current_step += 1
         show_progress(total_steps, current_step, "Critical packages already installed")
     
-    # Install remaining packages and verify as needed
-    # Remaining implementation for sentence_transformers, faiss, etc.
-    # (The rest would follow the same pattern, installing packages and marking checkpoints)
+    # Install sentence-transformers prerequisites in parallel if needed
+    if not is_already_installed("sentence_transformers"):
+        current_step += 1
+        show_progress(total_steps, current_step, "Installing transformers & torch (for sentence-transformers)")
+        
+        # Install prerequisites in parallel
+        import threading
+        threads = []
+        
+        cmd1 = f"{PYTHON_CMD} -m pip install -q transformers"
+        cmd2 = f"{PYTHON_CMD} -m pip install -q torch torchvision"
+        
+        for cmd in [cmd1, cmd2]:
+            thread = threading.Thread(target=run_command, args=(cmd,))
+            thread.start()
+            threads.append(thread)
+        
+        # Wait for all threads to complete
+        for thread in threads:
+            thread.join()
+        
+        # Install sentence-transformers
+        current_step += 1
+        show_progress(total_steps, current_step, "Installing sentence-transformers")
+        success, _ = run_command(f"{PYTHON_CMD} -m pip install -q sentence-transformers")
+        
+        # Apply fixes if needed
+        if not success or not verify_sentence_transformers():
+            fix_sentence_transformers()
+        
+        mark_as_installed("sentence_transformers")
+    else:
+        print_status("Sentence-transformers already installed, skipping...")
+        # Skip two steps
+        current_step += 2
+        show_progress(total_steps, current_step, "Sentence transformers already installed")
+    
+    # Install tree-sitter versions specifically if needed
+    if not is_already_installed("tree_sitter"):
+        current_step += 1
+        show_progress(total_steps, current_step, "Installing tree-sitter")
+        success, _ = run_command(f"{PYTHON_CMD} -m pip install -q --force-reinstall tree-sitter==0.20.1 tree-sitter-languages==1.8.0")
+        if not success:
+            print_error("Failed to install tree-sitter")
+            return False
+        mark_as_installed("tree_sitter")
+    else:
+        current_step += 1
+        show_progress(total_steps, current_step, "Tree-sitter already installed")
+    
+    # Install FAISS for vector search if needed
+    if not is_already_installed("faiss_cpu") and not is_already_installed("faiss_gpu"):
+        current_step += 1
+        show_progress(total_steps, current_step, "Installing FAISS for vector search")
+        install_faiss()
+    else:
+        current_step += 1
+        show_progress(total_steps, current_step, "FAISS already installed")
+        if is_already_installed("faiss_gpu"):
+            print_status("FAISS with GPU support is already installed")
+        else:
+            print_status("FAISS CPU version is already installed")
+    
+    # Install llama-cpp-python with acceleration if needed
+    if not is_already_installed("llama_cpp_python"):
+        current_step += 1
+        show_progress(total_steps, current_step, "Installing llama-cpp-python with hardware acceleration")
+        if install_llama_cpp_python():
+            mark_as_installed("llama_cpp_python")
+    else:
+        current_step += 1
+        show_progress(total_steps, current_step, "llama-cpp-python already installed")
     
     # Complete the progress bar
     current_step = total_steps
@@ -497,6 +758,14 @@ def install_dependencies():
     
     print_success("All dependencies installed!")
     return True
+
+def verify_sentence_transformers():
+    """Verify that sentence_transformers is installed correctly"""
+    try:
+        import sentence_transformers
+        return True
+    except ImportError:
+        return False
 
 def setup_venv():
     """Set up and activate a Python virtual environment"""
