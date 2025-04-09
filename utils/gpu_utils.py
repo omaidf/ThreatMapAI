@@ -299,6 +299,13 @@ def install_faiss_gpu() -> bool:
         True if installation was successful, False otherwise
     """
     try:
+        # First unload faiss if it's already loaded
+        if 'faiss' in sys.modules:
+            del sys.modules['faiss']
+        
+        # Now try to import and check for GPU support
+        import faiss
+        
         if hasattr(faiss, 'StandardGpuResources'):
             # GPU support already available
             info_msg("FAISS with GPU support is already installed")
@@ -327,23 +334,48 @@ def install_faiss_gpu() -> bool:
         
         # Install the package
         info_msg(f"Installing {package}...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--force-reinstall", package])
         success_msg(f"Successfully installed {package}")
         
-        # Verify installation
+        # Force unload faiss completely to ensure clean import
+        for module_name in list(sys.modules.keys()):
+            if module_name == 'faiss' or module_name.startswith('faiss.'):
+                del sys.modules[module_name]
+        
+        # Verify installation by importing fresh
         try:
-            # Force reload of faiss module if it was already imported
-            if 'faiss' in sys.modules:
-                importlib.reload(sys.modules['faiss'])
-            else:
-                import faiss
-                
+            import faiss
+            
+            # Test creating a GPU resource to verify it works
             if hasattr(faiss, 'StandardGpuResources'):
-                success_msg("FAISS GPU support successfully installed")
-                return True
+                try:
+                    # Try to actually create a GPU resource to fully verify
+                    res = faiss.StandardGpuResources()
+                    success_msg("FAISS GPU support successfully verified")
+                    # Keep the resource around to ensure module stays loaded correctly
+                    return True
+                except Exception as e:
+                    warning_msg(f"FAISS GPU support detected but initialization failed: {str(e)}")
+                    return False
             else:
                 warning_msg("FAISS installed but GPU support not available")
-                return False
+                # Sometimes the module needs to be fully reloaded from scratch
+                # Try reinstalling one more time to ensure we get the GPU version
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-cache-dir", package])
+                
+                # Force reload again
+                for module_name in list(sys.modules.keys()):
+                    if module_name == 'faiss' or module_name.startswith('faiss.'):
+                        del sys.modules[module_name]
+                
+                # Try one more time
+                import faiss
+                if hasattr(faiss, 'StandardGpuResources'):
+                    success_msg("FAISS GPU support successfully installed after reinstall")
+                    return True
+                else:
+                    warning_msg("FAISS GPU support still not available after reinstall")
+                    return False
         except ImportError:
             warning_msg("Failed to import FAISS after installation")
             return False
@@ -383,6 +415,9 @@ def configure_gpu_environment(force_gpu: bool = False,
     }
     
     try:
+        # Try to increase memory lock limits for better GPU performance
+        increase_memory_lock_limit()
+        
         # Can't force both CPU and GPU
         if force_gpu and force_cpu:
             error_msg("Cannot force both CPU and GPU at the same time")
@@ -449,12 +484,20 @@ def configure_gpu_environment(force_gpu: bool = False,
                 result['distributed'] = True
                 
                 # Install FAISS-GPU for better multi-GPU performance
-                install_faiss_gpu()
+                # Try multiple times with increasing force levels if needed
+                faiss_installed = install_faiss_gpu()
+                if not faiss_installed and 'faiss' in sys.modules:
+                    # If initial installation failed but module exists, try with --force-reinstall
+                    info_msg("Retrying FAISS-GPU installation with force...")
+                    faiss_installed = install_faiss_gpu()
             else:
                 # Clear distributed setting if not needed
                 if "DISTRIBUTED" in os.environ:
                     del os.environ["DISTRIBUTED"]
                 update_env_file("DISTRIBUTED", "")
+                
+                # Still install FAISS-GPU for single GPU performance
+                install_faiss_gpu()
             
             # Set memory limit if provided
             if memory_limit:
@@ -683,6 +726,48 @@ def run_gpu_benchmark(gpu_id: int = 0) -> Dict[str, Any]:
         result['error'] = str(e)
     
     return result
+
+def increase_memory_lock_limit() -> bool:
+    """
+    Attempt to increase the memory lock limit for the current process.
+    
+    This helps prevent "failed to mlock buffer" errors with FAISS-GPU.
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        if platform.system() != 'Linux':
+            # Memory locking is primarily an issue on Linux
+            return False
+            
+        import resource
+        
+        # Get current limits
+        soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+        
+        # Try to increase to maximum allowed
+        if soft != hard or soft == -1:
+            try:
+                # Set soft limit to hard limit
+                resource.setrlimit(resource.RLIMIT_MEMLOCK, (hard, hard))
+                info_msg(f"Increased memory lock limit from {soft} to {hard}")
+                return True
+            except Exception as e:
+                warning_msg(f"Failed to increase memory lock limit: {str(e)}")
+                
+                # Suggest command to fix this permanently
+                info_msg("To permanently increase memory lock limits, run as root:")
+                info_msg("echo '* soft memlock unlimited' >> /etc/security/limits.conf")
+                info_msg("echo '* hard memlock unlimited' >> /etc/security/limits.conf")
+                return False
+    except ImportError:
+        # Resource module not available
+        pass
+    except Exception as e:
+        warning_msg(f"Error setting memory lock limit: {str(e)}")
+        
+    return False
 
 def parse_gpu_ids(gpu_ids_str: Optional[str] = None) -> List[int]:
     """
