@@ -2475,23 +2475,23 @@ Pay special attention to:
                 device = torch.device(f"cuda:{i}")
                 # Get available memory for this GPU
                 total_memory = torch.cuda.get_device_properties(i).total_memory
-                # Calculate 90% of available memory for our dummy tensor (in bytes)
-                # We'll use 90% here to maximize GPU utilization with 24GB GPUs
-                mem_to_use = int(total_memory * 0.9)
+                # Calculate 80% of available memory for our dummy tensor (in bytes)
+                # We'll use 80% instead of 90% to reduce chances of OOM errors
+                mem_to_use = int(total_memory * 0.8)
                 
-                # Calculate tensor dimensions based on available memory
-                # Each float32 value is 4 bytes
-                tensor_size = int(math.sqrt(mem_to_use / 4 / 2))  # Divide by 4 (bytes) and 2 (matrices)
-                tensor_size = min(tensor_size, 40000)  # Increased cap for 24GB GPUs
+                # Use a smaller fixed tensor size for faster initialization
+                tensor_size = 10000  # Much faster than 40000
                 
                 info_msg(f"Creating tensor of size {tensor_size}x{tensor_size} on GPU {i} (~{tensor_size*tensor_size*4/1024/1024:.2f} MB)")
                 
-                # Create a larger dummy tensor on each GPU and perform operations
-                dummy_tensor = torch.zeros(tensor_size, tensor_size, device=device)
-                _ = torch.nn.functional.normalize(dummy_tensor, p=2, dim=1)
+                # Create a random tensor instead of zeros (faster for allocation)
+                dummy_tensor = torch.rand(tensor_size, tensor_size, device=device)
                 
-                # Second operation to ensure the GPU is fully engaged
-                _ = torch.matmul(dummy_tensor, dummy_tensor.t())
+                # Create a second tensor to utilize even more memory
+                dummy_tensor2 = torch.rand(tensor_size, tensor_size, device=device)
+                
+                # Perform an efficient operation that forces memory allocation
+                _ = torch.matmul(dummy_tensor, dummy_tensor2)
                 
                 # Force sync on this specific GPU
                 torch.cuda.synchronize(device)
@@ -2500,6 +2500,13 @@ Pay special attention to:
                 mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
                 mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
                 info_msg(f"GPU {i} activated with {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved")
+                
+                # Free the tensors for the first GPU after activation to avoid huge memory usage
+                # when the actual model loads (which will be on GPU 0)
+                if i == 0:
+                    del dummy_tensor, dummy_tensor2
+                    torch.cuda.empty_cache()
+                    info_msg("Freed initial tensors on GPU 0 to prepare for model loading")
             
             # Additional operations on GPU 0 to ensure layers are loaded
             device = torch.device("cuda:0")
