@@ -1279,7 +1279,7 @@ Pay special attention to:
             
             # With 100K context window, we can analyze many more files
             # We'll still apply a high limit to prevent extremely rare cases of enormous repos
-            max_files_to_check = 10000  # Previously 500, now much higher for 100K context
+            max_files_to_check = 50000  # Significantly increased from 10000 to allow for larger repositories
             
             if len(file_list) > max_files_to_check:
                 logger.warning(f"Extremely large repository with {len(file_list)} files, limiting architecture analysis to {max_files_to_check} files")

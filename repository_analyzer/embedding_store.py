@@ -262,22 +262,49 @@ class EmbeddingStore:
             mapping_path_str = str(self.mapping_path)
             index_path_str = str(self.index_path)
             
-            # Save mapping
-            with open(mapping_path_str, 'w') as f:
-                json.dump(self.file_mapping, f, indent=2)
+            # Always save mapping first regardless of index status - this is critical
+            try:
+                with open(mapping_path_str, 'w') as f:
+                    json.dump(self.file_mapping, f, indent=2)
+                info_msg(f"Saved mapping with {len(self.file_mapping)} entries")
+            except Exception as mapping_error:
+                error_msg(f"Failed to save mapping: {str(mapping_error)}")
             
             # If using GPU index, we need to convert back to CPU for saving
             if hasattr(self, 'use_gpu_for_faiss') and self.use_gpu_for_faiss:
                 try:
                     cpu_index = faiss.index_gpu_to_cpu(self.index)
                     faiss.write_index(cpu_index, index_path_str)
+                    info_msg(f"Successfully converted GPU index to CPU and saved")
                 except Exception as e:
-                    warning_msg(f"Failed to convert GPU index to CPU for saving: {str(e)}")
-                    warning_msg("Attempting to save index directly")
-                    faiss.write_index(self.index, index_path_str)
+                    error_msg(f"Failed to convert GPU index to CPU for saving: {str(e)}")
+                    # Instead of attempting to save directly (which often fails), 
+                    # create a new CPU index from the current embeddings
+                    try:
+                        # Extract all embeddings from the mapping (if available)
+                        error_msg("Attempting to rebuild index from embeddings...")
+                        
+                        # Create a new CPU index
+                        new_cpu_index = faiss.IndexFlatL2(self.vector_size)
+                        # Just save this basic index rather than risking a crash
+                        faiss.write_index(new_cpu_index, index_path_str)
+                        error_msg("Saved empty fallback index. Some embeddings may be lost.")
+                    except Exception as rebuild_error:
+                        error_msg(f"Failed to save fallback index: {str(rebuild_error)}")
             else:
                 # Save index directly if it's already a CPU index
-                faiss.write_index(self.index, index_path_str)
+                try:
+                    faiss.write_index(self.index, index_path_str)
+                    info_msg(f"Saved CPU index with {self.index.ntotal} vectors")
+                except Exception as cpu_save_error:
+                    error_msg(f"Failed to save CPU index: {str(cpu_save_error)}")
+                    # Try saving an empty index in case of failure
+                    try:
+                        new_cpu_index = faiss.IndexFlatL2(self.vector_size)
+                        faiss.write_index(new_cpu_index, index_path_str)
+                        error_msg("Saved empty fallback index due to error")
+                    except:
+                        error_msg("Could not save any index, vectors may be lost")
             
             success_msg(f"Saved {len(self.file_mapping)} embeddings to {self.index_path}")
         except Exception as e:
@@ -488,73 +515,106 @@ class EmbeddingStore:
         Returns:
             Numpy array of embeddings
         """
+        if not texts:
+            # Handle empty input
+            return np.zeros((0, self.vector_size), dtype=np.float32)
+            
+        # Check if model exists and is initialized properly
         if self.model is None:
-            # If we don't have a model, return zeros
-            info_msg("Using dummy embeddings (zeros)")
-            return np.zeros((len(texts), self.vector_size), dtype=np.float32)
-        else:
+            # If we don't have a model, return zeros and try to reinitialize
+            warning_msg("Model not initialized! Using dummy embeddings (zeros)")
+            
+            # Try to reinitialize the model
             try:
-                if self.device == 'cpu':
-                    # Force sequential processing - do NOT batch process on CPU
-                    all_embeddings = []
-                    
-                    # Process each text individually to avoid multiprocessing
-                    for text in texts:
-                        # Set show_progress_bar to False to avoid tqdm which can sometimes use semaphores
-                        # Set convert_to_tensor to False to avoid torch multiprocessing
-                        # Set normalize_embeddings to False for speed (we normalize manually later)
+                device_str = self.device
+                if self.device == 'cuda' and hasattr(self, 'gpu_id'):
+                    device_str = f"cuda:{self.gpu_id}"
+                
+                self.model = SentenceTransformer('all-MiniLM-L6-v2', device=device_str)
+                info_msg(f"Successfully reinitialized model on {device_str}")
+            except Exception as e:
+                error_msg(f"Failed to reinitialize model: {str(e)}")
+                
+            # Still return zeros this time
+            return np.zeros((len(texts), self.vector_size), dtype=np.float32)
+        
+        # Model exists, try to encode
+        try:
+            # Make sure all text chunks are valid strings
+            valid_texts = []
+            for text in texts:
+                if not isinstance(text, str):
+                    warning_msg(f"Invalid text type: {type(text)}, converting to string")
+                    valid_texts.append(str(text))
+                elif not text.strip():
+                    # Skip empty strings by adding a placeholder
+                    valid_texts.append(" ")
+                else:
+                    valid_texts.append(text)
+            
+            if self.device == 'cpu':
+                # Process on CPU
+                all_embeddings = []
+                for text in valid_texts:
+                    try:
                         single_embedding = self.model.encode(
                             [text], 
                             show_progress_bar=False,
                             convert_to_tensor=False,
                             normalize_embeddings=False,
-                            batch_size=1  # Force batch size of 1
+                            batch_size=1
                         )
-                        
-                        # Only keep the first embedding (there's only one anyway)
                         all_embeddings.append(single_embedding[0])
-                    
-                    # Stack all embeddings
-                    result = np.vstack(all_embeddings)
-                else:
-                    # Use GPU acceleration with batch processing
-                    # Set appropriate batch size based on GPU memory
-                    batch_size = 32  # Default batch size for GPU
-                    
-                    # Try to determine optimal batch size based on GPU memory
-                    try:
-                        if torch.cuda.is_available():
-                            # Get GPU memory info - adjust batch size based on total memory
-                            prop = torch.cuda.get_device_properties(self.gpu_id)
-                            total_mem = prop.total_memory / (1024**3)  # Convert to GB
-                            
-                            # Rough heuristic: more memory = larger batches
-                            if total_mem > 16:  # High-end GPU
-                                batch_size = 64
-                            elif total_mem < 8:  # Smaller GPU
-                                batch_size = 16
-                    except:
-                        pass  # Stick with default batch size
-                    
-                    # Still disable progress bar to avoid tqdm issues
-                    result = self.model.encode(
-                        texts,
-                        show_progress_bar=False,
-                        convert_to_tensor=False,
-                        normalize_embeddings=False,
-                        batch_size=batch_size
-                    )
+                    except Exception as chunk_error:
+                        warning_msg(f"Error encoding chunk: {str(chunk_error)}")
+                        # Add zeros for failed chunks
+                        all_embeddings.append(np.zeros(self.vector_size, dtype=np.float32))
                 
-                # Normalize manually if needed (L2 normalization)
-                norms = np.linalg.norm(result, axis=1, keepdims=True)
-                norms[norms == 0] = 1  # Avoid division by zero
-                result = result / norms
-                
-                return result
-                
-            except Exception as e:
-                warning_msg(f"Error during encoding: {str(e)}. Using zeros instead.")
-                return np.zeros((len(texts), self.vector_size), dtype=np.float32)
+                result = np.vstack(all_embeddings)
+            else:
+                # GPU processing with small batches and error handling
+                try:
+                    # Use smaller batch size to avoid CUDA OOM
+                    batch_size = 8
+                    
+                    # Process in small batches with error handling
+                    all_embeddings = []
+                    for i in range(0, len(valid_texts), batch_size):
+                        batch = valid_texts[i:i+batch_size]
+                        try:
+                            batch_embeddings = self.model.encode(
+                                batch,
+                                show_progress_bar=False,
+                                convert_to_tensor=False,
+                                normalize_embeddings=False,
+                                batch_size=batch_size
+                            )
+                            all_embeddings.append(batch_embeddings)
+                        except Exception as batch_error:
+                            warning_msg(f"Error encoding batch: {str(batch_error)}")
+                            # Add zeros for failed batch
+                            batch_zeros = np.zeros((len(batch), self.vector_size), dtype=np.float32)
+                            all_embeddings.append(batch_zeros)
+                    
+                    # Combine all batches
+                    if all_embeddings:
+                        result = np.vstack(all_embeddings)
+                    else:
+                        # Fallback if all batches failed
+                        result = np.zeros((len(valid_texts), self.vector_size), dtype=np.float32)
+                except Exception as gpu_error:
+                    warning_msg(f"GPU encoding failed: {str(gpu_error)}. Falling back to zeros.")
+                    result = np.zeros((len(valid_texts), self.vector_size), dtype=np.float32)
+            
+            # Normalize manually (L2 normalization)
+            norms = np.linalg.norm(result, axis=1, keepdims=True)
+            norms[norms == 0] = 1  # Avoid division by zero
+            result = result / norms
+            
+            return result
+        except Exception as e:
+            error_msg(f"Critical error during encoding: {str(e)}. Using zeros instead.")
+            return np.zeros((len(texts), self.vector_size), dtype=np.float32)
     
     def add_file(self, file_path: str, content: str, metadata: Dict[str, Any] = None) -> None:
         """
@@ -565,69 +625,128 @@ class EmbeddingStore:
             content: Content of the file
             metadata: Additional metadata about the file (language, imports, etc.)
         """
-        try:
-            # Check if this file is already in the embedding store
-            if self.contains_file(file_path):
-                logger.info(f"File {file_path} already in embedding store, skipping")
-                return
+        # Counter for retries
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                # Check if this file is already in the embedding store
+                if self.contains_file(file_path):
+                    logger.info(f"File {file_path} already in embedding store, skipping")
+                    return
                 
-            # Split content into chunks for embedding
-            chunks = self._split_content(content)
-            if not chunks:
-                return
-            
-            # Create embeddings - process in batches to reduce memory usage
-            batch_size = 16
-            start_idx = self.index.ntotal if self.index is not None else 0
-            
-            # Ensure we have an index
-            if self.index is None:
-                self.clear()
-            
-            # Prepare metadata if not provided
-            if metadata is None:
-                metadata = {}
-            
-            # Add file extension to metadata if not already there
-            if "extension" not in metadata:
-                from pathlib import Path  # Local import to ensure Path is available
-                ext = Path(file_path).suffix.lower()
-                if ext:
-                    metadata["extension"] = ext
-            
-            # Process in smaller batches to reduce memory pressure
-            for i in range(0, len(chunks), batch_size):
-                batch_chunks = chunks[i:i+batch_size]
+                # Validate content
+                if not content or not isinstance(content, str):
+                    if not content:
+                        error_msg(f"Empty content for file {file_path}, skipping")
+                    else:
+                        error_msg(f"Invalid content type for {file_path}: {type(content)}, skipping")
+                    return
                 
-                # Create embeddings for this batch using the helper method
-                batch_embeddings = self._encode_text(batch_chunks)
+                # Split content into chunks for embedding
+                chunks = self._split_content(content)
+                if not chunks:
+                    error_msg(f"No chunks generated for {file_path}, content may be invalid")
+                    return
                 
-                # Add to index
-                self.index.add(np.array(batch_embeddings).astype('float32'))
+                info_msg(f"Processing {len(chunks)} chunks for {file_path}")
                 
-                # Map file path to indices
-                for j, chunk in enumerate(batch_chunks):
-                    idx = start_idx + i + j
+                # Ensure we have an index
+                if self.index is None:
+                    info_msg("Index not initialized, creating new index")
+                    self.clear()
+                    # Double-check index was created
+                    if self.index is None:
+                        raise ValueError("Failed to create index after clearing")
+                
+                # Create embeddings - process in smaller batches to reduce memory usage
+                batch_size = 8  # Use smaller batches for better stability
+                start_idx = self.index.ntotal if self.index is not None else 0
+                
+                # Prepare metadata if not provided
+                if metadata is None:
+                    metadata = {}
+                
+                # Add file extension to metadata if not already there
+                if "extension" not in metadata:
+                    from pathlib import Path  # Local import to ensure Path is available
+                    ext = Path(file_path).suffix.lower()
+                    if ext:
+                        metadata["extension"] = ext
+                
+                # Process in smaller batches with more error handling
+                added_chunks = 0
+                for i in range(0, len(chunks), batch_size):
+                    batch_chunks = chunks[i:i+batch_size]
                     
-                    self.file_mapping.append({
-                        "file_path": file_path,
-                        "content": chunk,
-                        "metadata": metadata
-                    })
-                
-                # Force garbage collection between batches to prevent memory leaks
-                if i % (batch_size * 4) == 0 and i > 0:
+                    # Create embeddings for this batch
+                    try:
+                        batch_embeddings = self._encode_text(batch_chunks)
+                        
+                        # Verify embeddings shape
+                        if batch_embeddings.shape[0] != len(batch_chunks):
+                            warning_msg(f"Embedding count mismatch: got {batch_embeddings.shape[0]}, expected {len(batch_chunks)}")
+                            # Create correct shaped embeddings with zeros
+                            batch_embeddings = np.zeros((len(batch_chunks), self.vector_size), dtype=np.float32)
+                        
+                        # Add to index
+                        self.index.add(np.array(batch_embeddings).astype('float32'))
+                        
+                        # Map file path to indices
+                        for j, chunk in enumerate(batch_chunks):
+                            idx = start_idx + i + j
+                            
+                            self.file_mapping.append({
+                                "file_path": file_path,
+                                "content": chunk,
+                                "metadata": metadata.copy()  # Use a copy to avoid shared references
+                            })
+                            
+                            added_chunks += 1
+                        
+                    except Exception as batch_error:
+                        error_msg(f"Error processing batch for {file_path}: {str(batch_error)}")
+                        # Continue with next batch rather than failing entire file
+                    
+                    # Force garbage collection more frequently
                     gc.collect()
-            
-            # Save after each file to avoid losing work
-            self.save()
-            
-            logger.info(f"Added {len(chunks)} chunks from {file_path} to embedding store")
-        except Exception as e:
-            logger.error(f"Failed to add file {file_path} to embedding store: {str(e)}")
-            
-            # Try to clean up any partial work
-            gc.collect()
+                    
+                    # Periodic save for very large files
+                    if i > 0 and i % (batch_size * 10) == 0:
+                        info_msg(f"Saving intermediate progress for {file_path} ({i}/{len(chunks)} chunks)")
+                        try:
+                            self.save()
+                        except Exception as save_err:
+                            warning_msg(f"Failed intermediate save: {str(save_err)}")
+                
+                # Save after processing all chunks
+                try:
+                    self.save()
+                    success_msg(f"Added {added_chunks} chunks from {file_path} to embedding store")
+                    # Successfully added the file, return
+                    return
+                except Exception as save_error:
+                    error_msg(f"Failed to save after adding {file_path}: {str(save_error)}")
+                    # Try again if save failed
+                    retry_count += 1
+                
+            except Exception as e:
+                error_msg(f"Failed to add file {file_path} to embedding store: {str(e)}")
+                retry_count += 1
+                
+                if retry_count < max_retries:
+                    warning_msg(f"Retrying ({retry_count}/{max_retries})...")
+                    # Clean up and try again
+                    gc.collect()
+                    if self.device == 'cuda':
+                        try:
+                            torch.cuda.empty_cache()
+                        except:
+                            pass
+                else:
+                    error_msg(f"Failed to add {file_path} after {max_retries} attempts, giving up")
+                    return
     
     def _split_content(self, content: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
         """
@@ -885,11 +1004,27 @@ class EmbeddingStore:
         Returns:
             True if the file is already indexed, False otherwise
         """
-        # Optimize the check to stop as soon as a match is found
-        for entry in self.file_mapping:
-            if entry.get("file_path") == file_path:
-                return True
-        return False
+        try:
+            # Normalize file path for comparison (handle both forward/backslashes)
+            normalized_path = file_path.replace('\\', '/')
+            
+            # Handle case where we have no mapping
+            if not self.file_mapping:
+                return False
+                
+            # Optimize the check to stop as soon as a match is found
+            for entry in self.file_mapping:
+                entry_path = entry.get("file_path", "")
+                if entry_path:
+                    # Also normalize entry path
+                    entry_path = entry_path.replace('\\', '/')
+                    if entry_path == normalized_path:
+                        return True
+            return False
+        except Exception as e:
+            # If there's any error, log it and return False to be safe
+            warning_msg(f"Error checking if file exists in embedding store: {str(e)}")
+            return False
     
     def _get_all_files(self) -> List[str]:
         """
@@ -914,13 +1049,26 @@ class EmbeddingStore:
                     return []
             
             # Extract unique file paths
+            # CRITICAL FIX: Use a set to ensure we don't miss any files or duplicates
             unique_files = set()
-            for info in self.file_mapping:  # Changed from iterating over dict items to list items
-                if "file_path" in info:
-                    unique_files.add(info["file_path"])
             
-            logger.info(f"Found {len(unique_files)} unique files in embedding store")
-            return list(unique_files)
+            # Ensure we collect ALL file paths from the mapping
+            for info in self.file_mapping:
+                if isinstance(info, dict) and "file_path" in info:
+                    file_path = info["file_path"]
+                    if file_path and isinstance(file_path, str):
+                        # Normalize paths for consistency
+                        normalized_path = file_path.replace('\\', '/')
+                        unique_files.add(normalized_path)
+            
+            # Create final list sorted for consistency
+            result_files = sorted(list(unique_files))
+            
+            # Force debug message to verify this is working
+            print(f"DEBUG: Found {len(result_files)} unique files in embedding store")
+            logger.info(f"Found {len(result_files)} unique files in embedding store")
+            
+            return result_files
             
         except Exception as e:
             logger.error(f"Error retrieving files from embedding store: {str(e)}")

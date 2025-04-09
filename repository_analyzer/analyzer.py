@@ -72,12 +72,16 @@ class RepositoryAnalyzer:
         self.distributed = distributed
         self.memory_limit = memory_limit
         
+        # Set a very high max file size limit (100MB)
+        self.max_file_size = 100 * 1024 * 1024  # 100MB in bytes
+        
         # Check for available GPUs and configure distributed processing if not explicitly set
         if self.distributed is None:
             # Auto-detect if distributed processing should be enabled
             try:
                 if torch.cuda.is_available():
                     gpu_count = torch.cuda.device_count()
+                    info_msg(f"Detected {gpu_count} GPUs for repository analysis")
                     if gpu_count > 1:
                         # Automatically enable distributed processing for multi-GPU setups
                         self.distributed = True
@@ -95,6 +99,13 @@ class RepositoryAnalyzer:
                             # Also set environment variable for distributed to ensure other components use it 
                             update_env_file("DISTRIBUTED", "true")
                             update_env_file("GPU_IDS", ",".join(str(gpu_id) for gpu_id in self.gpu_ids))
+                            
+                    # Set environment variable to enable multi-GPU for FAISS if available
+                    if gpu_count > 1:
+                        os.environ["FAISS_MULTI_GPU"] = "1"
+                        info_msg("Enabled multi-GPU support for FAISS indexing")
+                    else:
+                        os.environ["FAISS_MULTI_GPU"] = "0"
             except ImportError:
                 # PyTorch not available, cannot use distributed processing
                 self.distributed = False
@@ -912,6 +923,16 @@ class RepositoryAnalyzer:
             Dictionary containing analysis results
         """
         try:
+            # Force print for debugging
+            print("CRITICAL DEBUG: Analyzer running with embedding_store:", self.embedding_store is not None)
+            if self.embedding_store:
+                # Verify embedding store is working properly
+                try:
+                    initial_files = self.embedding_store._get_all_files()
+                    print(f"CRITICAL DEBUG: Embedding store contains {len(initial_files)} files at start of analysis")
+                except Exception as e:
+                    print(f"CRITICAL DEBUG: Error checking embedding store: {str(e)}")
+            
             results = {
                 "components": [],
                 "data_flows": [],
@@ -937,6 +958,10 @@ class RepositoryAnalyzer:
                 
             logger.info(f"Analyzing files with extensions: {', '.join(supported_extensions)}")
             
+            # Special info for PHP projects with .inc files
+            if ".php" in supported_extensions and ".inc" in supported_extensions:
+                logger.info("Detected PHP project with .inc files - both file types will be analyzed and indexed")
+            
             # First pass: Count files to determine if repository is too large
             total_files_approx = 0
             is_large_repo = False
@@ -945,15 +970,11 @@ class RepositoryAnalyzer:
                 if any(i in root for i in ['.git', 'node_modules', '__pycache__', 'venv', '.idea']):
                     continue
                 total_files_approx += len(files)
-                if total_files_approx > 5000:  # Consider repos with >5000 files as large
-                    is_large_repo = True
-                    logger.warning(f"Large repository detected (>5000 files). Limiting analysis scope and disabling full embedding store")
-                    break
             
             # For large repositories, we'll use a more selective approach
             # With 100K context window, we can set these limits much higher
-            max_files_to_process = 50000 if is_large_repo else 100000  # Essentially unlimited
-            max_files_per_extension = 10000 if is_large_repo else 20000  # Essentially unlimited
+            max_files_to_process = 100000  # Removed conditional for large repos, just use the higher limit
+            max_files_per_extension = 20000  # Removed conditional for large repos, just use the higher limit
             
             logger.info(f"Repository size: approx. {total_files_approx} files. Using 100K context window to process up to {max_files_to_process} files")
             
@@ -1022,9 +1043,9 @@ class RepositoryAnalyzer:
                             results["architecture"]["file_types"][ext] = 0
                         results["architecture"]["file_types"][ext] += 1
                     
-                    # Add to our list of files to potentially process
-                    if is_supported:
-                        all_files.append((rel_path, file_path, ext))
+                    # Add ALL files to our list for processing - not just supported ones
+                    # This ensures all code files get indexed for RAG
+                    all_files.append((rel_path, file_path, ext))
             
             # Save directory structure
             results["architecture"]["directory_structure"] = dir_structure
@@ -1079,8 +1100,22 @@ class RepositoryAnalyzer:
             
             logger.info(f"Found {len(potential_entry_points)} potential entry points")
             
+            # Add GPU info
+            if self.embedding_store:
+                if hasattr(self.embedding_store, 'use_gpu_for_faiss') and self.embedding_store.use_gpu_for_faiss:
+                    gpu_id = getattr(self.embedding_store, 'gpu_id', 0)
+                    logger.info(f"Using GPU {gpu_id} acceleration for RAG indexing")
+                    if hasattr(self.embedding_store, 'model') and self.embedding_store.model is not None:
+                        device = self.embedding_store.model.device
+                        logger.info(f"Embedding model running on device: {device}")
+                else:
+                    logger.warning("GPU acceleration is NOT enabled for RAG indexing - this will be slower")
+                
+            # Log that all files will be indexed
+            logger.info(f"Indexing all files for RAG regardless of extension type or repository size")
+            
             # For large repositories, prioritize and select a subset of files
-            if is_large_repo or len(all_files) > max_files_to_process:
+            if len(all_files) > max_files_to_process:
                 logger.info(f"Repository has {len(all_files)} supported files. Prioritizing important files...")
                 
                 # Group files by extension
@@ -1153,21 +1188,59 @@ class RepositoryAnalyzer:
                             indexed_files += 1
                             continue
                             
-                        with open(file_path, 'rb') as f:
-                            content = f.read()
+                        # Skip very large binary files and common binary formats to avoid wasting storage
+                        file_size = os.path.getsize(file_path)
+                        if file_size > 10 * 1024 * 1024:  # 10MB is too large for effective RAG
+                            logger.info(f"Skipping very large file for indexing: {rel_path} ({file_size / 1024 / 1024:.2f} MB)")
+                            continue
+                            
+                        # Skip common binary formats that don't provide useful text
+                        binary_exts = ['.exe', '.dll', '.bin', '.zip', '.jar', '.war', '.class', '.pyc', '.o', '.so', '.dylib', 
+                                      '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.tiff', '.pdf', '.mp3', '.mp4', '.wav']
+                        if ext in binary_exts:
+                            logger.info(f"Skipping binary file: {rel_path}")
+                            continue
                         
-                        # Try to decode with utf-8, fallback to latin-1
-                        try:
-                            decoded_content = content.decode('utf-8', errors='replace')
-                        except UnicodeDecodeError:
-                            decoded_content = content.decode('latin-1', errors='replace')
+                        # Improved file reading that avoids loading entire files into memory
+                        with open(file_path, 'rb') as f:
+                            # Read first chunk to determine if it's text
+                            first_chunk = f.read(4096)  # Read 4KB to check
+                            
+                            # Skip file if it appears to be binary (check for null bytes)
+                            if b'\x00' in first_chunk:
+                                logger.info(f"Skipping likely binary file: {rel_path}")
+                                continue
+                            
+                            # Try to decode with utf-8, fallback to latin-1
+                            try:
+                                first_chunk_decoded = first_chunk.decode('utf-8', errors='replace')
+                                # Seek back to start
+                                f.seek(0)
+                                # Read in chunks to avoid memory issues
+                                decoded_content = ""
+                                chunk_size = 1024 * 1024  # 1MB chunks
+                                while True:
+                                    chunk = f.read(chunk_size)
+                                    if not chunk:
+                                        break
+                                    decoded_content += chunk.decode('utf-8', errors='replace')
+                            except UnicodeDecodeError:
+                                # Try latin-1 as fallback
+                                f.seek(0)
+                                decoded_content = ""
+                                chunk_size = 1024 * 1024  # 1MB chunks
+                                while True:
+                                    chunk = f.read(chunk_size)
+                                    if not chunk:
+                                        break
+                                    decoded_content += chunk.decode('latin-1', errors='replace')
                         
                         # Prepare metadata
                         metadata = {
                             "extension": ext,
                             "language": self._get_language_name(ext),
-                            "file_size": len(content),
-                            "is_supported": True,
+                            "file_size": os.path.getsize(file_path),
+                            "is_supported": ext in supported_extensions,
                             "path_components": rel_path.split(os.sep)
                         }
                         
@@ -1189,6 +1262,25 @@ class RepositoryAnalyzer:
             
             if skipped_test_files > 0:
                 logger.info(f"Skipped {skipped_test_files} test files from RAG indexing")
+                
+            # FORCE SAVE: Make sure all indexed files are saved immediately
+            if self.embedding_store and new_files > 0:
+                try:
+                    logger.info("Forcing save of embedding store after indexing")
+                    self.embedding_store.save()
+                    
+                    # Verify the save was successful by checking file count
+                    pre_save_files = indexed_files
+                    all_files_after_save = self.embedding_store._get_all_files()
+                    if len(all_files_after_save) < pre_save_files:
+                        logger.error(f"SAVE ERROR: Embedding store has fewer files after save ({len(all_files_after_save)}) than expected ({pre_save_files})")
+                        print(f"CRITICAL DEBUG: Embedding store has fewer files after save: {len(all_files_after_save)} vs {pre_save_files}")
+                    else:
+                        logger.info(f"Verified save successful: {len(all_files_after_save)} files in embedding store")
+                        print(f"CRITICAL DEBUG: Save successful with {len(all_files_after_save)} files")
+                except Exception as e:
+                    logger.error(f"Error forcing save of embedding store: {str(e)}")
+                    print(f"CRITICAL DEBUG: Error saving embedding store: {str(e)}")
 
             # Process files in chunks to avoid memory issues
             chunk_size = 100  # Process 100 files at a time
@@ -1210,6 +1302,36 @@ class RepositoryAnalyzer:
                     # Skip test files
                     if 'test' in rel_path.lower():
                         skipped_files += 1
+                        continue
+                    
+                    # If file isn't in a supported extension, we still want to index it for RAG
+                    # but we'll skip the parsing/AST extraction
+                    if ext not in supported_extensions:
+                        # Try to add the file to the embedding store for RAG
+                        if self.embedding_store:
+                            try:
+                                if not self.embedding_store.contains_file(rel_path):
+                                    with open(file_path, 'rb') as f:
+                                        content = f.read()
+                                    
+                                    # Try to decode with utf-8, fallback to latin-1
+                                    try:
+                                        decoded_content = content.decode('utf-8', errors='replace')
+                                    except UnicodeDecodeError:
+                                        decoded_content = content.decode('latin-1', errors='replace')
+                                    
+                                    # Add to embedding store
+                                    metadata = {
+                                        "extension": ext,
+                                        "language": self._get_language_name(ext),
+                                        "file_size": len(content),
+                                        "is_supported": False,
+                                        "path_components": rel_path.split(os.sep)
+                                    }
+                                    self.embedding_store.add_file(rel_path, decoded_content, metadata)
+                                    indexed_files += 1
+                            except Exception as e:
+                                logger.warning(f"Failed to index unsupported file {rel_path}: {str(e)}")
                         continue
                         
                     # Only try to parse files with supported extensions
@@ -1266,6 +1388,26 @@ class RepositoryAnalyzer:
                 except Exception as e:
                     logger.warning(f"Failed to build relationship graph: {str(e)}")
             
+            # Double-check the actual count of indexed files
+            actual_indexed_files = 0
+            if self.embedding_store:
+                try:
+                    all_files = self.embedding_store._get_all_files()
+                    actual_indexed_files = len(all_files)
+                    logger.info(f"Verified {actual_indexed_files} unique files in embedding store")
+                    
+                    # CRITICAL DEBUG OUTPUT
+                    print(f"CRITICAL DEBUG: Final embedding store contains {actual_indexed_files} unique files")
+                    print(f"CRITICAL DEBUG: First 10 files in embedding store: {all_files[:10]}")
+                    
+                    # If there's a mismatch, update the counter
+                    if actual_indexed_files != indexed_files:
+                        logger.warning(f"Indexed files counter ({indexed_files}) doesn't match actual count in embedding store ({actual_indexed_files})")
+                        indexed_files = actual_indexed_files
+                except Exception as e:
+                    logger.warning(f"Failed to verify indexed files count: {str(e)}")
+                    print(f"CRITICAL DEBUG: Failed to verify indexed files count: {str(e)}")
+            
             logger.info(f"Code analysis completed: {parsed_files} files parsed, {indexed_files} files indexed for RAG, {skipped_files} files skipped out of {total_files} total files")
             logger.info(f"Files matching primary language: {primary_language_files} ({(primary_language_files/total_files)*100:.1f}% of repository)")
             
@@ -1295,6 +1437,7 @@ class RepositoryAnalyzer:
             ".java": "Java",
             ".go": "Go",
             ".php": "PHP",
+            ".inc": "PHP",
             ".rb": "Ruby",
             ".c": "C",
             ".cpp": "C++",
