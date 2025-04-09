@@ -2475,14 +2475,14 @@ Pay special attention to:
                 device = torch.device(f"cuda:{i}")
                 # Get available memory for this GPU
                 total_memory = torch.cuda.get_device_properties(i).total_memory
-                # Calculate 60% of available memory for our dummy tensor (in bytes)
-                # We'll use 60% here to avoid OOM errors but still use a significant amount
-                mem_to_use = int(total_memory * 0.6)
+                # Calculate 90% of available memory for our dummy tensor (in bytes)
+                # We'll use 90% here to maximize GPU utilization with 24GB GPUs
+                mem_to_use = int(total_memory * 0.9)
                 
                 # Calculate tensor dimensions based on available memory
                 # Each float32 value is 4 bytes
                 tensor_size = int(math.sqrt(mem_to_use / 4 / 2))  # Divide by 4 (bytes) and 2 (matrices)
-                tensor_size = min(tensor_size, 20000)  # Cap at reasonable size
+                tensor_size = min(tensor_size, 40000)  # Increased cap for 24GB GPUs
                 
                 info_msg(f"Creating tensor of size {tensor_size}x{tensor_size} on GPU {i} (~{tensor_size*tensor_size*4/1024/1024:.2f} MB)")
                 

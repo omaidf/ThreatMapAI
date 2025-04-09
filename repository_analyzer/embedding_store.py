@@ -165,13 +165,13 @@ class EmbeddingStore:
                                     res = faiss.StandardGpuResources()
                                     # Configure the GPU resource to use more memory
                                     if hasattr(res, 'setTempMemory'):
-                                        # Try to allocate a larger amount of memory (80% of total GPU memory)
+                                        # Try to allocate a larger amount of memory (95% of total GPU memory)
                                         try:
                                             total_memory = torch.cuda.get_device_properties(i).total_memory
-                                            # Convert to MB and allocate 80%
-                                            alloc_memory = int(total_memory * 0.8 / (1024**2))
+                                            # Convert to MB and allocate 95%
+                                            alloc_memory = int(total_memory * 0.95 / (1024**2))
                                             res.setTempMemory(alloc_memory)
-                                            info_msg(f"Configured GPU {i} to use {alloc_memory} MB FAISS memory")
+                                            info_msg(f"Configured GPU {i} to use {alloc_memory} MB FAISS memory (95% of total)")
                                         except Exception as mem_e:
                                             warning_msg(f"Could not set GPU {i} memory: {str(mem_e)}")
                                     gpu_resources.append(res)
