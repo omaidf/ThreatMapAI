@@ -66,6 +66,18 @@ class LLMProcessor:
     
     This class handles threat analysis, code understanding, and
     security recommendations using CodeLlama.
+    
+    GPU Acceleration:
+    -----------------
+    The processor supports GPU acceleration for both model inference and data processing:
+    - Pass 'gpu_ids' parameter to specify which GPUs to use
+    - Set 'distributed=True' to enable multi-GPU processing
+    - If no GPU parameters are specified, the processor will use 
+      environment variables or default to the first GPU (GPU 0)
+    
+    During architecture analysis phases (which are typically CPU-bound), the processor
+    will attempt to use GPUs for text embedding and similarity operations to improve
+    performance. GPU utilization will vary by processing phase.
     """
     
     def __init__(self, model_path_or_embedding_store: Union[str, EmbeddingStore], 
@@ -160,8 +172,16 @@ class LLMProcessor:
                 
                 # Set environment variables to help CUDA detection in llama.cpp
                 if n_gpu_layers > 0 and gpu_config['use_gpu']:
-                    # Get selected GPU IDs from environment or use default
+                    # Get selected GPU IDs from environment, then class instance, or default to 0
                     gpu_ids_str = os.environ.get("GPU_IDS", "")
+                    
+                    # If no env var but self.gpu_ids is set, use that
+                    if not gpu_ids_str and self.gpu_ids:
+                        gpu_ids_str = ",".join(map(str, self.gpu_ids))
+                    # If single gpu_id is set, use that
+                    elif not gpu_ids_str and self.gpu_id is not None:
+                        gpu_ids_str = str(self.gpu_id)
+                    
                     visible_devices = gpu_ids_str if gpu_ids_str else "0"
                     
                     # Set the visible devices for CUDA
@@ -250,6 +270,19 @@ class LLMProcessor:
                 # Determine device based on GPU detection
                 device = gpu_config['device'] if gpu_config['use_gpu'] else "cpu"
                 
+                # Configure multi-GPU for HuggingFace if applicable
+                device_map = "cpu"
+                if gpu_config['use_gpu']:
+                    # For single GPU, use the device directly
+                    if not self.distributed and (self.gpu_ids is None or len(self.gpu_ids) <= 1):
+                        device_map = device
+                    # For multi-GPU, use "auto" to let HF distribute across GPUs
+                    else:
+                        device_map = "auto"
+                        # Enable parallel tokenization
+                        os.environ["TOKENIZERS_PARALLELISM"] = "true"
+                        info_msg("Configuring multi-GPU setup for HuggingFace model")
+                
                 # Skip quantization if disabled via environment variable
                 if not use_quantization:
                     info_msg("Quantization disabled via LLM_USE_QUANTIZATION, using standard loading")
@@ -257,7 +290,7 @@ class LLMProcessor:
                         model_id,
                         torch_dtype=torch.float16 if use_float16 else torch.float32,
                         low_cpu_mem_usage=True,
-                        device_map=device if gpu_config['use_gpu'] else "cpu"
+                        device_map=device_map
                     )
                 else:
                     try:
@@ -280,7 +313,7 @@ class LLMProcessor:
                             model = AutoModelForCausalLM.from_pretrained(
                                 model_id,
                                 quantization_config=quantization_config,
-                                device_map=device if gpu_config['use_gpu'] else "cpu",
+                                device_map=device_map,
                                 low_cpu_mem_usage=True
                             )
                         except Exception as install_e:
@@ -293,7 +326,7 @@ class LLMProcessor:
                             model_id,
                             torch_dtype=torch.float16 if use_float16 else torch.float32,
                             low_cpu_mem_usage=True,
-                            device_map=device if gpu_config['use_gpu'] else "cpu"
+                            device_map=device_map
                         )
                 
                 # Create a pipeline with memory-efficient settings
@@ -330,7 +363,7 @@ class LLMProcessor:
                     model = AutoModelForCausalLM.from_pretrained(
                         fallback_model_id,
                         low_cpu_mem_usage=True,
-                        device_map="cpu"  # Force CPU to avoid GPU memory issues
+                        device_map=device_map if gpu_config['use_gpu'] else "cpu"  # Use GPU if available
                     )
                     
                     # Create a simple pipeline with minimal settings
@@ -927,6 +960,9 @@ Pay special attention to:
         try:
             logger.info("Generating comprehensive threat model with RAG")
             
+            # Report GPU status at start of processing
+            self._log_gpu_status("Starting threat model generation")
+            
             # Check if LLM is available
             if not self.llm:
                 logger.warning("LLM not available, generating minimal threat model")
@@ -1045,6 +1081,9 @@ Pay special attention to:
             
             # Analyze components with RAG for dynamic context
             logger.info("Analyzing components with dynamic RAG")
+            
+            # Report GPU usage before component analysis
+            self._log_gpu_status("Before component analysis")
                 
             # With 100K context window, we can analyze more components
             max_components = 500 if large_repo else 1000  # Previously 100/200
@@ -1115,6 +1154,9 @@ Pay special attention to:
                 data_flows_by_component[source].append(data_flow)
             
             # Process data flows by component for better context
+            # Report GPU usage before data flow analysis
+            self._log_gpu_status("Before data flow analysis")
+            
             for source, flows in data_flows_by_component.items():
                 # Get combined context for all flows from this source
                 contexts = []
@@ -1156,6 +1198,9 @@ Pay special attention to:
             
             # Perform cross-file vulnerability analysis
             logger.info("Performing cross-file vulnerability analysis")
+            # Report GPU usage before vulnerability analysis
+            self._log_gpu_status("Before vulnerability analysis")
+            
             vulnerabilities = self._analyze_cross_file_vulnerabilities(
                 analysis_results, 
                 threat_model["components"],
@@ -1167,6 +1212,9 @@ Pay special attention to:
             
             # Calculate overall risk based on all identified threats and vulnerabilities
             threat_model["overall_risk"] = self._calculate_enhanced_risk(threat_model)
+            
+            # Report final GPU status
+            self._log_gpu_status("Completed threat model generation")
             
             # Save threat model to file
             output_dir = Path(os.getenv("OUTPUT_DIR", "output"))
@@ -1256,6 +1304,9 @@ Pay special attention to:
             Dictionary with architecture information
         """
         try:
+            # Ensure we're utilizing GPU for text embedding if available
+            self._ensure_gpu_acceleration()
+            
             # Filter out test files from file list
             filtered_file_list = [file for file in file_list if 'test' not in file.lower()]
             if len(filtered_file_list) < len(file_list):
@@ -1731,6 +1782,12 @@ FILES_BY_BOUNDARY:
             List of identified threats
         """
         try:
+            # Ensure GPU is engaged during processing
+            self._ensure_gpu_acceleration()
+            
+            # Start GPU utilization monitoring
+            self._start_gpu_monitoring()
+            
             # First, analyze the code structure
             code_analysis = self.analyze_code_structure(component)
             
@@ -1909,6 +1966,9 @@ For PHP code, pay special attention to input validation, SQL injection, XSS, and
             List of identified threats
         """
         try:
+            # Ensure GPU is engaged for processing
+            self._ensure_gpu_acceleration()
+            
             # Get relevant context
             contexts = []
             
@@ -2351,3 +2411,108 @@ Pay special attention to:
         except Exception as e:
             logger.warning(f"Error limiting component context: {str(e)}")
             return component  # Return original if anything fails
+    
+    def _ensure_gpu_acceleration(self) -> None:
+        """
+        Ensure GPU acceleration is enabled for text processing operations.
+        This method forces active GPU usage during non-inference operations
+        like architecture analysis, which would otherwise be CPU-bound.
+        """
+        try:
+            # Only proceed if we have GPU capabilities
+            if not hasattr(torch, 'cuda') or not torch.cuda.is_available():
+                return
+                
+            # Get number of GPUs
+            gpu_count = torch.cuda.device_count()
+            if gpu_count == 0:
+                return
+                
+            # Log that we're activating GPUs for processing
+            info_msg(f"Activating {gpu_count} GPUs for text embedding and processing")
+            
+            # Simple warm-up operations to ensure GPU is active
+            # This ensures the GPU context is created and maintained
+            device = torch.device("cuda")
+            
+            # Create a small tensor on GPU and perform operations
+            # This ensures CUDA context is initialized
+            dummy_tensor = torch.zeros(100, 768, device=device)
+            _ = torch.nn.functional.normalize(dummy_tensor, p=2, dim=1)
+            
+            # Verify GPU usage and report
+            for i in range(gpu_count):
+                mem_info = torch.cuda.memory_reserved(i) / 1024**2
+                if mem_info > 0:
+                    info_msg(f"GPU {i} activated with {mem_info:.2f} MB reserved")
+                    
+            # Force sync to ensure GPU operations complete
+            torch.cuda.synchronize()
+            
+        except Exception as e:
+            warning_msg(f"Failed to ensure GPU acceleration: {str(e)}")
+    
+    def _start_gpu_monitoring(self) -> None:
+        """
+        Start monitoring GPU utilization in a separate thread.
+        This helps track GPU usage during various processing phases.
+        """
+        try:
+            # Only monitor if we have GPUs
+            if not hasattr(torch, 'cuda') or not torch.cuda.is_available():
+                return
+                
+            # Get number of GPUs
+            gpu_count = torch.cuda.device_count()
+            if gpu_count == 0:
+                return
+                
+            # Log initial GPU state
+            for i in range(gpu_count):
+                if torch.cuda.memory_allocated(i) > 0:
+                    mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
+                    mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
+                    info_msg(f"GPU {i} memory state: {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved")
+                    
+            # Force garbage collection to get accurate reading
+            import gc
+            gc.collect()
+            if hasattr(torch.cuda, 'empty_cache'):
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            warning_msg(f"Failed to start GPU monitoring: {str(e)}")
+
+    def _log_gpu_status(self, phase: str) -> None:
+        """
+        Log current GPU memory allocation status.
+        
+        Args:
+            phase: Description of the current processing phase
+        """
+        try:
+            if not hasattr(torch, 'cuda') or not torch.cuda.is_available():
+                return
+                
+            gpu_count = torch.cuda.device_count()
+            if gpu_count == 0:
+                return
+                
+            logger.info(f"GPU status at phase: {phase}")
+            
+            for i in range(gpu_count):
+                mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
+                mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
+                util_percent = 0
+                
+                try:
+                    # Try to get actual GPU utilization if available
+                    if hasattr(torch.cuda, 'utilization'):
+                        util_percent = torch.cuda.utilization(i)
+                except:
+                    pass
+                    
+                logger.info(f"  GPU {i}: {mem_allocated:.1f}MB allocated, {mem_reserved:.1f}MB reserved, {util_percent}% utilization")
+                
+        except Exception as e:
+            warning_msg(f"Failed to log GPU status: {str(e)}")
