@@ -11,6 +11,7 @@ import logging
 import sys
 import subprocess
 import platform
+import math
 from typing import Dict, List, Optional, Any, Union
 from pathlib import Path
 from tqdm import tqdm
@@ -2472,9 +2473,21 @@ Pay special attention to:
             # Create more substantial tensors on all available GPUs to ensure they're utilized
             for i in range(gpu_count):
                 device = torch.device(f"cuda:{i}")
+                # Get available memory for this GPU
+                total_memory = torch.cuda.get_device_properties(i).total_memory
+                # Calculate 60% of available memory for our dummy tensor (in bytes)
+                # We'll use 60% here to avoid OOM errors but still use a significant amount
+                mem_to_use = int(total_memory * 0.6)
+                
+                # Calculate tensor dimensions based on available memory
+                # Each float32 value is 4 bytes
+                tensor_size = int(math.sqrt(mem_to_use / 4 / 2))  # Divide by 4 (bytes) and 2 (matrices)
+                tensor_size = min(tensor_size, 20000)  # Cap at reasonable size
+                
+                info_msg(f"Creating tensor of size {tensor_size}x{tensor_size} on GPU {i} (~{tensor_size*tensor_size*4/1024/1024:.2f} MB)")
+                
                 # Create a larger dummy tensor on each GPU and perform operations
-                # This helps activate the GPU more aggressively
-                dummy_tensor = torch.zeros(2000, 2000, device=device)
+                dummy_tensor = torch.zeros(tensor_size, tensor_size, device=device)
                 _ = torch.nn.functional.normalize(dummy_tensor, p=2, dim=1)
                 
                 # Second operation to ensure the GPU is fully engaged

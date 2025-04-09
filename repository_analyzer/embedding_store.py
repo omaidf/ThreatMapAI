@@ -159,10 +159,21 @@ class EmbeddingStore:
                                 # Clear CUDA cache first
                                 torch.cuda.empty_cache()
                                 
-                                # Create a list of GPU resources
+                                # Create a list of GPU resources with higher memory usage configuration
                                 gpu_resources = []
                                 for i in range(min(4, torch.cuda.device_count())):  # Limit to 4 GPUs 
                                     res = faiss.StandardGpuResources()
+                                    # Configure the GPU resource to use more memory
+                                    if hasattr(res, 'setTempMemory'):
+                                        # Try to allocate a larger amount of memory (80% of total GPU memory)
+                                        try:
+                                            total_memory = torch.cuda.get_device_properties(i).total_memory
+                                            # Convert to MB and allocate 80%
+                                            alloc_memory = int(total_memory * 0.8 / (1024**2))
+                                            res.setTempMemory(alloc_memory)
+                                            info_msg(f"Configured GPU {i} to use {alloc_memory} MB FAISS memory")
+                                        except Exception as mem_e:
+                                            warning_msg(f"Could not set GPU {i} memory: {str(mem_e)}")
                                     gpu_resources.append(res)
                                 
                                 # Create config for multi-GPU with careful options
