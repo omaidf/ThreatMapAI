@@ -1419,241 +1419,283 @@ Pay special attention to:
             security_boundaries = []
             boundary_files = {}
             
+            # Define initial batch size with adaptive reduction if needed
+            batch_size = 100
+            max_retry_count = 3
+            retry_count = 0
+            
             # Process files in batches, focusing on high priority files first
-            for batch_idx in range(0, len(file_list), 100):
-                batch_end = min(batch_idx + 100, len(file_list))
+            batch_idx = 0
+            while batch_idx < len(file_list):
+                batch_end = min(batch_idx + batch_size, len(file_list))
                 current_batch = file_list[batch_idx:batch_end]
                 
-                logger.info(f"Processing architecture batch {batch_idx//100 + 1}: files {batch_idx+1}-{batch_end} of {len(file_list)}")
+                logger.info(f"Processing architecture batch {batch_idx//batch_size + 1}: files {batch_idx+1}-{batch_end} of {len(file_list)} (batch size: {batch_size})")
+                
+                # Early escape if batch is empty
+                if not current_batch:
+                    logger.warning("Empty batch encountered, skipping")
+                    batch_idx += batch_size
                 
                 # For all batches after the first, we have reduced analysis scope
                 # to preserve important discoveries while adding new files
                 is_first_batch = (batch_idx == 0)
                 
-                # Limit entry points for non-first batches
-                batch_entry_points = entry_points if is_first_batch else entry_points[:3]
-                
-                # Limit file relationships for current batch
-                batch_relationships = {}
-                if file_relationships:
-                    # Only include relationships for files in this batch
-                    for file in current_batch:
-                        if file in file_relationships:
-                            # For first batch, include more relationships
-                            rel_limit = 5 if is_first_batch else 3
-                            related = [f for f in file_relationships[file] if f in current_batch][:rel_limit]
-                            if related:
-                                batch_relationships[file] = related
-                
-                # Format batch data for prompt
-                file_list_formatted = "\n".join([f"- {file}" for file in current_batch])
-                entry_points_formatted = "\n".join([f"- {ep}" for ep in batch_entry_points])
-                
-                # Format file relationships
-                relationships_formatted = []
-                for file, related in batch_relationships.items():
-                    if related:  # Only include files with actual relationships
-                        related_str = ", ".join(related)
-                        relationships_formatted.append(f"- {file} -> {related_str}")
-                
-                # Limit relationships to prevent token explosion
-                if len(relationships_formatted) > 20:
-                    relationships_formatted = relationships_formatted[:20]
-                    relationships_formatted.append("- ... (additional relationships omitted)")
+                try:
+                    # Limit entry points for non-first batches
+                    batch_entry_points = entry_points if is_first_batch else entry_points[:3]
                     
-                relationships_text = "\n".join(relationships_formatted)
-                
-                # Create the prompt - modified for incremental analysis
-                system_prompt = """You are an expert in software architecture and security analysis.
-Your task is to identify the architecture layers and security boundaries in a codebase.
-Be concise and focus on the most important security boundaries."""
-
-                # Modify human prompt based on whether this is the first batch
-                if is_first_batch:
-                    human_prompt = """
-I need you to analyze the architecture of a software project.
-
-Technology stack: {tech_stack}
-
-Key entry points:
-{entry_points}
-
-Here are some key files:
-{file_list}
-
-Some important file relationships:
-{file_relationships}
-
-Please identify:
-1. The overall architecture description (1-2 sentences)
-2. 2-4 key security boundaries/zones (e.g., frontend/backend, authenticated/unauthenticated, admin/user)
-3. Which files belong in which security boundaries
-
-Return your analysis in this format:
-DESCRIPTION:
-<1-2 sentence description>
-
-SECURITY_BOUNDARIES:
-- <boundary name>: <description>
-- <boundary name>: <description>
-
-FILES_BY_BOUNDARY:
-- <boundary name>: <comma-separated file list>
-- <boundary name>: <comma-separated file list>
-"""
-                else:
-                    # For subsequent batches, include previous findings and focus on new files
-                    human_prompt = """
-I need you to continue analyzing the architecture of a software project. 
-I've already analyzed some files and identified initial boundaries. Now I need you to look at additional files.
-
-Technology stack: {tech_stack}
-
-Previous findings:
-{previous_description}
-
-Previously identified security boundaries:
-{previous_boundaries}
-
-Additional files to analyze:
-{file_list}
-
-Some important file relationships:
-{file_relationships}
-
-Please:
-1. Update or refine the architecture description if needed
-2. Assign these additional files to existing boundaries or create new boundaries if necessary
-
-Return your analysis in this format:
-DESCRIPTION:
-<1-2 sentence updated description>
-
-SECURITY_BOUNDARIES:
-- <boundary name>: <description>
-- <boundary name>: <description>
-
-FILES_BY_BOUNDARY:
-- <boundary name>: <comma-separated file list>
-- <boundary name>: <comma-separated file list>
-"""
-
-                # Prepare the prompt based on batch
-                prompt_template = system_prompt if is_first_batch else system_prompt
-                
-                # Format the prompt parameters for this batch
-                if is_first_batch:
-                    prompt = ChatPromptTemplate.from_messages([
-                        ("system", system_prompt),
-                        ("human", human_prompt)
-                    ])
+                    # Limit file relationships for current batch
+                    batch_relationships = {}
+                    if file_relationships:
+                        # Only include relationships for files in this batch
+                        for file in current_batch:
+                            if file in file_relationships:
+                                # For first batch, include more relationships
+                                rel_limit = 5 if is_first_batch else 3
+                                related = [f for f in file_relationships[file] if f in current_batch][:rel_limit]
+                                if related:
+                                    batch_relationships[file] = related
                     
-                    chain = prompt | self.llm | StrOutputParser()
-                    result = chain.invoke({
-                        "tech_stack": tech_stack,
-                        "entry_points": entry_points_formatted,
-                        "file_list": file_list_formatted,
-                        "file_relationships": relationships_text
-                    })
-                else:
-                    # Format previous security boundaries for the prompt
-                    previous_boundaries_text = "\n".join([f"- {b['name']}: {b['description']}" for b in security_boundaries])
+                    # Format batch data for prompt
+                    file_list_formatted = "\n".join([f"- {file}" for file in current_batch])
+                    entry_points_formatted = "\n".join([f"- {ep}" for ep in batch_entry_points])
                     
-                    prompt = ChatPromptTemplate.from_messages([
-                        ("system", system_prompt),
-                        ("human", human_prompt)
-                    ])
+                    # Format file relationships
+                    relationships_formatted = []
+                    for file, related in batch_relationships.items():
+                        if related:  # Only include files with actual relationships
+                            related_str = ", ".join(related)
+                            relationships_formatted.append(f"- {file} -> {related_str}")
                     
-                    chain = prompt | self.llm | StrOutputParser()
-                    result = chain.invoke({
-                        "tech_stack": tech_stack,
-                        "previous_description": description,
-                        "previous_boundaries": previous_boundaries_text,
-                        "file_list": file_list_formatted,
-                        "file_relationships": relationships_text
-                    })
-                
-                # Parse the result
-                batch_description = self._extract_section(result, "DESCRIPTION")
-                
-                # Update overall description if meaningful
-                if batch_description and (not description or len(batch_description) > 10):
-                    description = batch_description
-                
-                # Extract security boundaries section
-                boundaries_section = self._extract_section(result, "SECURITY_BOUNDARIES")
-                
-                # Parse security boundaries
-                if boundaries_section and is_first_batch:
-                    # For first batch, use the boundaries as-is
-                    boundary_lines = boundaries_section.split("\n")
-                    for line in boundary_lines:
-                        line = line.strip()
-                        if line.startswith("- "):
-                            line = line[2:]  # Remove the "- " prefix
-                            if ":" in line:
-                                boundary_name, boundary_desc = line.split(":", 1)
-                                security_boundaries.append({
-                                    "name": boundary_name.strip(),
-                                    "description": boundary_desc.strip(),
-                                    "files": []  # Will fill this later
-                                })
-                elif boundaries_section and not is_first_batch:
-                    # For subsequent batches, merge with existing boundaries
-                    boundary_lines = boundaries_section.split("\n")
-                    for line in boundary_lines:
-                        line = line.strip()
-                        if line.startswith("- "):
-                            line = line[2:]  # Remove the "- " prefix
-                            if ":" in line:
-                                boundary_name, boundary_desc = line.split(":", 1)
-                                boundary_name = boundary_name.strip()
-                                
-                                # Check if this boundary already exists
-                                existing = False
-                                for boundary in security_boundaries:
-                                    if boundary["name"] == boundary_name:
-                                        existing = True
-                                        # Update description if new one is more detailed
-                                        if len(boundary_desc.strip()) > len(boundary["description"]):
-                                            boundary["description"] = boundary_desc.strip()
-                                        break
-                                
-                                # If not found, add as new boundary
-                                if not existing:
+                    # Limit relationships to prevent token explosion
+                    if len(relationships_formatted) > 20:
+                        relationships_formatted = relationships_formatted[:20]
+                        relationships_formatted.append("- ... (additional relationships omitted)")
+                        
+                    relationships_text = "\n".join(relationships_formatted)
+                    
+                    # Create the prompt - modified for incremental analysis
+                    system_prompt = """You are an expert in software architecture and security analysis.
+    Your task is to identify the architecture layers and security boundaries in a codebase.
+    Be concise and focus on the most important security boundaries."""
+                    
+                    # Modify human prompt based on whether this is the first batch
+                    if is_first_batch:
+                        human_prompt = """
+    I need you to analyze the architecture of a software project.
+    
+    Technology stack: {tech_stack}
+    
+    Key entry points:
+    {entry_points}
+    
+    Here are some key files:
+    {file_list}
+    
+    Some important file relationships:
+    {file_relationships}
+    
+    Please identify:
+    1. The overall architecture description (1-2 sentences)
+    2. 2-4 key security boundaries/zones (e.g., frontend/backend, authenticated/unauthenticated, admin/user)
+    3. Which files belong in which security boundaries
+    
+    Return your analysis in this format:
+    DESCRIPTION:
+    <1-2 sentence description>
+    
+    SECURITY_BOUNDARIES:
+    - <boundary name>: <description>
+    - <boundary name>: <description>
+    
+    FILES_BY_BOUNDARY:
+    - <boundary name>: <comma-separated file list>
+    - <boundary name>: <comma-separated file list>
+    """
+                    else:
+                        # For subsequent batches, include previous findings and focus on new files
+                        human_prompt = """
+    I need you to continue analyzing the architecture of a software project. 
+    I've already analyzed some files and identified initial boundaries. Now I need you to look at additional files.
+    
+    Technology stack: {tech_stack}
+    
+    Previous findings:
+    {previous_description}
+    
+    Previously identified security boundaries:
+    {previous_boundaries}
+    
+    Additional files to analyze:
+    {file_list}
+    
+    Some important file relationships:
+    {file_relationships}
+    
+    Please:
+    1. Update or refine the architecture description if needed
+    2. Assign these additional files to existing boundaries or create new boundaries if necessary
+    
+    Return your analysis in this format:
+    DESCRIPTION:
+    <1-2 sentence updated description>
+    
+    SECURITY_BOUNDARIES:
+    - <boundary name>: <description>
+    - <boundary name>: <description>
+    
+    FILES_BY_BOUNDARY:
+    - <boundary name>: <comma-separated file list>
+    - <boundary name>: <comma-separated file list>
+    """
+                    
+                    # Prepare the prompt based on batch
+                    prompt_template = system_prompt if is_first_batch else system_prompt
+                    
+                    # Format the prompt parameters for this batch
+                    if is_first_batch:
+                        prompt = ChatPromptTemplate.from_messages([
+                            ("system", system_prompt),
+                            ("human", human_prompt)
+                        ])
+                        
+                        chain = prompt | self.llm | StrOutputParser()
+                        try:
+                            # Add timeout to prevent hanging
+                            result = chain.invoke({
+                                "tech_stack": tech_stack,
+                                "entry_points": entry_points_formatted,
+                                "file_list": file_list_formatted,
+                                "file_relationships": relationships_text
+                            }, timeout=300)  # 5 minute timeout
+                        except Exception as e:
+                            logger.error(f"Error in LLM processing for batch {batch_idx//batch_size + 1}: {str(e)}")
+                            raise  # Re-raise to trigger batch retry logic
+                    else:
+                        # Format previous security boundaries for the prompt
+                        previous_boundaries_text = "\n".join([f"- {b['name']}: {b['description']}" for b in security_boundaries])
+                        
+                        prompt = ChatPromptTemplate.from_messages([
+                            ("system", system_prompt),
+                            ("human", human_prompt)
+                        ])
+                        
+                        chain = prompt | self.llm | StrOutputParser()
+                        try:
+                            # Add timeout to prevent hanging
+                            result = chain.invoke({
+                                "tech_stack": tech_stack,
+                                "previous_description": description,
+                                "previous_boundaries": previous_boundaries_text,
+                                "file_list": file_list_formatted,
+                                "file_relationships": relationships_text
+                            }, timeout=300)  # 5 minute timeout
+                        except Exception as e:
+                            logger.error(f"Error in LLM processing for batch {batch_idx//batch_size + 1}: {str(e)}")
+                            raise  # Re-raise to trigger batch retry logic
+                    
+                    # Parse the result
+                    batch_description = self._extract_section(result, "DESCRIPTION")
+                    
+                    # Update overall description if meaningful
+                    if batch_description and (not description or len(batch_description) > 10):
+                        description = batch_description
+                    
+                    # Extract security boundaries section
+                    boundaries_section = self._extract_section(result, "SECURITY_BOUNDARIES")
+                    
+                    # Parse security boundaries
+                    if boundaries_section and is_first_batch:
+                        # For first batch, use the boundaries as-is
+                        boundary_lines = boundaries_section.split("\n")
+                        for line in boundary_lines:
+                            line = line.strip()
+                            if line.startswith("- "):
+                                line = line[2:]  # Remove the "- " prefix
+                                if ":" in line:
+                                    boundary_name, boundary_desc = line.split(":", 1)
                                     security_boundaries.append({
                                         "name": boundary_name.strip(),
                                         "description": boundary_desc.strip(),
                                         "files": []  # Will fill this later
                                     })
-                
-                # Parse files by boundary
-                files_by_boundary_section = self._extract_section(result, "FILES_BY_BOUNDARY")
-                if files_by_boundary_section:
-                    boundary_files_lines = files_by_boundary_section.split("\n")
-                    for line in boundary_files_lines:
-                        line = line.strip()
-                        if line.startswith("- "):
-                            line = line[2:]  # Remove the "- " prefix
-                            if ":" in line:
-                                boundary_name, file_list_str = line.split(":", 1)
-                                boundary_name = boundary_name.strip()
-                                
-                                # Find the boundary in our list
-                                for boundary in security_boundaries:
-                                    if boundary["name"] == boundary_name:
-                                        # Parse comma-separated file list
-                                        new_files = [f.strip() for f in file_list_str.split(",")]
-                                        
-                                        # Add to existing files, avoiding duplicates
-                                        existing_files = boundary["files"]
-                                        for new_file in new_files:
-                                            if new_file and new_file not in existing_files:
-                                                existing_files.append(new_file)
-                                        
-                                        # Update the boundary
-                                        boundary["files"] = existing_files
-                                        break
+                    elif boundaries_section and not is_first_batch:
+                        # For subsequent batches, merge with existing boundaries
+                        boundary_lines = boundaries_section.split("\n")
+                        for line in boundary_lines:
+                            line = line.strip()
+                            if line.startswith("- "):
+                                line = line[2:]  # Remove the "- " prefix
+                                if ":" in line:
+                                    boundary_name, boundary_desc = line.split(":", 1)
+                                    boundary_name = boundary_name.strip()
+                                    
+                                    # Check if this boundary already exists
+                                    existing = False
+                                    for boundary in security_boundaries:
+                                        if boundary["name"] == boundary_name:
+                                            existing = True
+                                            # Update description if new one is more detailed
+                                            if len(boundary_desc.strip()) > len(boundary["description"]):
+                                                boundary["description"] = boundary_desc.strip()
+                                            break
+                                    
+                                    # If not found, add as new boundary
+                                    if not existing:
+                                        security_boundaries.append({
+                                            "name": boundary_name.strip(),
+                                            "description": boundary_desc.strip(),
+                                            "files": []  # Will fill this later
+                                        })
+                    
+                    # Parse files by boundary
+                    files_by_boundary_section = self._extract_section(result, "FILES_BY_BOUNDARY")
+                    if files_by_boundary_section:
+                        boundary_files_lines = files_by_boundary_section.split("\n")
+                        for line in boundary_files_lines:
+                            line = line.strip()
+                            if line.startswith("- "):
+                                line = line[2:]  # Remove the "- " prefix
+                                if ":" in line:
+                                    boundary_name, file_list_str = line.split(":", 1)
+                                    boundary_name = boundary_name.strip()
+                                    
+                                    # Find the boundary in our list
+                                    for boundary in security_boundaries:
+                                        if boundary["name"] == boundary_name:
+                                            # Parse comma-separated file list
+                                            new_files = [f.strip() for f in file_list_str.split(",")]
+                                            
+                                            # Add to existing files, avoiding duplicates
+                                            existing_files = boundary["files"]
+                                            for new_file in new_files:
+                                                if new_file and new_file not in existing_files:
+                                                    existing_files.append(new_file)
+                                            
+                                            # Update the boundary
+                                            boundary["files"] = existing_files
+                                            break
+                    
+                    # Successfully processed this batch, move to next
+                    batch_idx += batch_size
+                    retry_count = 0  # Reset retry count on success
+                    
+                except Exception as e:
+                    logger.error(f"Error processing batch {batch_idx//batch_size + 1}: {str(e)}")
+                    retry_count += 1
+                    
+                    if retry_count >= max_retry_count:
+                        # If we've retried this batch multiple times, reduce batch size and try again
+                        new_batch_size = max(10, batch_size // 2)  # Reduce batch size but keep minimum of 10
+                        logger.warning(f"Reducing batch size from {batch_size} to {new_batch_size} after {retry_count} failed attempts")
+                        batch_size = new_batch_size
+                        retry_count = 0  # Reset retry counter for new batch size
+                        
+                        if batch_size == 10 and retry_count >= max_retry_count:
+                            logger.error("Even smallest batch size failed, skipping problematic batch")
+                            batch_idx += batch_size  # Skip this problematic batch
+                            retry_count = 0  # Reset retry counter
             
             # Create architecture result
             architecture = {
