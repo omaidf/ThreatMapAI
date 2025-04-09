@@ -255,7 +255,7 @@ class LLMProcessor:
                     seed=42,  # Set a fixed seed for reproducibility
                     use_mlock=True,  # Use mlock to keep the model in memory
                     n_threads=int(os.cpu_count() * 0.75) if os.cpu_count() else 4,  # Use 75% of available CPU cores
-                    **({"gpu_vram_limited": memory_limit_mb} if memory_limit_mb else {})  # Add memory limit if set
+                    model_kwargs={"gpu_vram_limited": memory_limit_mb} if memory_limit_mb else {}  # Add memory limit properly via model_kwargs
                 )
                 
                 success_msg("Successfully loaded model using LlamaCpp")
