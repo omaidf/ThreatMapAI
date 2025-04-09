@@ -172,17 +172,28 @@ class LLMProcessor:
                     memory_limit_mb = int(self.memory_limit * 1024)
                     info_msg(f"Using user-specified memory limit: {self.memory_limit:.2f} GB ({memory_limit_mb} MiB)")
                 elif n_gpu_layers > 0 and gpu_config['use_gpu']:
-                    # For RTX A5000 GPUs (24GB), use 95% of memory to maximize usage
-                    rtx_a5000_memory = 24564  # MiB from nvidia-smi output
-                    memory_limit_mb = int(rtx_a5000_memory * 0.95)  # Use 95% of available memory
-                    info_msg(f"Setting memory limit to 95% of RTX A5000 memory: {memory_limit_mb} MiB")
+                    # Dynamically detect available GPU memory and use 80% of it
+                    try:
+                        import torch
+                        gpu_id = 0  # Default to first GPU
+                        if self.gpu_id is not None:
+                            gpu_id = self.gpu_id
+                        elif self.gpu_ids and len(self.gpu_ids) > 0:
+                            gpu_id = self.gpu_ids[0]  # Use first GPU in the list
+                            
+                        total_memory = torch.cuda.get_device_properties(gpu_id).total_memory / (1024 * 1024)  # Convert to MiB
+                        memory_limit_mb = int(total_memory * 0.8)  # Use 80% of available memory
+                        info_msg(f"Setting memory limit to 80% of detected GPU memory: {memory_limit_mb} MiB (Total: {int(total_memory)} MiB)")
+                    except Exception as e:
+                        # Fallback to default if detection fails
+                        rtx_a5000_memory = 24564  # MiB default for RTX A5000
+                        memory_limit_mb = int(rtx_a5000_memory * 0.8)
+                        warning_msg(f"Failed to detect GPU memory: {str(e)}")
+                        warning_msg(f"Falling back to default memory limit: {memory_limit_mb} MiB (80% of 24GB)")
                     
-                    # If specific GPU IDs are set, adjust memory limit based on GPU count
+                    # In multi-GPU setups, we'll allocate the same percentage to each GPU
                     if self.gpu_ids and len(self.gpu_ids) > 1:
-                        # For multi-GPU, use higher per-GPU memory to better utilize resources
-                        # When using multiple GPUs, memory is divided across them
-                        memory_limit_mb = int(memory_limit_mb / len(self.gpu_ids))
-                        info_msg(f"Adjusted per-GPU memory limit for {len(self.gpu_ids)} GPUs: {memory_limit_mb} MiB each")
+                        info_msg(f"Using 80% memory allocation for each of the {len(self.gpu_ids)} GPUs")
                 
                 temperature = float(get_env_variable("LLM_TEMPERATURE", "0.7"))
                 max_tokens = int(get_env_variable("LLM_MAX_TOKENS", "4096"))
