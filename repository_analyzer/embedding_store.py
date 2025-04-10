@@ -21,6 +21,7 @@ import torch
 from sentence_transformers import SentenceTransformer
 import sentence_transformers.util
 from langchain_core.vectorstores import VectorStore
+from transformers import AutoModel, AutoTokenizer
 
 # Import utility modules
 from utils.common import success_msg, error_msg, warning_msg, info_msg
@@ -84,27 +85,33 @@ class EmbeddingStore:
         if self.device == 'cuda' and gpu_id is not None and torch.cuda.is_available():
             if gpu_id < torch.cuda.device_count():
                 torch.cuda.set_device(gpu_id)
-                info_msg(f"Using GPU {gpu_id} for sentence transformers")
+                info_msg(f"Using GPU {gpu_id} for transformers")
             else:
                 warning_msg(f"Specified GPU {gpu_id} not available, using default GPU")
         
-        # Initialize the sentence transformer model for embeddings
+        # Initialize the embedding model
         try:
             if self.device == 'cuda':
                 device_str = f'cuda:{self.gpu_id}' if self.gpu_id is not None else 'cuda'
             else:
                 device_str = 'cpu'
             
-            # Get embedding model name from environment or use default
-            embedding_model = get_env_variable("EMBEDDING_MODEL", "microsoft/codebert-base")
-            self.model = SentenceTransformer(embedding_model, device=device_str)
-            self.vector_size = self.model.get_sentence_embedding_dimension()
-            info_msg(f"Embedding model initialized with {embedding_model}, dimension {self.vector_size} on {device_str}")
+            # Hardcode CodeBERT as the embedding model
+            self.embedding_model_name = "microsoft/codebert-base"
+            
+            # Load CodeBERT model and tokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(self.embedding_model_name)
+            self.model = AutoModel.from_pretrained(self.embedding_model_name)
+            self.model.to(device_str)
+            # CodeBERT has 768 dimensions
+            self.vector_size = 768
+            info_msg(f"CodeBERT model initialized with dimension {self.vector_size} on {device_str}")
         except Exception as e:
-            warning_msg(f"Failed to initialize SentenceTransformer: {str(e)}")
+            warning_msg(f"Failed to initialize CodeBERT embedding model: {str(e)}")
             self.model = None
+            self.tokenizer = None
             # Set a default vector size for FAISS initialization
-            self.vector_size = 384  # Default dimension for embeddings
+            self.vector_size = 768  # Default dimension for embeddings
         
         # Set up FAISS index - handle errors gracefully
         try:
@@ -476,17 +483,20 @@ class EmbeddingStore:
                     if self.device == 'cuda' and hasattr(self, 'gpu_id'):
                         device_str = f"cuda:{self.gpu_id}"
                     
-                    # Get embedding model name from environment or use default
-                    embedding_model = get_env_variable("EMBEDDING_MODEL", "microsoft/codebert-base")
-                    self.model = SentenceTransformer(embedding_model, device=device_str)
-                    self.vector_size = self.model.get_sentence_embedding_dimension()
-                    info_msg(f"Reinitialized model with {embedding_model} on {device_str}")
+                    # Hardcode to use CodeBERT
+                    self.embedding_model_name = "microsoft/codebert-base"
+                    self.tokenizer = AutoTokenizer.from_pretrained(self.embedding_model_name)
+                    self.model = AutoModel.from_pretrained(self.embedding_model_name)
+                    self.model.to(device_str)
+                    # CodeBERT has 768 dimensions
+                    self.vector_size = 768
+                    info_msg(f"CodeBERT model reinitialized with dimension {self.vector_size} on {device_str}")
                 except Exception as e:
-                    logger.warning(f"Failed to initialize SentenceTransformer: {str(e)}")
+                    logger.warning(f"Failed to initialize CodeBERT model: {str(e)}")
                     self.model = None
                     # Set default vector size if we don't have it
                     if not hasattr(self, 'vector_size'):
-                        self.vector_size = 384  # Standard dimension for embeddings
+                        self.vector_size = 768  # Standard dimension for embeddings
             
             # Initialize the index (will handle failures internally)
             try:
@@ -522,7 +532,7 @@ class EmbeddingStore:
     
     def _encode_text(self, texts: List[str]) -> np.ndarray:
         """
-        Encode text to embeddings, with fallback for when the model is None.
+        Encode text to embeddings using CodeBERT.
         
         Args:
             texts: List of texts to encode
@@ -535,9 +545,9 @@ class EmbeddingStore:
             return np.zeros((0, self.vector_size), dtype=np.float32)
             
         # Check if model exists and is initialized properly
-        if self.model is None:
+        if self.model is None or self.tokenizer is None:
             # If we don't have a model, return zeros and try to reinitialize
-            warning_msg("Model not initialized! Using dummy embeddings (zeros)")
+            warning_msg("CodeBERT model not initialized! Using dummy embeddings (zeros)")
             
             # Try to reinitialize the model
             try:
@@ -545,12 +555,14 @@ class EmbeddingStore:
                 if self.device == 'cuda' and hasattr(self, 'gpu_id'):
                     device_str = f"cuda:{self.gpu_id}"
                 
-                # Get embedding model name from environment or use default
-                embedding_model = get_env_variable("EMBEDDING_MODEL", "microsoft/codebert-base")
-                self.model = SentenceTransformer(embedding_model, device=device_str)
-                info_msg(f"Successfully reinitialized model with {embedding_model} on {device_str}")
+                # Hardcode CodeBERT model
+                self.embedding_model_name = "microsoft/codebert-base"
+                self.tokenizer = AutoTokenizer.from_pretrained(self.embedding_model_name)
+                self.model = AutoModel.from_pretrained(self.embedding_model_name)
+                self.model.to(device_str)
+                info_msg(f"CodeBERT model reinitialized on {device_str}")
             except Exception as e:
-                error_msg(f"Failed to reinitialize model: {str(e)}")
+                error_msg(f"Failed to reinitialize CodeBERT model: {str(e)}")
                 
             # Still return zeros this time
             return np.zeros((len(texts), self.vector_size), dtype=np.float32)
@@ -569,27 +581,27 @@ class EmbeddingStore:
                 else:
                     valid_texts.append(text)
             
+            # CodeBERT specific encoding
             if self.device == 'cpu':
                 # Process on CPU
                 all_embeddings = []
                 for text in valid_texts:
                     try:
-                        single_embedding = self.model.encode(
-                            [text], 
-                            show_progress_bar=False,
-                            convert_to_tensor=False,
-                            normalize_embeddings=False,
-                            batch_size=1
-                        )
+                        # Tokenize and extract embeddings
+                        inputs = self.tokenizer(text, padding=True, truncation=True, return_tensors="pt", max_length=512)
+                        with torch.no_grad():
+                            outputs = self.model(**inputs)
+                        # Use CLS token embedding as the sentence embedding
+                        single_embedding = outputs.last_hidden_state[:, 0, :].cpu().numpy()
                         all_embeddings.append(single_embedding[0])
                     except Exception as chunk_error:
-                        warning_msg(f"Error encoding chunk: {str(chunk_error)}")
+                        warning_msg(f"Error encoding chunk with CodeBERT: {str(chunk_error)}")
                         # Add zeros for failed chunks
                         all_embeddings.append(np.zeros(self.vector_size, dtype=np.float32))
                 
                 result = np.vstack(all_embeddings)
             else:
-                # GPU processing with small batches and error handling
+                # GPU processing with small batches
                 try:
                     # Use smaller batch size to avoid CUDA OOM
                     batch_size = 8
@@ -599,16 +611,19 @@ class EmbeddingStore:
                     for i in range(0, len(valid_texts), batch_size):
                         batch = valid_texts[i:i+batch_size]
                         try:
-                            batch_embeddings = self.model.encode(
-                                batch,
-                                show_progress_bar=False,
-                                convert_to_tensor=False,
-                                normalize_embeddings=False,
-                                batch_size=batch_size
-                            )
+                            # Tokenize and extract embeddings
+                            inputs = self.tokenizer(batch, padding=True, truncation=True, 
+                                                    return_tensors="pt", max_length=512)
+                            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+                            
+                            with torch.no_grad():
+                                outputs = self.model(**inputs)
+                            
+                            # Use CLS token embedding as the sentence embedding
+                            batch_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
                             all_embeddings.append(batch_embeddings)
                         except Exception as batch_error:
-                            warning_msg(f"Error encoding batch: {str(batch_error)}")
+                            warning_msg(f"Error encoding batch with CodeBERT: {str(batch_error)}")
                             # Add zeros for failed batch
                             batch_zeros = np.zeros((len(batch), self.vector_size), dtype=np.float32)
                             all_embeddings.append(batch_zeros)
@@ -620,7 +635,7 @@ class EmbeddingStore:
                         # Fallback if all batches failed
                         result = np.zeros((len(valid_texts), self.vector_size), dtype=np.float32)
                 except Exception as gpu_error:
-                    warning_msg(f"GPU encoding failed: {str(gpu_error)}. Falling back to zeros.")
+                    warning_msg(f"GPU encoding with CodeBERT failed: {str(gpu_error)}. Falling back to zeros.")
                     result = np.zeros((len(valid_texts), self.vector_size), dtype=np.float32)
             
             # Normalize manually (L2 normalization)
