@@ -352,123 +352,41 @@ def fix_sentence_transformers():
         return False
 
 def install_faiss():
-    """Install FAISS with GPU support if available"""
-    print_status("Installing FAISS for vector search...")
-    
-    # First uninstall any existing faiss installations to avoid conflicts
-    print_status("Removing any existing FAISS installations...")
-    run_command(f"{PYTHON_CMD} -m pip uninstall -y faiss faiss-cpu faiss-gpu")
-    
-    # First ensure we have a compatible NumPy version (< 2.0)
-    print_status("Installing compatible NumPy for FAISS...")
-    run_command(f"{PYTHON_CMD} -m pip install 'numpy<2.0.0' --force-reinstall")
-    
-    # Check if PyTorch with CUDA is available for GPU version
-    cuda_available = False
-    multi_gpu = False
-    gpu_count = 0
-    print_status("Checking for CUDA/GPU availability...")
+    """Check if FAISS with GPU support is available"""
+    print_status("Checking FAISS for vector search...")
     
     try:
-        import torch
-        if torch.cuda.is_available():
-            cuda_available = True
-            gpu_count = torch.cuda.device_count()
-            if gpu_count > 1:
-                multi_gpu = True
-            
-            gpu_info = []
-            for i in range(gpu_count):
-                gpu_name = torch.cuda.get_device_name(i)
-                total_memory = torch.cuda.get_device_properties(i).total_memory / (1024**3)  # GB
-                gpu_info.append(f"GPU {i}: {gpu_name} ({total_memory:.1f} GB)")
-            
-            print_success(f"Found {gpu_count} GPUs: {', '.join(gpu_info)}")
-    except ImportError:
-        # If torch isn't installed, check for CUDA via system
-        if shutil.which("nvcc") or os.path.exists("/usr/local/cuda"):
-            cuda_available = True
-            print_success("CUDA detected via nvcc/cuda directory! Will install GPU-enabled FAISS.")
-        else:
-            print_status("No CUDA detected, using CPU version of FAISS.")
-    
-    # Check for Apple Silicon MPS support
-    mps_available = False
-    try:
-        import torch
-        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            mps_available = True
-            print_success("Apple Silicon MPS support detected!")
-    except:
-        pass
-    
-    # Install appropriate FAISS version
-    if cuda_available:
-        # Install PyTorch with CUDA first if needed
-        try:
-            import torch
-        except ImportError:
-            print_status("Installing PyTorch with CUDA support first...")
-            run_command(f"{PYTHON_CMD} -m pip install torch --index-url https://download.pytorch.org/whl/cu118")
-        
-        # Install faiss-gpu with specific version 1.7.2
-        print_status("Installing FAISS with GPU support (version 1.7.2)...")
-        
-        # Try installation with --no-deps first to avoid dependency issues
-        success, _ = run_command(f"{PYTHON_CMD} -m pip install -q faiss-gpu==1.7.2 --no-deps")
-        if not success:
-            print_status("Trying alternative installation method...")
-            success, _ = run_command(f"{PYTHON_CMD} -m pip install -q faiss-gpu==1.7.2")
-        
-        # Verify FAISS has expected attributes
-        try:
-            import faiss
-            if hasattr(faiss, 'IndexFlatL2'):
-                print_success("FAISS GPU installation successful and verified!")
-            else:
-                print_warning("FAISS installed but missing IndexFlatL2. Falling back to CPU version.")
-                cuda_available = False
-        except ImportError:
-            print_warning("Failed to import FAISS-GPU. Falling back to CPU version.")
-            cuda_available = False
-    
-    if not cuda_available or not hasattr(faiss, 'IndexFlatL2'):
-        # Install CPU version at specific version 1.10.0
-        print_status("Installing FAISS CPU version 1.10.0...")
-        success, _ = run_command(f"{PYTHON_CMD} -m pip install -q faiss-cpu==1.10.0 --force-reinstall")
-        if not success:
-            print_status("Trying alternative installation method...")
-            run_command(f"{PYTHON_CMD} -m pip install -q faiss-cpu==1.10.0 --force-reinstall --no-deps")
-            run_command(f"{PYTHON_CMD} -m pip install 'numpy<2.0.0'")  # Ensure numpy is installed
-            
-    # Final verification
-    try:
+        # Try to import faiss
         import faiss
-        if hasattr(faiss, 'IndexFlatL2'):
-            if cuda_available:
-                print_success("FAISS-GPU 1.7.2 installation verified successfully!")
+        
+        # Check if FAISS has GPU support
+        cuda_available = hasattr(faiss, 'get_num_gpus') and faiss.get_num_gpus() > 0
+        has_indexflatl2 = hasattr(faiss, 'IndexFlatL2')
+        
+        if cuda_available:
+            gpu_count = faiss.get_num_gpus()
+            
+            if has_indexflatl2:
+                print_success(f"FAISS-GPU is installed with {gpu_count} GPUs and IndexFlatL2 support")
+                return True
             else:
-                print_success("FAISS-CPU 1.10.0 installation verified successfully!")
-            
-            # Set up FAISS multi-GPU support if available
-            if multi_gpu:
-                print_status(f"Setting up FAISS for multi-GPU operation with {gpu_count} GPUs...")
-                with open(".env", "a") as f:
-                    f.write("FAISS_MULTI_GPU=1\n")
-                    f.write("FAISS_USE_SHARDING=1\n")
-                print_success("FAISS configured for multi-GPU operation")
-            
+                print_warning("FAISS-GPU is installed but missing IndexFlatL2 attribute")
+                return False
+        elif has_indexflatl2:
+            print_status("FAISS CPU version is installed with IndexFlatL2 support")
             return True
         else:
-            print_error("FAISS installation is incomplete (missing IndexFlatL2)")
-            print_status("Attempting one more installation with exact version...")
-            if cuda_available:
-                run_command(f"{PYTHON_CMD} -m pip install -q faiss-gpu==1.7.2 --force-reinstall")
-            else:
-                run_command(f"{PYTHON_CMD} -m pip install -q faiss-cpu==1.10.0 --force-reinstall")
+            print_warning("FAISS is installed but missing required functionality")
             return False
-    except ImportError as e:
-        print_error(f"FAISS installation failed: {str(e)}")
+            
+    except ImportError:
+        print_warning("FAISS is not installed")
+        print_status("To use vector search capabilities, you need to install FAISS:")
+        print_status("  - For GPU support: pip install faiss-gpu==1.7.2")
+        print_status("  - For CPU only: pip install faiss-cpu==1.10.0")
+        return False
+    except Exception as e:
+        print_error(f"Error checking FAISS installation: {str(e)}")
         return False
 
 def install_llama_cpp_python():
@@ -802,11 +720,19 @@ def install_dependencies():
         current_step += 1
         show_progress(total_steps, current_step, "Tree-sitter already installed")
     
-    # Install FAISS for vector search if needed
+    # Install faiss for vector search if needed
     if not is_already_installed("faiss_cpu") and not is_already_installed("faiss_gpu"):
         current_step += 1
-        show_progress(total_steps, current_step, "Installing FAISS for vector search")
-        install_faiss()
+        show_progress(total_steps, current_step, "Checking FAISS for vector search")
+        
+        # Check FAISS installation
+        if install_faiss():
+            print_success("FAISS is already installed.")
+        else:
+            print_warning("FAISS is not installed. Vector search functionality will be limited.")
+            print_warning("To install FAISS, run one of the following commands:")
+            print_warning("  - For GPU support: pip install faiss-gpu==1.7.2")
+            print_warning("  - For CPU only: pip install faiss-cpu==1.10.0")
     else:
         current_step += 1
         show_progress(total_steps, current_step, "FAISS already installed")

@@ -157,15 +157,11 @@ def create_embedding_store(try_load: bool = True, device: Optional[str] = None, 
                 gpu_supported = hasattr(faiss, 'StandardGpuResources')
                 
                 if not gpu_supported:
-                    info_msg("FAISS GPU support not detected. Installing faiss-gpu...")
-                    # Use our centralized function for FAISS-GPU installation
-                    if install_faiss_gpu():
-                        success_msg("Successfully installed faiss-gpu for CUDA")
-                    else:
-                        warning_msg("Failed to install faiss-gpu, will use CPU for vector search")
+                    info_msg("FAISS GPU support not detected.")
+                    warning_msg("Vector search will use CPU only. For GPU acceleration, install faiss-gpu.")
             except ImportError:
-                # If faiss isn't imported at all, we'll install it below
-                pass
+                # If faiss isn't imported at all, warn about it
+                warning_msg("FAISS is not installed. Vector search functionality will be limited.")
 
         # Configure the embedding store
         config = {}
@@ -204,26 +200,11 @@ def create_embedding_store(try_load: bool = True, device: Optional[str] = None, 
         return embedding_store
     except ImportError as e:
         if "faiss" in str(e):
-            error_msg("FAISS is not installed. Installing CPU version...")
-            try:
-                # First check if we should install GPU version instead
-                try:
-                    if torch.cuda.is_available() and not use_cpu:
-                        info_msg("CUDA detected, installing GPU version of FAISS...")
-                        install_faiss_gpu()
-                        info_msg("FAISS-GPU installed successfully. Retrying...")
-                    else:
-                        subprocess.check_call([sys.executable, "-m", "pip", "install", "faiss-cpu"])
-                        info_msg("FAISS-CPU installed successfully. Retrying...")
-                except ImportError:
-                    # Torch not available, install CPU version
-                    subprocess.check_call([sys.executable, "-m", "pip", "install", "faiss-cpu"])
-                    info_msg("FAISS-CPU installed successfully. Retrying...")
-                return create_embedding_store(try_load, device, gpu_id)
-            except Exception as install_error:
-                error_msg(f"Failed to install FAISS: {str(install_error)}")
-                error_msg("Please run: pip install faiss-cpu")
-                return None
+            error_msg("FAISS is not installed.")
+            error_msg("To use vector search capabilities, please install:")
+            error_msg("  - For GPU support: pip install faiss-gpu==1.7.2")
+            error_msg("  - For CPU only: pip install faiss-cpu==1.10.0")
+            return None
         else:
             error_msg(f"Failed to initialize embedding store: {str(e)}")
             return None

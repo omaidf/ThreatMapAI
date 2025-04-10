@@ -296,89 +296,34 @@ def detect_gpu_capabilities(force_gpu: bool = False, force_cpu: bool = False) ->
 
 def install_faiss_gpu() -> bool:
     """
-    Install the FAISS-GPU package with version 1.7.2 which is known to work best.
+    Check if the FAISS-GPU package is installed.
     
     Returns:
-        True if installation was successful, False otherwise
+        True if FAISS-GPU is installed, False otherwise
     """
     try:
-        # First unload faiss if it's already loaded
-        if 'faiss' in sys.modules:
-            del sys.modules['faiss']
-        
-        # Completely clear any faiss related modules
-        for module_name in list(sys.modules.keys()):
-            if module_name == 'faiss' or module_name.startswith('faiss.'):
-                del sys.modules[module_name]
-        
-        # Check CUDA version to determine compatibility
-        cuda_version = None
-        if torch.cuda.is_available():
-            cuda_version = torch.version.cuda
-            info_msg(f"Detected CUDA version: {cuda_version}")
-        else:
-            warning_msg("No CUDA available, cannot install FAISS-GPU")
-            return False
-        
-        # We'll use version 1.7.2 for all CUDA versions as specified
-        package = "faiss-gpu==1.7.2"
-        
-        # First uninstall any existing faiss packages
-        info_msg("Uninstalling any existing FAISS packages...")
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "-y", "faiss", "faiss-cpu", "faiss-gpu"])
-        except:
-            # Ignore errors if packages weren't installed
-            pass
-        
-        # Install the package with --no-cache-dir to force fresh download
-        info_msg(f"Installing {package}...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", package])
-        
-        # Verify installation
-        import importlib
+        # Try importing faiss
         import faiss
         
-        # Reload faiss module to ensure we get the newly installed version
-        if 'faiss' in sys.modules:
-            importlib.reload(faiss)
-        
-        # Check if FAISS has GPU support and IndexFlatL2
+        # Check if FAISS has GPU support
         has_gpu = hasattr(faiss, 'get_num_gpus') and faiss.get_num_gpus() > 0
         has_indexflatl2 = hasattr(faiss, 'IndexFlatL2')
         
         if has_gpu and has_indexflatl2:
-            info_msg(f"Successfully installed FAISS-GPU 1.7.2 with GPU support ({faiss.get_num_gpus()} GPUs) and IndexFlatL2")
+            info_msg(f"FAISS-GPU is already installed with {faiss.get_num_gpus()} GPUs and IndexFlatL2 support")
             return True
         elif has_indexflatl2:
-            warning_msg("FAISS has IndexFlatL2 but no GPU support detected")
-            return True
+            info_msg("FAISS is installed but without GPU support")
+            return False
         else:
-            error_msg("FAISS installation does not have IndexFlatL2! Falling back to CPU version")
-            # Try to install CPU version instead
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", "faiss-cpu==1.10.0"])
+            info_msg("FAISS is installed but missing IndexFlatL2")
             return False
+    except ImportError:
+        info_msg("FAISS is not installed")
+        return False
     except Exception as e:
-        error_msg(f"Failed to install FAISS-GPU: {str(e)}")
-        try:
-            # Fall back to CPU version
-            info_msg("Falling back to FAISS-CPU 1.10.0...")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", "faiss-cpu==1.10.0"])
-            
-            # Check if this version has IndexFlatL2
-            import importlib
-            import faiss
-            importlib.reload(faiss)
-            
-            if hasattr(faiss, 'IndexFlatL2'):
-                info_msg("Successfully installed FAISS-CPU 1.10.0 with IndexFlatL2 support")
-                return True
-            else:
-                error_msg("FAISS-CPU does not have IndexFlatL2!")
-                return False
-        except Exception as cpu_e:
-            error_msg(f"Failed to install FAISS-CPU fallback: {str(cpu_e)}")
-            return False
+        error_msg(f"Error checking FAISS installation: {str(e)}")
+        return False
 
 def configure_gpu_environment(force_gpu: bool = False, 
                              force_cpu: bool = False, 
@@ -479,20 +424,17 @@ def configure_gpu_environment(force_gpu: bool = False,
                 update_env_file("DISTRIBUTED", "true")
                 result['distributed'] = True
                 
-                # Install FAISS-GPU for better multi-GPU performance
-                # Try multiple times with increasing force levels if needed
-                faiss_installed = install_faiss_gpu()
-                if not faiss_installed and 'faiss' in sys.modules:
-                    # If initial installation failed but module exists, try with --force-reinstall
-                    info_msg("Retrying FAISS-GPU installation with force...")
-                    faiss_installed = install_faiss_gpu()
+                # Check if FAISS-GPU is installed for better multi-GPU performance
+                has_faiss_gpu = install_faiss_gpu()
+                if has_faiss_gpu:
+                    info_msg("FAISS-GPU is already installed, good for multi-GPU performance")
             else:
                 # Clear distributed setting if not needed
                 if "DISTRIBUTED" in os.environ:
                     del os.environ["DISTRIBUTED"]
                 update_env_file("DISTRIBUTED", "")
                 
-                # Still install FAISS-GPU for single GPU performance
+                # Check if FAISS-GPU is installed
                 install_faiss_gpu()
             
             # Set memory limit if provided
