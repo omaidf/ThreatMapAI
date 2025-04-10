@@ -85,13 +85,14 @@ def is_in_our_venv():
         return sys.base_prefix != sys.prefix and VENV_NAME in sys.prefix
     return False
 
-def run_command(cmd, silent=True):
+def run_command(cmd, env=None, silent=True):
     """Run a shell command and return the output and success status"""
     try:
+        env_vars = env or os.environ.copy()
         if silent:
-            result = subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            result = subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env_vars)
         else:
-            result = subprocess.run(cmd, shell=True, check=True)
+            result = subprocess.run(cmd, shell=True, check=True, env=env_vars)
         return True, result.stdout.decode('utf-8') if hasattr(result, 'stdout') and result.stdout else ""
     except subprocess.CalledProcessError as e:
         return False, e.stderr.decode('utf-8') if hasattr(e, 'stderr') and e.stderr else str(e)
@@ -354,19 +355,35 @@ def install_faiss():
     """Install FAISS with GPU support if available"""
     print_status("Installing FAISS for vector search...")
     
+    # First uninstall any existing faiss installations to avoid conflicts
+    print_status("Removing any existing FAISS installations...")
+    run_command(f"{PYTHON_CMD} -m pip uninstall -y faiss faiss-cpu faiss-gpu")
+    
     # First ensure we have a compatible NumPy version (< 2.0)
     print_status("Installing compatible NumPy for FAISS...")
-    run_command(f"{PYTHON_CMD} -m pip install 'numpy<2.0.0'")
+    run_command(f"{PYTHON_CMD} -m pip install 'numpy<2.0.0' --force-reinstall")
     
     # Check if PyTorch with CUDA is available for GPU version
     cuda_available = False
-    print_status("Checking for CUDA availability...")
+    multi_gpu = False
+    gpu_count = 0
+    print_status("Checking for CUDA/GPU availability...")
     
     try:
         import torch
         if torch.cuda.is_available():
             cuda_available = True
-            print_success("CUDA detected via PyTorch! Will install GPU-enabled FAISS.")
+            gpu_count = torch.cuda.device_count()
+            if gpu_count > 1:
+                multi_gpu = True
+            
+            gpu_info = []
+            for i in range(gpu_count):
+                gpu_name = torch.cuda.get_device_name(i)
+                total_memory = torch.cuda.get_device_properties(i).total_memory / (1024**3)  # GB
+                gpu_info.append(f"GPU {i}: {gpu_name} ({total_memory:.1f} GB)")
+            
+            print_success(f"Found {gpu_count} GPUs: {', '.join(gpu_info)}")
     except ImportError:
         # If torch isn't installed, check for CUDA via system
         if shutil.which("nvcc") or os.path.exists("/usr/local/cuda"):
@@ -374,6 +391,16 @@ def install_faiss():
             print_success("CUDA detected via nvcc/cuda directory! Will install GPU-enabled FAISS.")
         else:
             print_status("No CUDA detected, using CPU version of FAISS.")
+    
+    # Check for Apple Silicon MPS support
+    mps_available = False
+    try:
+        import torch
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            mps_available = True
+            print_success("Apple Silicon MPS support detected!")
+    except:
+        pass
     
     # Install appropriate FAISS version
     if cuda_available:
@@ -384,98 +411,164 @@ def install_faiss():
             print_status("Installing PyTorch with CUDA support first...")
             run_command(f"{PYTHON_CMD} -m pip install torch --index-url https://download.pytorch.org/whl/cu118")
         
-        # Install faiss-gpu
+        # Install faiss-gpu with appropriate version
         print_status("Installing FAISS with GPU support...")
-        success, _ = run_command(f"{PYTHON_CMD} -m pip install -q faiss-gpu")
+        
+        # Try multiple install strategies in order of preference
+        strategies = [
+            f"{PYTHON_CMD} -m pip install -q faiss-gpu --no-deps",
+            f"{PYTHON_CMD} -m pip install -q 'faiss-gpu>=1.10.0' --no-deps",
+            f"{PYTHON_CMD} -m pip install -q faiss-gpu",
+            f"{PYTHON_CMD} -m pip install -q 'faiss-gpu==1.10.0'"
+        ]
+        
+        success = False
+        for strategy in strategies:
+            print_status(f"Trying FAISS install: {strategy}")
+            success, _ = run_command(strategy)
+            if success:
+                # Verify FAISS has expected attributes
+                try:
+                    import faiss
+                    if hasattr(faiss, 'IndexFlatL2'):
+                        print_success("FAISS GPU installation successful and verified!")
+                        break
+                    else:
+                        print_warning("FAISS installed but missing IndexFlatL2. Trying another method...")
+                        success = False
+                except:
+                    success = False
         
         if not success:
-            print_warning("Failed to install faiss-gpu, trying with specific CUDA version...")
-            # Try with specific pinned version
-            success, _ = run_command(f"{PYTHON_CMD} -m pip install -q 'faiss-gpu>=1.7.0'")
-            
-            if not success:
-                print_warning("Failed to install faiss-gpu. Falling back to CPU version.")
-                run_command(f"{PYTHON_CMD} -m pip install -q faiss-cpu")
-        
-        # Verify GPU FAISS installation
-        try:
-            import faiss
-            if hasattr(faiss, 'get_num_gpus') and faiss.get_num_gpus() > 0:
-                print_success("Successfully installed FAISS with GPU support!")
-                detected_gpus = faiss.get_num_gpus()
-                print_status(f"Detected {detected_gpus} GPUs for FAISS acceleration")
-                mark_as_installed("faiss_gpu")
-                
-                # Set environment variable for the application
-                os.environ["FAISS_MULTI_GPU"] = "1" if detected_gpus > 1 else "0"
-                
-                return True
-            else:
-                print_warning("FAISS installed but GPU support not detected. Using CPU version.")
-                mark_as_installed("faiss_cpu")
-        except ImportError:
-            print_error("Failed to import FAISS after installation. Vector search will be limited.")
-    else:
-        # Now install faiss-cpu
-        print_status("Installing FAISS CPU version...")
+            print_warning("All GPU installation methods failed. Falling back to CPU version.")
+            cuda_available = False
+    
+    if mps_available and not cuda_available:
+        print_status("Installing FAISS for Apple Silicon...")
         success, _ = run_command(f"{PYTHON_CMD} -m pip install -q faiss-cpu")
         
-        if not success:
-            print_warning("Failed to install faiss-cpu, trying alternative method...")
-            # Try with specific pinned version
-            success, _ = run_command(f"{PYTHON_CMD} -m pip install -q 'faiss-cpu==1.7.4'")
-            
-            if not success:
-                # Try with known-compatible versions
-                run_command(f"{PYTHON_CMD} -m pip install -q 'numpy==1.24.3'")
-                run_command(f"{PYTHON_CMD} -m pip install -q 'faiss-cpu==1.7.4'")
+        # Set environment variable for MPS
+        with open(".env", "a") as f:
+            f.write("USE_MPS=1\n")
         
-        # Verify faiss installation
-        try:
-            import faiss
-            print_success("Successfully installed FAISS CPU version")
-            mark_as_installed("faiss_cpu")
+        if success:
+            try:
+                import faiss
+                if hasattr(faiss, 'IndexFlatL2'):
+                    print_success("FAISS CPU installation successful for Apple Silicon!")
+                else:
+                    print_warning("FAISS installed but missing IndexFlatL2. May not work correctly.")
+            except:
+                print_error("FAISS installation verification failed.")
+    
+    if not cuda_available and not mps_available:
+        # Install CPU version
+        print_status("Installing FAISS CPU version...")
+        success, _ = run_command(f"{PYTHON_CMD} -m pip install -q faiss-cpu --no-deps")
+        if not success:
+            print_status("Trying alternative installation method...")
+            run_command(f"{PYTHON_CMD} -m pip install -q faiss-cpu")
+    
+    # Verify FAISS installation
+    try:
+        import faiss
+        if hasattr(faiss, 'IndexFlatL2'):
+            print_success("FAISS installation verified successfully!")
+            
+            # Set up FAISS multi-GPU support if available
+            if multi_gpu:
+                print_status(f"Setting up FAISS for multi-GPU operation with {gpu_count} GPUs...")
+                with open(".env", "a") as f:
+                    f.write("FAISS_MULTI_GPU=1\n")
+                    f.write("FAISS_USE_SHARDING=1\n")
+                print_success("FAISS configured for multi-GPU operation")
+            
             return True
-        except ImportError:
-            print_error("Failed to import FAISS after installation. Vector search will be limited.")
+        else:
+            print_error("FAISS installation is incomplete (missing IndexFlatL2)")
             return False
+    except ImportError as e:
+        print_error(f"FAISS installation failed: {str(e)}")
+        return False
 
 def install_llama_cpp_python():
-    """Install llama-cpp-python with hardware acceleration if available"""
+    """Install llama-cpp-python with appropriate CUDA support if available"""
     print_status("Installing llama-cpp-python...")
     
-    # Check if we're on a system with CUDA
-    if shutil.which("nvcc") or os.path.exists("/usr/local/cuda"):
-        print_status("CUDA detected, installing llama-cpp-python with CUDA support...")
-        os.environ["CMAKE_ARGS"] = "-DLLAMA_CUBLAS=on"
-        success, _ = run_command(f"{PYTHON_CMD} -m pip install --force-reinstall llama-cpp-python")
-        
-        if success:
-            print_success("Installed llama-cpp-python with CUDA support!")
-            return True
-        else:
-            print_warning("Failed to install with CUDA. Installing standard version...")
-    # Check if we're on a Mac with Metal (Apple Silicon)
-    elif platform.system() == "Darwin" and platform.machine() == "arm64":
-        print_status("Apple Silicon detected, installing llama-cpp-python with Metal support...")
-        os.environ["CMAKE_ARGS"] = "-DLLAMA_METAL=on"
-        success, _ = run_command(f"{PYTHON_CMD} -m pip install --force-reinstall llama-cpp-python")
-        
-        if success:
-            print_success("Installed llama-cpp-python with Metal support!")
-            return True
-        else:
-            print_warning("Failed to install with Metal. Installing standard version...")
-    
-    # Fall back to standard version
-    print_status("Installing standard llama-cpp-python...")
-    success, _ = run_command(f"{PYTHON_CMD} -m pip install --force-reinstall llama-cpp-python")
-    
-    if success:
-        print_success("Installed standard llama-cpp-python")
+    # First check if we already have it
+    try:
+        import llama_cpp
+        print_success("llama-cpp-python already installed")
         return True
+    except:
+        pass
+    
+    # Check for CUDA
+    cuda_available = False
+    cuda_compute = None
+    try:
+        import torch
+        if torch.cuda.is_available():
+            cuda_available = True
+            # Get CUDA compute capability
+            device = torch.cuda.get_device_properties(0)
+            cuda_compute = f"{device.major}.{device.minor}"
+            print_success(f"CUDA detected with compute capability {cuda_compute}")
+    except:
+        # Try to detect CUDA via system
+        if shutil.which("nvcc") or os.path.exists("/usr/local/cuda"):
+            cuda_available = True
+            print_success("CUDA detected via system!")
+    
+    # Check for Apple Silicon MPS
+    mps_available = False
+    try:
+        import torch
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            mps_available = True
+            print_success("Apple Silicon MPS support detected!")
+    except:
+        pass
+    
+    # Set up environment variables for llama-cpp compilation
+    env_vars = os.environ.copy()
+    
+    if cuda_available:
+        print_status("Configuring for CUDA compilation...")
+        env_vars["CMAKE_ARGS"] = "-DLLAMA_CUBLAS=on"
+        env_vars["FORCE_CMAKE"] = "1"
+        
+        if cuda_compute:
+            env_vars["CUDA_COMPUTE"] = cuda_compute
+    
+    elif mps_available:
+        print_status("Configuring for Apple Silicon Metal acceleration...")
+        env_vars["CMAKE_ARGS"] = "-DLLAMA_METAL=on"
+        env_vars["FORCE_CMAKE"] = "1"
+    
+    # Try installing with CUDA support
+    print_status("Installing llama-cpp-python (this may take several minutes)...")
+    
+    if cuda_available or mps_available:
+        cmd = f"{PYTHON_CMD} -m pip install llama-cpp-python --no-cache-dir --verbose"
+        success, output = run_command(cmd, env=env_vars, silent=False)
+        
+        if not success:
+            print_warning("Failed to install with GPU acceleration, falling back to CPU version")
+            cmd = f"{PYTHON_CMD} -m pip install llama-cpp-python --no-cache-dir"
+            success, _ = run_command(cmd)
     else:
-        print_warning("Failed to install llama-cpp-python.")
+        # CPU-only installation
+        cmd = f"{PYTHON_CMD} -m pip install llama-cpp-python --no-cache-dir"
+        success, _ = run_command(cmd)
+    
+    # Verify installation
+    try:
+        import llama_cpp
+        print_success("llama-cpp-python installation successful!")
+        return True
+    except ImportError as e:
+        print_error(f"llama-cpp-python installation failed: {str(e)}")
         return False
 
 def verify_installation():
@@ -835,119 +928,117 @@ def handle_git_support():
     
     return True
 
+def setup_multi_gpu():
+    """Configure the environment for multi-GPU setups"""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False, 0
+        
+        gpu_count = torch.cuda.device_count()
+        if gpu_count <= 1:
+            return False, gpu_count
+        
+        print_success(f"Detected {gpu_count} GPUs for multi-GPU setup")
+        
+        # Get GPU information
+        gpu_info = []
+        total_memory_gb = 0
+        for i in range(gpu_count):
+            name = torch.cuda.get_device_name(i)
+            memory_gb = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+            total_memory_gb += memory_gb
+            gpu_info.append(f"GPU {i}: {name} ({memory_gb:.1f} GB)")
+        
+        print_status("\n".join(gpu_info))
+        print_status(f"Total GPU memory: {total_memory_gb:.1f} GB")
+        
+        # Add multi-GPU configuration to .env
+        with open(".env", "a") as f:
+            f.write("\n# Multi-GPU Configuration\n")
+            f.write(f"GPU_COUNT={gpu_count}\n")
+            f.write("DISTRIBUTED=1\n")
+            f.write(f"GPU_IDS={','.join([str(i) for i in range(gpu_count)])}\n")
+            
+            # If we have more than 32GB total, suggest 70B model
+            if total_memory_gb > 32:
+                print_status("Detected sufficient GPU memory for CodeLlama-70B model")
+                f.write("# Uncomment to use 70B model\n")
+                f.write("# LLM_MODEL=codellama-70b-instruct\n")
+        
+        print_success("Multi-GPU configuration set up successfully")
+        return True, gpu_count
+    
+    except Exception as e:
+        print_warning(f"Failed to set up multi-GPU configuration: {str(e)}")
+        return False, 0
+
 def main():
     # Handle Ctrl+C gracefully
     def signal_handler(sig, frame):
-        print_warning("\nInterrupted! Cleaning up...")
-        sys.exit(1)
+        print_warning("\nInstallation interrupted. You can resume by running the script again.")
+        sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
     
-    # Start the setup
-    print_status("Starting setup...")
-    print("=================================================================")
-    print(f"          {GREEN}AI Threat Map{NC} - {BLUE}Installation{NC}")
-    print("=================================================================")
-    print("")
+    print_status(f"AI Threat Model Map Generator Installer v1.2.0")
+    print_status(f"Python {platform.python_version()} on {platform.system()} {platform.machine()}")
     
-    # Setup steps tracker
-    total_setup_steps = 8
-    current_step = 0
+    # Detect system resources for optimization
+    detect_system_resources()
     
-    # Check for Python
-    current_step += 1
-    show_progress(total_setup_steps, current_step, "Checking Python installation")
-    
-    if platform.python_version().startswith("3.11"):
-        print_success("Python 3.11 is installed!")
-    else:
-        py_version = platform.python_version()
-        print_status(f"Python version: {py_version}")
-        print_warning(f"You're using Python {py_version}, but Python 3.11 is recommended for best compatibility.")
-        print_status("The setup will continue, but you may encounter dependency issues.")
-        time.sleep(1)
-    
-    # Check for pip
-    current_step += 1
-    show_progress(total_setup_steps, current_step, "Checking pip installation")
-    
-    if check_command("pip3") or check_command("pip"):
-        print_success("pip is installed!")
-    else:
-        print_error("pip is not installed. Please install pip and try again.")
-        sys.exit(1)
-    
-    # Setup virtual environment
-    current_step += 1
-    show_progress(total_setup_steps, current_step, "Setting up virtual environment")
-    if not setup_venv():
-        sys.exit(1)
-    
-    # Install dependencies
-    current_step += 1
-    show_progress(total_setup_steps, current_step, "Installing dependencies")
-    if not install_dependencies():
-        print_error("Failed to install critical dependencies. Exiting.")
-        sys.exit(1)
-    
-    # Handle Git support
-    current_step += 1
-    show_progress(total_setup_steps, current_step, "Configuring Git support")
-    handle_git_support()
+    # Set up cache directories
+    setup_cache_dir()
     
     # Create required directories
-    current_step += 1
-    show_progress(total_setup_steps, current_step, "Creating directories")
     create_directories()
     
-    # Detect architecture and setup environment
-    current_step += 1
-    show_progress(total_setup_steps, current_step, "Detecting architecture & setting up environment")
+    # Set up Python environment
+    if not is_in_our_venv():
+        print_status("Setting up virtual environment...")
+        setup_venv()
+        print_success("Virtual environment created. Please run the installer again from within the virtual environment.")
+        print_status(f"On Linux/macOS: source {VENV_NAME}/bin/activate")
+        print_status(f"On Windows: .\\{VENV_NAME}\\Scripts\\activate")
+        print_status(f"Then run: python install.py")
+        sys.exit(0)
+    
+    # Detect architecture for model selection
     model_variant = detect_architecture()
+    
+    # Prompt for Hugging Face token
     token_set, hf_token = prompt_for_hf_token()
+    
+    # Install dependencies
+    print_status("Installing dependencies...")
+    install_dependencies()
+    
+    # Specific installations and fixes
+    install_faiss()
+    install_llama_cpp_python()
+    fix_sentence_transformers()
+    
+    # Set up multi-GPU if available
+    multi_gpu, gpu_count = setup_multi_gpu()
+    
+    # Set up .env file with configuration
     setup_env_file(model_variant, hf_token, token_set)
     
-    # Initialize the framework
-    current_step += 1
-    show_progress(total_setup_steps, current_step, "Initializing framework")
-    print_status("Initializing the framework...")
-    success, _ = run_command(f"{PYTHON_CMD} -m cli init")
-    if not success:
-        print_warning("Framework initialization encountered issues, but we can continue")
+    # Final verification
+    if verify_installation():
+        print_success("Installation completed successfully!")
+        
+        print_status("\nNext steps:")
+        print_status("1. Download models: python -m cli init")
+        if multi_gpu:
+            print_status("2. For multi-GPU analysis: python -m cli analyze path/to/repo --distributed")
+        else:
+            print_status("2. Analyze a repository: python -m cli analyze path/to/repo")
+    else:
+        print_warning("Installation completed with some warnings. Some components may not work as expected.")
+        print_status("You can try manually fixing issues or re-running the installer.")
     
-    # Verify installation
-    if not verify_installation():
-        print_error("Some critical dependencies are missing. There may have been installation errors.")
-        print_status("You can try installing them manually:")
-        print_status("pip install click langchain langchain-core langchain-community python-dotenv tree-sitter==0.20.1 tree-sitter-languages==1.8.0 requests tqdm xmltodict==0.13.0 click-plugins XlsxWriter faiss-cpu==1.7.4")
-        sys.exit(1)
-    
-    # Final success message and instructions
-    print("")
-    print("=================================================================")
-    print(f"      {GREEN}✓ Setup completed successfully!{NC}")
-    print("=================================================================")
-    print("")
-    print_status("You can now run the tool with: python -m cli analyze <repository_url>")
-    print_status("")
-    print_status(f"IMPORTANT: To use AI Threat Map in the future, you must first activate the virtual environment:")
-    print_status(f"  source {VENV_NAME}/bin/activate")
-    print_status("")
-    if not token_set:
-        print_status("If you haven't set up your Hugging Face token yet, do that first:")
-        print_status("  python -m cli set_token")
-        print_status("")
-    print_status("Models are downloaded automatically by the Python code using huggingface_hub.")
-    print_status("You can also manually download models with:")
-    print_status("  python example_hf_download.py")
-    print_status("")
-    print_status("After activation, you can run commands like:")
-    print_status("  python -m cli analyze <repository_url>")
-    print_status("")
-    print_status("You can create a simple alias in your shell config (~/.bashrc or ~/.zshrc):")
-    print_status(f"  alias aithreatmap='cd {os.getcwd()} && source {VENV_NAME}/bin/activate && python -m cli'")
-    print_status("")
-    print_status("Then use it like: aithreatmap analyze <repository_url>")
+    return 0
 
 if __name__ == "__main__":
     main() 
