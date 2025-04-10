@@ -25,7 +25,7 @@ except ImportError:
 # from dulwich import porcelain
 
 from .embedding_store import EmbeddingStore
-from utils import info_msg
+from utils import info_msg, warning_msg
 from utils.env_utils import update_env_file
 import re
 import json
@@ -920,547 +920,381 @@ class RepositoryAnalyzer:
     
     def analyze_code(self) -> Dict[str, Any]:
         """
-        Analyze the code in the repository.
+        Analyze code in the repository and return results.
         
         Returns:
             Dictionary containing analysis results
         """
         try:
-            # Force print for debugging
-            print("CRITICAL DEBUG: Analyzer running with embedding_store:", self.embedding_store is not None)
-            if self.embedding_store:
-                # Verify embedding store is working properly
-                try:
-                    initial_files = self.embedding_store._get_all_files()
-                    print(f"CRITICAL DEBUG: Embedding store contains {len(initial_files)} files at start of analysis")
-                    if hasattr(self.embedding_store, 'model') and self.embedding_store.model is None:
-                        print("CRITICAL DEBUG: ERROR - Embedding model is None, attempting to reinitialize")
-                        self.embedding_store.initialize_model()
-                        if hasattr(self.embedding_store, 'model') and self.embedding_store.model is not None:
-                            print("CRITICAL DEBUG: Successfully reinitialized embedding model")
-                        else:
-                            print("CRITICAL DEBUG: Failed to reinitialize embedding model")
-                except Exception as e:
-                    print(f"CRITICAL DEBUG: Error checking embedding store: {str(e)}")
-                    print("CRITICAL DEBUG: Attempting to reinitialize embedding store model")
-                    try:
-                        if hasattr(self.embedding_store, 'initialize_model'):
-                            self.embedding_store.initialize_model()
-                            print("CRITICAL DEBUG: Reinitialized embedding store model")
-                    except Exception as e2:
-                        print(f"CRITICAL DEBUG: Failed to reinitialize embedding store model: {str(e2)}")
+            # Verify repository is available
+            if not self.verify_repository():
+                raise RepositoryAnalyzerError(f"Repository path {self.repo_path} is not valid")
             
-            results = {
-                "components": [],
-                "data_flows": [],
-                "dependencies": [],
-                "architecture": {
-                    "file_types": {},
-                    "directory_structure": {},
-                    "entry_points": []
-                }
-            }
+            # Setup parser with detected languages
+            if self.parser is None:
+                info_msg("Initializing parser...")
+                languages = self._detect_languages_in_repo()
+                self._setup_tree_sitter(languages)
             
-            # Track total files and files parsed
-            total_files = 0
-            indexed_files = 0
-            parsed_files = 0
-            skipped_files = 0
-            primary_language_files = 0  # Add counter for primary language files
-            
-            # Include only the languages we've loaded grammars for
-            supported_extensions = []
-            for lang_config in self.languages.values():
-                supported_extensions.extend(lang_config["extensions"])
+            # Initialize embedding store if needed
+            if self.embedding_store is None:
+                from .embedding_store import EmbeddingStore
+                info_msg("Creating new embedding store")
                 
-            logger.info(f"Analyzing files with extensions: {', '.join(supported_extensions)}")
-            
-            # Special info for PHP projects with .inc files
-            if ".php" in supported_extensions and ".inc" in supported_extensions:
-                logger.info("Detected PHP project with .inc files - both file types will be analyzed and indexed")
+                # Check for environment variable to control device
+                force_cpu = os.environ.get("FORCE_CPU", "").lower() in ["true", "1", "yes"]
+                force_gpu = os.environ.get("FORCE_GPU", "").lower() in ["true", "1", "yes"]
                 
-            # Clarify that only files matching the primary language will be indexed for RAG
-            logger.info(f"ONLY files matching the primary language ({', '.join(supported_extensions)}) will be indexed for RAG")
-            
-            # First pass: Count files to determine if repository is too large
-            total_files_approx = 0
-            is_large_repo = False
-            for root, dirs, files in os.walk(self.repo_path):
-                # Skip common directories to ignore
-                if any(i in root for i in ['.git', 'node_modules', '__pycache__', 'venv', '.idea']):
-                    continue
-                total_files_approx += len(files)
-            
-            # For large repositories, we'll use a more selective approach
-            # With 100K context window, we can set these limits much higher
-            max_files_to_process = 100000  # Removed conditional for large repos, just use the higher limit
-            max_files_per_extension = 20000  # Removed conditional for large repos, just use the higher limit
-            
-            logger.info(f"Repository size: approx. {total_files_approx} files. Using 100K context window to process up to {max_files_to_process} files")
-            
-            # Track directories and their files
-            dir_structure = {}
-            
-            # First collect all file paths that match our criteria
-            all_files = []
-            for root, dirs, files in os.walk(self.repo_path):
-                # Skip common directories to ignore
-                if any(i in root for i in ['.git', 'node_modules', '__pycache__', 'venv', '.idea']):
-                    continue
+                # Determine device based on environment and availability
+                device = None
+                if force_cpu:
+                    device = "cpu"
+                elif force_gpu:
+                    device = "cuda"
                     
-                # Skip test directories and paths containing 'test'
-                if 'test' in root.lower() or 'tests' in root.lower():
-                    continue
-                
-                # Update directory structure
-                rel_root = os.path.relpath(root, self.repo_path)
-                if rel_root == '.':
-                    rel_root = ''
-                
-                # Build directory structure incrementally
-                dir_path = rel_root.split(os.sep)
-                current_dir = dir_structure
-                for part in dir_path:
-                    if part:
-                        if part not in current_dir:
-                            current_dir[part] = {"files": [], "dirs": {}}
-                        current_dir = current_dir[part]["dirs"]
-                
-                # Process files
-                for file in files:
-                    # Skip test files
-                    if 'test' in file.lower():
-                        continue
-                        
-                    total_files += 1
-                    file_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(file_path, self.repo_path)
-                    
-                    # Get file extension and check if it's supported for detailed parsing
-                    ext = Path(file).suffix.lower()
-                    is_supported = ext in supported_extensions
-                    
-                    # Count files matching primary language
-                    if is_supported:
-                        primary_language_files += 1
-                    
-                    # Add to directory structure
-                    if rel_root:
-                        parent_dir = dir_structure
-                        for part in rel_root.split(os.sep):
-                            if part:
-                                parent_dir = parent_dir[part]["dirs"]
-                        if "files" in parent_dir:
-                            parent_dir["files"].append({"name": file, "path": rel_path, "supported": is_supported})
-                    else:
-                        if "files" not in dir_structure:
-                            dir_structure["files"] = []
-                        dir_structure["files"].append({"name": file, "path": rel_path, "supported": is_supported})
-                    
-                    # Track file types
-                    if ext:
-                        if ext not in results["architecture"]["file_types"]:
-                            results["architecture"]["file_types"][ext] = 0
-                        results["architecture"]["file_types"][ext] += 1
-                    
-                    # Add ONLY files with supported extensions to our list for processing
-                    # This ensures we only index files matching the primary language for RAG
-                    if ext in supported_extensions:
-                        all_files.append((rel_path, file_path, ext))
+                # Create store with appropriate device setting
+                self.embedding_store = EmbeddingStore(device=device, gpu_id=self.gpu_ids[0] if self.gpu_ids else None)
             
-            # Save directory structure
-            results["architecture"]["directory_structure"] = dir_structure
+            # Load existing embeddings if present
+            self.embedding_store.load()
             
-            # Identify potential entry points before filtering files
-            logger.info("Identifying potential entry points...")
-            potential_entry_points = []
-            
-            # Common entry point patterns
-            entry_point_patterns = [
-                "main", "app", "index", "server", "start", "init", "application",
-                "api", "controller", "service", "router", "routes", "config", "settings"
+            # Get all code files
+            info_msg("Scanning repository for code files...")
+            ignore_patterns = [
+                '**/node_modules/**', '**/.git/**', '**/venv/**', '**/.venv/**',
+                '**/__pycache__/**', '**/dist/**', '**/build/**', '**/.idea/**',
+                '**/.vscode/**', '**/tests/**', '**/test/**', '**/vendor/**',
+                '**/*.min.js', '**/*.min.css', '**/jquery*.js', '**/bootstrap*.js',
+                '**/bootstrap*.css', '**/*.png', '**/*.jpg', '**/*.jpeg', '**/*.gif',
+                '**/*.ico', '**/*.svg', '**/*.woff', '**/*.woff2', '**/*.ttf',
+                '**/*.eot', '**/*.map', '**/*.pb', '**/*.pyc', '**/*.pyo', '**/*.pyd',
+                '**/*.so', '**/*.dylib', '**/*.dll', '**/*.exe', '**/*.bin',
+                '**/*.obj', '**/*.o', '**/*.a', '**/*.lib', '**/*.out', '**/*.class',
+                '**/*.jar', '**/*.war', '**/*.ear', '**/*.zip', '**/*.tar',
+                '**/*.tar.gz', '**/*.tar.bz2', '**/*.rar', '**/*.7z'
             ]
             
-            # First identify all potential entry points
-            for rel_path, file_path, ext in all_files:
-                filename = os.path.basename(file_path)
-                name_stem = Path(filename).stem
-                
-                # Check if the filename indicates an entry point
-                is_entry_point = False
-                for pattern in entry_point_patterns:
-                    if pattern in name_stem.lower():
-                        is_entry_point = True
-                        break
-                
-                # If it looks like an entry point, check content to confirm
-                if is_entry_point or os.path.basename(os.path.dirname(file_path)) in entry_point_patterns:
-                    try:
-                        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                            # Read just the first 2KB to check for entry point patterns
-                            content = f.read(2048)
-                            
-                            # Check for language-specific entry point patterns
-                            if ext == ".py" and ("if __name__ == '__main__'" in content or "if __name__ == \"__main__\"" in content):
-                                potential_entry_points.append((rel_path, file_path, ext))
-                                results["architecture"]["entry_points"].append(rel_path)
-                            elif ext in [".js", ".ts"] and any(pattern in content for pattern in ["exports.", "module.exports", "export default", "export const", "app.listen(", "createServer", "addEventListener('load'"]):
-                                potential_entry_points.append((rel_path, file_path, ext))
-                                results["architecture"]["entry_points"].append(rel_path)
-                            elif ext == ".java" and "public static void main" in content:
-                                potential_entry_points.append((rel_path, file_path, ext))
-                                results["architecture"]["entry_points"].append(rel_path)
-                            elif ext == ".go" and "func main()" in content:
-                                potential_entry_points.append((rel_path, file_path, ext))
-                                results["architecture"]["entry_points"].append(rel_path)
-                            elif ext == ".php" and "<?php" in content[:100]:
-                                potential_entry_points.append((rel_path, file_path, ext))
-                                results["architecture"]["entry_points"].append(rel_path)
-                    except Exception as e:
-                        logger.warning(f"Error checking for entry point in {file_path}: {str(e)}")
+            # Get all code files using a generator to avoid loading all files in memory at once
+            all_files = self._get_all_files(str(self.repo_path), ignore_patterns)
             
-            logger.info(f"Found {len(potential_entry_points)} potential entry points")
+            # Count total files for progress tracking
+            file_count = sum(1 for f in self._get_all_files(str(self.repo_path), ignore_patterns))
+            info_msg(f"Found {file_count} files to analyze")
             
-            # Add GPU info
-            if self.embedding_store:
-                if hasattr(self.embedding_store, 'use_gpu_for_faiss') and self.embedding_store.use_gpu_for_faiss:
-                    gpu_id = getattr(self.embedding_store, 'gpu_id', 0)
-                    logger.info(f"Using GPU {gpu_id} acceleration for RAG indexing")
-                    if hasattr(self.embedding_store, 'model') and self.embedding_store.model is not None:
-                        device = self.embedding_store.model.device
-                        logger.info(f"Embedding model running on device: {device}")
-                else:
-                    logger.warning("GPU acceleration is NOT enabled for RAG indexing - this will be slower")
-                
-            # Log that all files will be indexed
-            logger.info(f"Indexing {len(all_files)} files for RAG...")
+            # Reinitialize all_files generator
+            all_files = self._get_all_files(str(self.repo_path), ignore_patterns)
             
-            # DIAGNOSTIC: Count PHP files specifically
-            php_files = [f for f in all_files if f[2] == '.php']
-            if php_files:
-                print(f"CRITICAL DEBUG: Found {len(php_files)} PHP files to index")
-                print(f"CRITICAL DEBUG: First 5 PHP files: {php_files[:5]}")
-            else:
-                print("CRITICAL DEBUG: NO PHP FILES FOUND FOR INDEXING")
-                
-            # Count by extension for logging purposes
-            extension_counts = {}
-            for _, _, ext in all_files:
-                if ext not in extension_counts:
-                    extension_counts[ext] = 0
-                extension_counts[ext] += 1
-                
-            # Log the breakdown of file extensions being processed
-            if extension_counts:
-                logger.info("File types being indexed:")
-                for ext, count in sorted(extension_counts.items(), key=lambda x: x[1], reverse=True):
-                    logger.info(f"  - {ext}: {count} files")
+            # Skip empty repositories
+            if file_count == 0:
+                warning_msg("No files found in repository, skipping analysis")
+                return {
+                    "components": [],
+                    "data_flows": [],
+                    "architecture": self._analyze_architecture({})
+                }
             
-            # For large repositories, prioritize and select a subset of files
-            if len(all_files) > max_files_to_process:
-                logger.info(f"Repository has {len(all_files)} supported files. Prioritizing important files...")
-                
-                # Group files by extension
-                files_by_ext = {}
-                for rel_path, file_path, ext in all_files:
-                    if ext not in files_by_ext:
-                        files_by_ext[ext] = []
-                    files_by_ext[ext].append((rel_path, file_path, ext))
-                
-                # Limit files per extension
-                selected_files = []
-                
-                # Always include entry points
-                selected_files.extend(potential_entry_points)
-                
-                # Add a limited number of files from each extension
-                for ext, files in files_by_ext.items():
-                    # Skip if we already have enough from this extension via entry points
-                    existing_count = sum(1 for f in selected_files if f[2] == ext)
-                    if existing_count >= max_files_per_extension:
-                        continue
-                        
-                    # Select remaining files up to the limit
-                    remaining = max_files_per_extension - existing_count
-                    # Exclude entry points which are already included
-                    remaining_files = [f for f in files if f not in potential_entry_points]
-                    # Prioritize files in src/, lib/, app/ directories
-                    prioritized = [f for f in remaining_files if any(dir_name in f[0] for dir_name in ["src/", "lib/", "app/", "core/", "main/"])]
-                    # Add prioritized files first
-                    selected_files.extend(prioritized[:remaining])
-                    # If we still have room, add other files
-                    if len(prioritized) < remaining:
-                        non_prioritized = [f for f in remaining_files if f not in prioritized]
-                        selected_files.extend(non_prioritized[:remaining - len(prioritized)])
-                
-                # Make sure we don't exceed overall file limit
-                if len(selected_files) > max_files_to_process:
-                    logger.warning(f"Limiting analysis to {max_files_to_process} files from {len(selected_files)} selected files")
-                    # Preserve entry points
-                    entry_point_count = len(potential_entry_points)
-                    remaining_slots = max_files_to_process - entry_point_count
-                    if remaining_slots > 0:
-                        other_files = [f for f in selected_files if f not in potential_entry_points]
-                        selected_files = potential_entry_points + other_files[:remaining_slots]
-                    else:
-                        selected_files = potential_entry_points[:max_files_to_process]
-                
-                logger.info(f"Selected {len(selected_files)} files for analysis")
-                # Replace all_files with our selected subset
-                all_files = selected_files
-            
-            # Index the selected files for RAG
-            reused_files = 0
-            new_files = 0
-            skipped_test_files = 0
-            logger.info(f"Indexing {len(all_files)} files for RAG...")
-            for rel_path, file_path, ext in all_files:
-                # Skip test files
-                if 'test' in rel_path.lower():
-                    skipped_test_files += 1
-                    continue
+            # Analyze file types
+            info_msg("Analyzing code files...")
+            file_types = {}
+            for file_path in self._get_all_files(str(self.repo_path), ignore_patterns):
+                ext = Path(file_path).suffix.lower()
+                if ext:
+                    if ext not in file_types:
+                        file_types[ext] = 0
+                    file_types[ext] += 1
                     
-                if self.embedding_store:
+            # Log file type distribution
+            info_msg("File type distribution:")
+            for ext, count in sorted(file_types.items(), key=lambda x: x[1], reverse=True)[:10]:
+                info_msg(f"  {ext}: {count} files")
+            
+            # Initialize results
+            components = []
+            data_flows = []
+            file_relationships = {}  # Dictionary to track file relationships
+            
+            # Initialize directory structure for architecture analysis
+            directory_structure = {}
+            
+            # Track entry points and critical files
+            entry_points = []
+            
+            # Configure batch processing to handle GPU memory better
+            batch_size = 10  # Files per batch
+            batch_count = (file_count + batch_size - 1) // batch_size
+            info_msg(f"Processing in {batch_count} batches of up to {batch_size} files each")
+            
+            # Process files in batches
+            current_batch = []
+            current_batch_size = 0
+            with tqdm(total=file_count, desc="Analyzing code files") as pbar:
+                for file_path in all_files:
                     try:
-                        # Check if this file is already in the embedding store to avoid re-indexing
-                        # when reusing embeddings
-                        if self.embedding_store.contains_file(rel_path):
-                            # Skip files that are already indexed
-                            reused_files += 1
-                            indexed_files += 1
-                            continue
-                            
-                        # Skip very large binary files and common binary formats to avoid wasting storage
+                        # Skip very large files
                         file_size = os.path.getsize(file_path)
-                        if file_size > 10 * 1024 * 1024:  # 10MB is too large for effective RAG
-                            logger.info(f"Skipping very large file for indexing: {rel_path} ({file_size / 1024 / 1024:.2f} MB)")
-                            continue
-                            
-                        # Skip common binary formats that don't provide useful text
-                        binary_exts = ['.exe', '.dll', '.bin', '.zip', '.jar', '.war', '.class', '.pyc', '.o', '.so', '.dylib', 
-                                      '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.tiff', '.pdf', '.mp3', '.mp4', '.wav']
-                        if ext in binary_exts:
-                            logger.info(f"Skipping binary file: {rel_path}")
+                        if file_size > self.max_file_size:
+                            warning_msg(f"Skipping very large file {file_path} ({file_size/(1024*1024):.1f} MB)")
+                            pbar.update(1)
                             continue
                         
-                        # CRITICAL CHECK: Only index files with supported extensions
-                        if ext not in supported_extensions:
-                            print(f"CRITICAL DEBUG: Skipping unsupported extension: {rel_path} (ext: {ext}), supported_extensions: {supported_extensions}")
-                            logger.info(f"Skipping file with unsupported extension: {rel_path}")
+                        # Only process files with supported extensions
+                        ext = Path(file_path).suffix.lower()
+                        language = self._get_language_name(ext)
+                        if not language:
+                            # Skip unsupported file types silently
+                            pbar.update(1)
                             continue
-                        
-                        print(f"CRITICAL DEBUG: Processing file for indexing: {rel_path} (ext: {ext})")
-                        # Improved file reading that avoids loading entire files into memory
-                        with open(file_path, 'rb') as f:
-                            # Read first chunk to determine if it's text
-                            first_chunk = f.read(4096)  # Read 4KB to check
                             
-                            # Skip file if it appears to be binary (check for null bytes)
-                            if b'\x00' in first_chunk:
-                                logger.info(f"Skipping likely binary file: {rel_path}")
-                                continue
-                            
-                            # Try to decode with utf-8, fallback to latin-1
-                            try:
-                                first_chunk_decoded = first_chunk.decode('utf-8', errors='replace')
-                                # Seek back to start
-                                f.seek(0)
-                                # Read in chunks to avoid memory issues
-                                decoded_content = ""
-                                chunk_size = 1024 * 1024  # 1MB chunks
-                                while True:
-                                    chunk = f.read(chunk_size)
-                                    if not chunk:
-                                        break
-                                    decoded_content += chunk.decode('utf-8', errors='replace')
-                            except UnicodeDecodeError:
-                                # Try latin-1 as fallback
-                                f.seek(0)
-                                decoded_content = ""
-                                chunk_size = 1024 * 1024  # 1MB chunks
-                                while True:
-                                    chunk = f.read(chunk_size)
-                                    if not chunk:
-                                        break
-                                    decoded_content += chunk.decode('latin-1', errors='replace')
-                        
-                        # Prepare metadata
-                        metadata = {
-                            "extension": ext,
-                            "language": self._get_language_name(ext),
-                            "file_size": os.path.getsize(file_path),
-                            "is_supported": ext in supported_extensions,
-                            "path_components": rel_path.split(os.sep)
-                        }
-                        
-                        # Check if this is an entry point
-                        is_entry_point = rel_path in results["architecture"]["entry_points"]
-                        if is_entry_point:
-                            metadata["is_entry_point"] = True
-                        
-                        # Add file to embedding store with metadata
+                        # Read file content
+                        content = ""
                         try:
-                            if self.embedding_store:
-                                print(f"CRITICAL DEBUG: Adding file to embedding store: {rel_path}")
-                                self.embedding_store.add_file(rel_path, decoded_content, metadata)
-                                print(f"CRITICAL DEBUG: Successfully added file to embedding store: {rel_path}")
-                                new_files += 1
-                                indexed_files += 1
-                            else:
-                                print(f"CRITICAL DEBUG: Embedding store is None, cannot add file: {rel_path}")
-                        except Exception as e:
-                            print(f"CRITICAL DEBUG: Error adding file to embedding store: {rel_path} - {str(e)}")
-                            logger.warning(f"Failed to add file to embedding store: {rel_path}: {str(e)}")
-                    except Exception as e:
-                        logger.warning(f"Failed to index {rel_path}: {str(e)}")
-                        skipped_files += 1
-                        
-            if reused_files > 0:
-                logger.info(f"Reused {reused_files} files already in embedding store, indexed {new_files} new files")
-            
-            if skipped_test_files > 0:
-                logger.info(f"Skipped {skipped_test_files} test files from RAG indexing")
-                
-            # FORCE SAVE: Make sure all indexed files are saved immediately
-            if self.embedding_store and new_files > 0:
-                try:
-                    logger.info("Forcing save of embedding store after indexing")
-                    self.embedding_store.save()
-                    
-                    # Verify the save was successful by checking file count
-                    pre_save_files = indexed_files
-                    all_files_after_save = self.embedding_store._get_all_files()
-                    if len(all_files_after_save) < pre_save_files:
-                        logger.error(f"SAVE ERROR: Embedding store has fewer files after save ({len(all_files_after_save)}) than expected ({pre_save_files})")
-                        print(f"CRITICAL DEBUG: Embedding store has fewer files after save: {len(all_files_after_save)} vs {pre_save_files}")
-                    else:
-                        logger.info(f"Verified save successful: {len(all_files_after_save)} files in embedding store")
-                        print(f"CRITICAL DEBUG: Save successful with {len(all_files_after_save)} files")
-                except Exception as e:
-                    logger.error(f"Error forcing save of embedding store: {str(e)}")
-                    print(f"CRITICAL DEBUG: Error saving embedding store: {str(e)}")
-
-            # Process files in chunks to avoid memory issues
-            chunk_size = 100  # Process 100 files at a time
-            logger.info(f"Processing {len(all_files)} files in chunks of {chunk_size}...")
-            
-            # Calculate total chunks for progress reporting
-            total_chunks = (len(all_files) + chunk_size - 1) // chunk_size
-            
-            # Process each chunk
-            for chunk_idx in range(total_chunks):
-                start_idx = chunk_idx * chunk_size
-                end_idx = min(start_idx + chunk_size, len(all_files))
-                chunk = all_files[start_idx:end_idx]
-                
-                logger.info(f"Processing chunk {chunk_idx+1}/{total_chunks} ({start_idx+1}-{end_idx} of {len(all_files)} files)")
-                
-                # Process files in this chunk
-                for rel_path, file_path, ext in chunk:
-                    # Skip test files
-                    if 'test' in rel_path.lower():
-                        skipped_files += 1
-                        continue
-                    
-                    # If file isn't in a supported extension, we still want to index it for RAG
-                    # but we'll skip the parsing/AST extraction
-                    if ext not in supported_extensions:
-                        # We should only index files that match the primary language
-                        # Skip indexing this file since it doesn't match any supported extension
-                        continue
-                        
-                    # Only try to parse files with supported extensions
-                    if ext in supported_extensions:
-                        logger.info(f"Parsing: {rel_path}")
-                        
-                        # Parse file
-                        ast_info = self._parse_file(file_path)
-                        if not ast_info:
-                            skipped_files += 1
+                            with open(file_path, 'rb') as f:
+                                content_bytes = f.read()
+                                content = self._safe_decode(content_bytes)
+                        except Exception as read_error:
+                            warning_msg(f"Error reading {file_path}: {str(read_error)}")
+                            pbar.update(1)
                             continue
                         
-                        parsed_files += 1
+                        # Skip empty files or those that couldn't be decoded
+                        if not content:
+                            pbar.update(1)
+                            continue
                         
-                        # Get file metadata
-                        metadata = {
-                            "is_entry_point": rel_path in results["architecture"]["entry_points"]
-                        }
+                        # Check if this is an entry point (main file)
+                        is_entry_point = self._detect_entry_point(file_path, content, ext)
+                        if is_entry_point:
+                            entry_points.append(file_path)
                         
-                        # Add AST info to metadata for cross-referencing
-                        if self.embedding_store:
-                            # Update metadata in embedding store
-                            self._update_file_metadata(rel_path, ast_info)
+                        # Parse AST
+                        file_info = self._parse_file(file_path)
                         
-                        # Add component
-                        component = {
-                            "name": Path(file_path).stem,
-                            "type": "file",
-                            "path": rel_path,
-                            "classes": ast_info["classes"],
-                            "functions": ast_info["functions"],
-                            "imports": ast_info["imports"],
-                            "dependencies": ast_info["dependencies"],
-                            "metadata": metadata
-                        }
-                        results["components"].append(component)
-                        
-                        # Add dependencies
-                        results["dependencies"].extend(ast_info["dependencies"])
-                        
-                        # Analyze data flows
-                        self._extract_data_flows(component, ast_info, results)
-                
-                # Clean up after each chunk to prevent memory buildup
-                import gc
-                gc.collect()
-            
-            # Build file relationship graph
-            if self.embedding_store:
-                try:
-                    relationships = self.embedding_store.get_file_relationships()
-                    results["file_relationships"] = relationships
-                    logger.info(f"Built relationship graph for {len(relationships)} files")
-                except Exception as e:
-                    logger.warning(f"Failed to build relationship graph: {str(e)}")
-            
-            # Double-check the actual count of indexed files
-            actual_indexed_files = 0
-            if self.embedding_store:
-                try:
-                    all_files = self.embedding_store._get_all_files()
-                    actual_indexed_files = len(all_files)
-                    logger.info(f"Verified {actual_indexed_files} unique files in embedding store")
+                        # Process only if parsing succeeded
+                        if file_info:
+                            # Create component object
+                            component = {
+                                "path": file_path,
+                                "name": os.path.basename(file_path),
+                                "type": language,
+                                "classes": file_info.get("classes", []),
+                                "functions": file_info.get("functions", []),
+                                "imports": file_info.get("imports", []),
+                                "dependencies": file_info.get("dependencies", []),
+                                "metadata": {
+                                    "is_entry_point": is_entry_point
+                                }
+                            }
+                            
+                            current_batch.append((component, file_info, content))
+                            current_batch_size += 1
+                            
+                            # Add to directory structure for architecture analysis
+                            rel_path = os.path.relpath(file_path, str(self.repo_path))
+                            dir_path = os.path.dirname(rel_path)
+                            if dir_path not in directory_structure:
+                                directory_structure[dir_path] = []
+                            directory_structure[dir_path].append({
+                                "file": os.path.basename(file_path),
+                                "language": language,
+                                "is_entry_point": is_entry_point
+                            })
+                            
+                            # Check if we've reached batch size or it's the last file
+                            if current_batch_size >= batch_size:
+                                # Process batch and add to embedding store
+                                self._process_file_batch(current_batch, components, data_flows, file_relationships)
+                                current_batch = []
+                                current_batch_size = 0
+                                
+                                # Release GPU memory after each batch
+                                if self.embedding_store and hasattr(self.embedding_store, 'device') and self.embedding_store.device == 'cuda':
+                                    import torch
+                                    import gc
+                                    gc.collect()
+                                    torch.cuda.empty_cache()
                     
-                    # CRITICAL DEBUG OUTPUT
-                    print(f"CRITICAL DEBUG: Final embedding store contains {actual_indexed_files} unique files")
-                    print(f"CRITICAL DEBUG: First 10 files in embedding store: {all_files[:10]}")
-                    
-                    # If there's a mismatch, update the counter
-                    if actual_indexed_files != indexed_files:
-                        logger.warning(f"Indexed files counter ({indexed_files}) doesn't match actual count in embedding store ({actual_indexed_files})")
-                        indexed_files = actual_indexed_files
-                except Exception as e:
-                    logger.warning(f"Failed to verify indexed files count: {str(e)}")
-                    print(f"CRITICAL DEBUG: Failed to verify indexed files count: {str(e)}")
+                        # Update progress bar
+                        pbar.update(1)
+                        
+                    except Exception as e:
+                        self._safe_exception_handler("analyze_file", e, severity="warning")
+                        pbar.update(1)
+                        continue
             
-            logger.info(f"Code analysis completed: {parsed_files} files parsed, {indexed_files} files indexed for RAG, {skipped_files} files skipped out of {total_files} total files")
-            logger.info(f"Files matching primary language: {primary_language_files} ({(primary_language_files/total_files)*100:.1f}% of repository)")
-            
-            # Clean up results
-            results["dependencies"] = list(set(results["dependencies"]))  # Remove duplicates
-            
-            # Check if we found anything useful
-            if not results["components"]:
-                logger.warning("No code components found in the repository")
-            if not results["data_flows"]:
-                logger.warning("No data flows found in the repository")
+            # Process final batch if any
+            if current_batch:
+                self._process_file_batch(current_batch, components, data_flows, file_relationships)
                 
-            return results
+                # Final memory cleanup
+                if self.embedding_store and hasattr(self.embedding_store, 'device') and self.embedding_store.device == 'cuda':
+                    import torch
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+        
+            # Add enhanced architecture information
+            architecture = self._analyze_architecture({
+                "file_types": file_types,
+                "directory_structure": directory_structure,
+                "entry_points": entry_points,
+            })
+            
+            # Identify critical files based on architecture analysis
+            critical_files = self._identify_critical_files(architecture)
+            
+            # Update component metadata with critical file status
+            for component in components:
+                if component["path"] in critical_files:
+                    component["metadata"]["is_critical"] = True
+                    
+                    # Add to embedding store metadata if not already there
+                    if self.embedding_store:
+                        self._update_file_metadata(component["path"], {"is_critical": True})
+                    
+            # Log entry points
+            info_msg(f"Detected {len(entry_points)} entry points")
+            for entry_point in entry_points[:5]:  # Show only a few
+                info_msg(f"  {entry_point}")
+            if len(entry_points) > 5:
+                info_msg(f"  ... and {len(entry_points) - 5} more")
+            
+            # Log critical files
+            info_msg(f"Identified {len(critical_files)} critical files")
+            for critical_file in critical_files[:5]:  # Show only a few
+                info_msg(f"  {critical_file}")
+            if len(critical_files) > 5:
+                info_msg(f"  ... and {len(critical_files) - 5} more")
+            
+            # Update the embedding store
+            if self.embedding_store:
+                # Save embeddings before returning
+                try:
+                    info_msg("Saving embedding store...")
+                    self.embedding_store.save()
+                    info_msg("Embedding store saved successfully")
+                except Exception as e:
+                    warning_msg(f"Failed to save embedding store: {str(e)}")
+                    
+                # Release GPU memory after saving
+                try:
+                    import torch
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    info_msg("Released GPU memory after saving embeddings")
+                except:
+                    pass
+            
+            # Return results
+            return {
+                "components": components,
+                "data_flows": data_flows,
+                "architecture": architecture,
+                "entry_points": entry_points,
+                "critical_files": critical_files,
+                "file_relationships": file_relationships
+            }
             
         except Exception as e:
-            logger.error(f"Failed to analyze code: {str(e)}")
-            raise RepositoryAnalyzerError(f"Code analysis failed: {str(e)}")
-    
+            self._safe_exception_handler("analyze_code", e, severity="error", reraise=True)
+            return {}  # This line will only be reached if reraise is set to False
+
+    def _process_file_batch(self, batch, components, data_flows, file_relationships):
+        """Process a batch of files for analysis and embedding."""
+        for component, file_info, content in batch:
+            # Add component
+            components.append(component)
+            
+            # Extract data flows
+            self._extract_data_flows(component, file_info, data_flows)
+            
+            # Extract file relationships
+            imports = file_info.get("imports", [])
+            file_path = component["path"]
+            
+            # Convert imports to file paths if possible
+            related_files = []
+            for imp in imports:
+                # Simple heuristic: check if the repository contains a file with this name
+                if "/" in imp or "\\" in imp:
+                    # This looks like a path
+                    imp_parts = imp.replace("\\", "/").split("/")
+                    imp_name = imp_parts[-1]
+                    
+                    # Check for files that might match this import
+                    repo_root = str(self.repo_path)
+                    for root, _, files in os.walk(repo_root):
+                        for file in files:
+                            if file == imp_name or file == imp_name + ".py" or file == imp_name + ".js":
+                                related_path = os.path.join(root, file)
+                                related_files.append(related_path)
+                                break
+            
+            # Store file relationships
+            if related_files:
+                file_relationships[file_path] = related_files
+            
+            # Add to embedding store if available
+            if self.embedding_store and content:
+                try:
+                    enhanced_content = content
+                    
+                    # Add some context from file info to improve embeddings
+                    if file_info.get("classes") or file_info.get("functions"):
+                        # Create a summary of the file structure
+                        summary = f"File: {component['name']}\nLanguage: {component['type']}\n\n"
+                        
+                        # Add classes
+                        if file_info.get("classes"):
+                            summary += "Classes:\n"
+                            for cls in file_info.get("classes")[:5]:  # Limit to first 5
+                                summary += f"- {cls.get('name')}\n"
+                            if len(file_info.get("classes")) > 5:
+                                summary += f"... and {len(file_info.get('classes')) - 5} more\n"
+                        
+                        # Add functions
+                        if file_info.get("functions"):
+                            summary += "\nFunctions:\n"
+                            for func in file_info.get("functions")[:5]:  # Limit to first 5
+                                summary += f"- {func.get('name')}\n"
+                            if len(file_info.get("functions")) > 5:
+                                summary += f"... and {len(file_info.get('functions')) - 5} more\n"
+                        
+                        # Add imports
+                        if file_info.get("imports"):
+                            summary += "\nImports:\n"
+                            for imp in file_info.get("imports")[:5]:  # Limit to first 5
+                                summary += f"- {imp}\n"
+                            if len(file_info.get("imports")) > 5:
+                                summary += f"... and {len(file_info.get('imports')) - 5} more\n"
+                        
+                        # Enhance content with summary
+                        enhanced_content = summary + "\n\n" + content[:50000]  # Limit content to 50K chars
+                    
+                    # Add file to embedding store with metadata
+                    self.embedding_store.add_file(
+                        file_path, 
+                        enhanced_content, 
+                        metadata={
+                            "language": component["type"],
+                            "is_entry_point": component["metadata"].get("is_entry_point", False),
+                            "extension": os.path.splitext(file_path)[1].lower()[1:],  # Extension without dot
+                            "classes": [cls.get("name") for cls in file_info.get("classes", [])],
+                            "functions": [func.get("name") for func in file_info.get("functions", [])],
+                            "imports": file_info.get("imports", [])
+                        }
+                    )
+                except Exception as e:
+                    warning_msg(f"Error adding {file_path} to embedding store: {str(e)}")
+                
+            # Release GPU memory after each file if using CUDA
+            if self.embedding_store and hasattr(self.embedding_store, 'device') and self.embedding_store.device == 'cuda':
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except:
+                    pass
+
     def _get_language_name(self, ext: str) -> str:
         """Get language name from file extension."""
         ext_to_lang = {

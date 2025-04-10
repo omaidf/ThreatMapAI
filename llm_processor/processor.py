@@ -1144,6 +1144,9 @@ Pay special attention to:
             # Report GPU status at start of processing
             self._log_gpu_status("Starting threat model generation")
             
+            # Clean GPU memory before starting
+            self._release_gpu_memory()
+            
             # Check if LLM is available
             if not self.llm:
                 logger.warning("LLM not available, generating minimal threat model")
@@ -1231,12 +1234,18 @@ Pay special attention to:
             
             # Architecture analysis with limited file list
             try:
+                # Clean memory before architecture analysis
+                self._release_gpu_memory()
+                
                 architecture_analysis = self._explore_architecture(
                     tech_stack, 
                     file_list, 
                     entry_points,
                     file_relationships
                 )
+                
+                # Clean memory after architecture analysis
+                self._release_gpu_memory()
             except Exception as e:
                 logger.warning(f"Error in final architecture analysis: {str(e)}")
                 architecture_analysis = {
@@ -1312,25 +1321,36 @@ Pay special attention to:
                 
             logger.info(f"Analyzing {len(priority_components)} priority components first")
             
-            # Process components in batches to avoid memory issues
-            batch_size = 20  # Process 20 components at a time
+            # Process components in smaller batches to avoid memory issues
+            batch_size = 10  # Process 10 components at a time (reduced from 20)
             components_analyzed = 0
             
             # Analyze components with RAG for dynamic context
-            for i, component in enumerate(priority_components):
-                component_threats = self._analyze_component_with_exploration(component, analysis_results)
-                threat_model["components"].append({
-                    "name": component["name"],
-                    "type": component["type"],
-                    "path": component["path"],
-                    "priority": True,
-                    "threats": [threat.dict() for threat in component_threats]
-                })
+            for batch_start in range(0, len(priority_components), batch_size):
+                # Clean memory before each batch
+                self._release_gpu_memory()
                 
-                # Release memory every 10 components to avoid accumulation
-                if (i + 1) % 10 == 0:
-                    info_msg(f"Processed {i + 1}/{len(priority_components)} components, releasing GPU memory")
+                batch_end = min(batch_start + batch_size, len(priority_components))
+                info_msg(f"Processing component batch {batch_start//batch_size + 1}: components {batch_start+1}-{batch_end} of {len(priority_components)}")
+                
+                for i in range(batch_start, batch_end):
+                    component = priority_components[i]
+                    component_threats = self._analyze_component_with_exploration(component, analysis_results)
+                    threat_model["components"].append({
+                        "name": component["name"],
+                        "type": component["type"],
+                        "path": component["path"],
+                        "priority": True,
+                        "threats": [threat.dict() for threat in component_threats]
+                    })
+                    
+                    components_analyzed += 1
+                    
+                    # Release memory after each component to avoid accumulation
                     self._release_gpu_memory()
+                
+                # Log progress after each batch
+                info_msg(f"Completed {components_analyzed}/{len(priority_components)} components")
             
             # Analyze data flows with enhanced focus on security boundaries
             logger.info("Analyzing data flows with focus on security boundaries")
@@ -1347,51 +1367,67 @@ Pay special attention to:
             # Release memory before data flow analysis
             self._release_gpu_memory()
             
+            # Process data flows in smaller batches
             flow_count = 0
-            for source, flows in data_flows_by_component.items():
-                # Get combined context for all flows from this source
-                contexts = []
-                if self.embedding_store:
-                    contexts = self._get_context_for_path(
-                        source,
-                        max_results=10  # Increased to get better context
-                    )
+            batch_size = 5  # Process 5 sources at a time
+            
+            sources = list(data_flows_by_component.keys())
+            for batch_idx in range(0, len(sources), batch_size):
+                # Clean memory before each batch
+                self._release_gpu_memory()
                 
-                # Check if this flow crosses security boundaries
-                crosses_boundary = False
-                for flow in flows:
-                    for cross_flow in threat_model["cross_boundary_flows"]:
-                        if flow["source"] == cross_flow["source"] and flow["function"] == cross_flow["function"]:
-                            crosses_boundary = True
+                batch_end = min(batch_idx + batch_size, len(sources))
+                info_msg(f"Processing data flow batch {batch_idx//batch_size + 1}: sources {batch_idx+1}-{batch_end} of {len(sources)}")
+                
+                for source_idx in range(batch_idx, batch_end):
+                    source = sources[source_idx]
+                    flows = data_flows_by_component[source]
+                    
+                    # Get combined context for all flows from this source
+                    contexts = []
+                    if self.embedding_store:
+                        contexts = self._get_context_for_path(
+                            source,
+                            max_results=10  # Increased to get better context
+                        )
+                    
+                    # Check if this flow crosses security boundaries
+                    crosses_boundary = False
+                    for flow in flows:
+                        for cross_flow in threat_model["cross_boundary_flows"]:
+                            if flow["source"] == cross_flow["source"] and flow["function"] == cross_flow["function"]:
+                                crosses_boundary = True
+                                break
+                        if crosses_boundary:
                             break
-                    if crosses_boundary:
-                        break
-                
-                # Analyze each flow with the combined context
-                for data_flow in flows:
-                    # Add boundary crossing information to the flow
-                    if crosses_boundary:
-                        data_flow["crosses_boundary"] = True
                     
-                    flow_threats = self._analyze_data_flow_with_exploration(
-                        data_flow, 
-                        "\n\n".join(contexts),
-                        threat_model["security_boundaries"]
-                    )
-                    
-                    threat_model["data_flows"].append({
-                        "source": data_flow["source"],
-                        "function": data_flow["function"],
-                        "parameters": data_flow.get("parameters", []),
-                        "crosses_boundary": crosses_boundary,
-                        "threats": [threat.dict() for threat in flow_threats]
-                    })
-                    
-                    flow_count += 1
-                    # Release memory every 5 flows
-                    if flow_count % 5 == 0:
-                        info_msg(f"Processed {flow_count} data flows, releasing GPU memory")
+                    # Analyze each flow with the combined context
+                    for data_flow in flows:
+                        # Add boundary crossing information to the flow
+                        if crosses_boundary:
+                            data_flow["crosses_boundary"] = True
+                        
+                        flow_threats = self._analyze_data_flow_with_exploration(
+                            data_flow, 
+                            "\n\n".join(contexts),
+                            threat_model["security_boundaries"]
+                        )
+                        
+                        threat_model["data_flows"].append({
+                            "source": data_flow["source"],
+                            "function": data_flow["function"],
+                            "parameters": data_flow.get("parameters", []),
+                            "crosses_boundary": crosses_boundary,
+                            "threats": [threat.dict() for threat in flow_threats]
+                        })
+                        
+                        flow_count += 1
+                        
+                        # Release memory after each flow
                         self._release_gpu_memory()
+                    
+                    # Log progress
+                    info_msg(f"Processed {flow_count} data flows")
             
             # Release memory after all data flow analysis
             self._release_gpu_memory()
@@ -1430,8 +1466,10 @@ Pay special attention to:
             
         except Exception as e:
             logger.error(f"Failed to generate threat model: {str(e)}")
+            # Final cleanup in case of error
+            self._release_gpu_memory()
             raise LLMProcessorError(f"Threat model generation failed: {str(e)}")
-            
+    
     def _generate_minimal_threat_model(self, analysis_results: Dict[str, Any]) -> Dict[str, Any]:
         """
         Generate a minimal threat model when no components are found.
@@ -2158,422 +2196,8 @@ For PHP code, pay special attention to input validation, SQL injection, XSS, and
             # Parse and return threats
             threats = self._parse_threats(result)
             
-            return threats
-            
-        except Exception as e:
-            logger.error(f"Failed to analyze component: {str(e)}")
-            raise LLMProcessorError(f"Component analysis failed: {str(e)}")
-    
-    def _generate_component_questions(self, component: Dict[str, Any], code_analysis: CodeAnalysis, is_priority: bool) -> List[str]:
-        """Generate questions for dynamically exploring a component."""
-        questions = []
-        
-        # Basic questions for all components
-        questions.append("How is user input validated?")
-        questions.append("Are there any authentication checks?")
-        
-        # Add language-specific questions
-        path = component.get("path", "")
-        ext = Path(path).suffix.lower() if path else ""
-        
-        if ext == ".php":
-            questions.append("How are database queries constructed?")
-            questions.append("Is user input properly sanitized?")
-            questions.append("Are there any file operations?")
-            questions.append("How are sessions managed?")
-        
-        elif ext in [".js", ".jsx", ".ts", ".tsx"]:
-            questions.append("Are there any DOM manipulation functions?")
-            questions.append("How is AJAX/fetch used?")
-            questions.append("Is there input sanitization?")
-        
-        elif ext == ".py":
-            questions.append("How are database queries constructed?")
-            questions.append("Are there any shell commands or exec calls?")
-            questions.append("How is authentication handled?")
-        
-        # Add questions based on code analysis
-        if "database" in code_analysis.purpose.lower() or "db" in code_analysis.purpose.lower():
-            questions.append("How is SQL injection prevented?")
-            questions.append("Are prepared statements used?")
-        
-        if "auth" in code_analysis.purpose.lower() or "login" in code_analysis.purpose.lower():
-            questions.append("How are passwords stored?")
-            questions.append("Is MFA implemented?")
-            questions.append("How are sessions managed?")
-        
-        if is_priority:
-            questions.append("What security checks are performed?")
-            questions.append("Are there any hardcoded credentials?")
-            questions.append("How is sensitive data handled?")
-        
-        # Limit to avoid too many queries
-        return questions[:5]
-    
-    def _analyze_data_flow_with_exploration(self, data_flow: Dict[str, Any], additional_context: str = None, security_boundaries: List[Dict[str, Any]] = None) -> List[Threat]:
-        """
-        Analyze a data flow for security threats with boundary awareness.
-        
-        Args:
-            data_flow: Data flow information from repository analysis
-            additional_context: Additional context about the data flow (optional)
-            security_boundaries: List of security boundaries
-            
-        Returns:
-            List of identified threats
-        """
-        try:
-            # Ensure GPU is engaged for processing
-            self._ensure_gpu_acceleration()
-            
-            # Get relevant context
-            contexts = []
-            
-            # Add provided additional context if any
-            if additional_context:
-                contexts.append(additional_context)
-                
-            # Add context from embedding store
-            if self.embedding_store:
-                stored_contexts = self.embedding_store.get_relevant_context(
-                    data_flow["source"],
-                    max_results=5
-                )
-                contexts.extend(stored_contexts)
-            
-            # Check if this flow crosses security boundaries
-            crosses_boundary = data_flow.get("crosses_boundary", False)
-            boundary_context = ""
-            
-            if crosses_boundary and security_boundaries:
-                # Add boundary information
-                for boundary in security_boundaries:
-                    components = boundary.get("components", [])
-                    if data_flow["source"] in components:
-                        boundary_context += f"Source is within security boundary: {boundary['name']} - {boundary.get('description', '')}\n"
-                
-                boundary_context += "WARNING: This data flow crosses security boundaries!"
-            
-            if boundary_context:
-                contexts.append(boundary_context)
-            
-            # Add parameters to allow better analysis
-            parameters = data_flow.get("parameters", [])
-            if parameters:
-                contexts.append(f"Flow parameters: {', '.join(parameters)}")
-            
-            # Generate dynamic questions about this flow
-            flow_questions = [
-                "How is data validated before processing?",
-                "What security checks are performed on the parameters?",
-                "Is the data sanitized before use?"
-            ]
-            
-            if crosses_boundary:
-                flow_questions.append("What authentication/authorization is performed?")
-                flow_questions.append("How is the data protected when crossing boundaries?")
-            
-            # Get answers to questions
-            for question in flow_questions[:2]:  # Limit to 2 questions
-                source = data_flow["source"]
-                function = data_flow["function"]
-                answer = self._query_rag_for_answer(f"{source} {function} {question}")
-                if answer and answer != "No relevant information found." and answer != "Error retrieving information.":
-                    contexts.append(f"Q: {question}\nA: {answer}")
-            
-            # Construct prompt for data flow analysis with enhanced instructions
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", f"""You are a security expert analyzing data flows for potential threats. 
-Focus on identifying how data moves through the system and potential security issues at each point.
-{'This data flow CROSSES SECURITY BOUNDARIES, which requires extra scrutiny!' if crosses_boundary else ''}
-Pay special attention to:
-- Input validation and sanitization
-- Authentication and authorization checks
-- Data encryption and protection
-- Error handling and information leakage
-- Access control enforcement
-- Injection vulnerabilities (SQL, command, etc.)
-- Cross-site scripting opportunities
-- File operation security"""),
-                ("human", """
-                Data Flow:
-                Source: {source}
-                Function: {function}
-                Parameters: {parameters}
-                Crosses Security Boundary: {crosses_boundary}
-                
-                Context:
-                {context}
-                
-                Please analyze this data flow for security threats, focusing on:
-                1. Data validation
-                2. Authentication
-                3. Authorization
-                4. Encryption
-                5. Error handling
-                
-                For each threat, provide:
-                - Type
-                - Description
-                - Severity (Low/Medium/High)
-                - Impact
-                - Mitigation
-                - Relevant code snippet (if any)
-                
-                Also identify how this data flow interacts with other components and any security boundaries it crosses.
-                """)
-            ])
-            
-            # Create chain and run analysis
-            chain = prompt | self.llm | StrOutputParser()
-            result = chain.invoke({
-                "source": data_flow["source"],
-                "function": data_flow["function"],
-                "parameters": ", ".join(data_flow.get("parameters", [])),
-                "crosses_boundary": str(crosses_boundary),
-                "context": "\n".join(contexts)
-            })
-            
-            # Parse and return threats
-            return self._parse_threats(result)
-            
-        except Exception as e:
-            logger.error(f"Failed to analyze data flow: {str(e)}")
-            raise LLMProcessorError(f"Data flow analysis failed: {str(e)}")
-    
-    def _analyze_cross_file_vulnerabilities(self, analysis_results: Dict[str, Any], components: List[Dict[str, Any]], data_flows: List[Dict[str, Any]], cross_boundary_flows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Analyze cross-file vulnerabilities.
-        
-        Args:
-            analysis_results: Overall analysis results
-            components: Analyzed components
-            data_flows: Analyzed data flows
-            cross_boundary_flows: Flows that cross security boundaries
-            
-        Returns:
-            List of cross-file vulnerabilities
-        """
-        try:
-            # Create context with key information
-            context = []
-            
-            # Add high-risk components
-            high_risk_components = []
-            for component in components:
-                for threat in component.get("threats", []):
-                    if threat.get("severity", "").lower() == "high":
-                        high_risk_components.append(component["name"])
-                        break
-            
-            if high_risk_components:
-                context.append(f"High risk components: {', '.join(high_risk_components)}")
-            
-            # Add cross-boundary flows information
-            if cross_boundary_flows:
-                flows_text = []
-                for flow in cross_boundary_flows[:5]:  # Limit to 5 flows
-                    flows_text.append(f"{flow['source']} -> {flow['destination']} (from {flow['source_boundary']} to {flow['destination_boundary']})")
-                context.append("Cross-boundary flows:\n- " + "\n- ".join(flows_text))
-            
-            # Get file relationships
-            file_relationships = analysis_results.get("file_relationships", {})
-            if file_relationships:
-                # Filter to relationships involving high-risk components
-                risky_relationships = {}
-                for comp in high_risk_components:
-                    if comp in file_relationships:
-                        risky_relationships[comp] = file_relationships[comp]
-                
-                if risky_relationships:
-                    rel_text = []
-                    for source, targets in list(risky_relationships.items())[:5]:
-                        rel_text.append(f"{source} -> {', '.join(targets[:3])}" + ("..." if len(targets) > 3 else ""))
-                    context.append("Risky file relationships:\n- " + "\n- ".join(rel_text))
-            
-            # Get entry points
-            entry_points = analysis_results.get("architecture", {}).get("entry_points", [])
-            if entry_points:
-                context.append(f"Entry points: {', '.join(entry_points[:5])}")
-            
-            # Analyze cross-file vulnerabilities
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", "You are a security expert performing cross-file vulnerability analysis. Your task is to identify vulnerabilities that span multiple files and components."),
-                ("human", """
-                Based on the following information about a codebase:
-                
-                {context}
-                
-                Please identify potential cross-file vulnerabilities, focusing on:
-                1. Insecure data passing between components
-                2. Authentication/authorization bypasses
-                3. Cross-boundary data leaks
-                4. End-to-end injection vulnerabilities
-                5. Race conditions
-                
-                For each vulnerability, provide:
-                - Type
-                - Description
-                - Severity (Low/Medium/High)
-                - Components involved
-                - Attack vector
-                - Mitigation
-                
-                Format as JSON:
-                ```json
-                [
-                  {
-                    "type": "vulnerability_type",
-                    "description": "description",
-                    "severity": "severity",
-                    "components": ["component1", "component2"],
-                    "attack_vector": "attack_vector",
-                    "mitigation": "mitigation"
-                  }
-                ]
-                ```
-                
-                Return ONLY the JSON without explanation.
-                """)
-            ])
-            
-            # Get vulnerabilities - Updated for LangChain 0.2.x
-            chain = prompt | self.llm | StrOutputParser()
-            vulnerabilities_response = chain.invoke({
-                "context": "\n\n".join(context)
-            })
-            
-            # Extract JSON response
-            vulnerabilities = self._extract_json(vulnerabilities_response)
-            if not isinstance(vulnerabilities, list):
-                return []
-            
-            return vulnerabilities
-            
-        except Exception as e:
-            logger.error(f"Cross-file vulnerability analysis failed: {str(e)}")
-            return []
-    
-    def _calculate_enhanced_risk(self, threat_model: Dict[str, Any]) -> str:
-        """Calculate the overall risk level based on all threats and vulnerabilities."""
-        try:
-            severity_scores = {
-                "Low": 1,
-                "Medium": 2,
-                "High": 3
-            }
-            
-            max_score = 0
-            total_score = 0
-            threat_count = 0
-            
-            # Check component threats
-            for component in threat_model.get("components", []):
-                for threat in component.get("threats", []):
-                    score = severity_scores.get(threat.get("severity", "Low"), 1)
-                    max_score = max(max_score, score)
-                    total_score += score
-                    threat_count += 1
-            
-            # Check data flow threats
-            for flow in threat_model.get("data_flows", []):
-                for threat in flow.get("threats", []):
-                    # Higher weight for boundary-crossing flows
-                    weight = 1.5 if flow.get("crosses_boundary") else 1.0
-                    score = severity_scores.get(threat.get("severity", "Low"), 1) * weight
-                    max_score = max(max_score, score)
-                    total_score += score
-                    threat_count += 1
-            
-            # Check cross-file vulnerabilities
-            for vuln in threat_model.get("vulnerabilities", []):
-                score = severity_scores.get(vuln.get("severity", "Low"), 1) * 2.0  # Higher weight
-                max_score = max(max_score, score)
-                total_score += score
-                threat_count += 1
-            
-            # Calculate average severity (if any threats exist)
-            avg_score = total_score / threat_count if threat_count > 0 else 0
-            
-            # Determine overall risk based on max and average scores
-            if max_score >= 3 or avg_score >= 2.0:
-                return "High"
-            elif max_score >= 2 or avg_score >= 1.5:
-                return "Medium"
-            return "Low"
-            
-        except Exception as e:
-            logger.warning(f"Failed to calculate enhanced risk: {str(e)}")
-            return "Unknown"
-    
-    def _extract_section(self, text: str, section: str) -> str:
-        """Extract a specific section from the LLM response."""
-        try:
-            start = text.find(f"{section}:")
-            if start == -1:
-                return ""
-            start += len(section) + 1
-            end = text.find("\n\n", start)
-            if end == -1:
-                end = len(text)
-            return text[start:end].strip()
-        except Exception as e:
-            logger.warning(f"Failed to extract section {section}: {str(e)}")
-            return ""
-    
-    def _extract_list(self, text: str, section: str) -> List[str]:
-        """Extract a list from the LLM response."""
-        try:
-            section_text = self._extract_section(text, section)
-            if not section_text:
-                return []
-            return [item.strip("- ").strip() for item in section_text.split("\n") if item.strip()]
-        except Exception as e:
-            logger.warning(f"Failed to extract list from {section}: {str(e)}")
-            return []
-    
-    def _parse_threats(self, text: str) -> List[Threat]:
-        """Parse threats from the LLM response."""
-        try:
-            threats = []
-            current_threat = {}
-            
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line:
-                    if current_threat and "type" in current_threat:
-                        try:
-                            # Ensure all required fields are present
-                            required_fields = ["type", "description", "severity", "impact", "mitigation"]
-                            for field in required_fields:
-                                if field not in current_threat:
-                                    current_threat[field] = "Not specified"
-                            
-                            threats.append(Threat(**current_threat))
-                        except Exception as e:
-                            logger.warning(f"Failed to create threat from {current_threat}: {str(e)}")
-                        finally:
-                            current_threat = {}
-                    continue
-                
-                if ":" in line:
-                    key, value = line.split(":", 1)
-                    key = key.strip().lower().replace(" ", "_")
-                    if key in ["type", "description", "severity", "impact", "mitigation", "code_snippet"]:
-                        current_threat[key] = value.strip()
-            
-            # Handle last threat if present
-            if current_threat and "type" in current_threat:
-                try:
-                    # Ensure all required fields are present
-                    required_fields = ["type", "description", "severity", "impact", "mitigation"]
-                    for field in required_fields:
-                        if field not in current_threat:
-                            current_threat[field] = "Not specified"
-                    
-                    threats.append(Threat(**current_threat))
-                except Exception as e:
-                    logger.warning(f"Failed to create threat from {current_threat}: {str(e)}")
+            # Clean up memory
+            self._release_gpu_memory()
             
             return threats
             
@@ -2702,3 +2326,438 @@ Pay special attention to:
         """
         # Call the centralized function in gpu_utils
         release_gpu_memory()
+    
+    def _generate_component_questions(self, component: Dict[str, Any], code_analysis: CodeAnalysis, is_priority: bool) -> List[str]:
+        """Generate questions for dynamically exploring a component."""
+        questions = []
+        
+        # Basic questions for all components
+        questions.append("How is user input validated?")
+        questions.append("Are there any authentication checks?")
+        
+        # Add language-specific questions
+        path = component.get("path", "")
+        ext = Path(path).suffix.lower() if path else ""
+        
+        if ext == ".php":
+            questions.append("How are database queries constructed?")
+            questions.append("Is user input properly sanitized?")
+            questions.append("Are there any file operations?")
+            questions.append("How are sessions managed?")
+        
+        elif ext in [".js", ".jsx", ".ts", ".tsx"]:
+            questions.append("Are there any DOM manipulation functions?")
+            questions.append("How is AJAX/fetch used?")
+            questions.append("Is there input sanitization?")
+        
+        elif ext == ".py":
+            questions.append("How are database queries constructed?")
+            questions.append("Are there any shell commands or exec calls?")
+            questions.append("How is authentication handled?")
+        
+        # Add questions based on code analysis
+        if "database" in code_analysis.purpose.lower() or "db" in code_analysis.purpose.lower():
+            questions.append("How is SQL injection prevented?")
+            questions.append("Are prepared statements used?")
+        
+        if "auth" in code_analysis.purpose.lower() or "login" in code_analysis.purpose.lower():
+            questions.append("How are passwords stored?")
+            questions.append("Is MFA implemented?")
+            questions.append("How are sessions managed?")
+        
+        if is_priority:
+            questions.append("What security checks are performed?")
+            questions.append("Are there any hardcoded credentials?")
+            questions.append("How is sensitive data handled?")
+        
+        # Limit to avoid too many queries
+        return questions[:5]
+    
+    def _analyze_data_flow_with_exploration(self, data_flow: Dict[str, Any], additional_context: str = None, security_boundaries: List[Dict[str, Any]] = None) -> List[Threat]:
+        """
+        Analyze a data flow for security threats with boundary awareness.
+        
+        Args:
+            data_flow: Data flow information from repository analysis
+            additional_context: Additional context about the data flow (optional)
+            security_boundaries: List of security boundaries
+            
+        Returns:
+            List of identified threats
+        """
+        try:
+            # Ensure GPU is engaged for processing
+            self._ensure_gpu_acceleration()
+            
+            # Get relevant context
+            contexts = []
+            
+            # Add provided additional context if any
+            if additional_context:
+                contexts.append(additional_context)
+                
+            # Add context from embedding store
+            if self.embedding_store:
+                stored_contexts = self.embedding_store.get_relevant_context(
+                    data_flow["source"],
+                    max_results=5
+                )
+                contexts.extend(stored_contexts)
+            
+            # Check if this flow crosses security boundaries
+            crosses_boundary = data_flow.get("crosses_boundary", False)
+            boundary_context = ""
+            
+            if crosses_boundary and security_boundaries:
+                # Add boundary information
+                for boundary in security_boundaries:
+                    components = boundary.get("components", [])
+                    if data_flow["source"] in components:
+                        boundary_context += f"Source is within security boundary: {boundary['name']} - {boundary.get('description', '')}\n"
+                
+                boundary_context += "WARNING: This data flow crosses security boundaries!"
+            
+            if boundary_context:
+                contexts.append(boundary_context)
+            
+            # Add parameters to allow better analysis
+            parameters = data_flow.get("parameters", [])
+            if parameters:
+                contexts.append(f"Flow parameters: {', '.join(parameters)}")
+            
+            # Generate dynamic questions about this flow
+            flow_questions = [
+                "How is data validated before processing?",
+                "What security checks are performed on the parameters?",
+                "Is the data sanitized before use?"
+            ]
+            
+            if crosses_boundary:
+                flow_questions.append("What authentication/authorization is performed?")
+                flow_questions.append("How is the data protected when crossing boundaries?")
+            
+            # Get answers to questions
+            for question in flow_questions[:2]:  # Limit to 2 questions
+                source = data_flow["source"]
+                function = data_flow["function"]
+                answer = self._query_rag_for_answer(f"{source} {function} {question}")
+                if answer and answer != "No relevant information found." and answer != "Error retrieving information.":
+                    contexts.append(f"Q: {question}\nA: {answer}")
+                
+                # Release memory after each question
+                self._release_gpu_memory()
+            
+            # Construct prompt for data flow analysis with enhanced instructions
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", f"""You are a security expert analyzing data flows for potential threats. 
+Focus on identifying how data moves through the system and potential security issues at each point.
+{'This data flow CROSSES SECURITY BOUNDARIES, which requires extra scrutiny!' if crosses_boundary else ''}
+Pay special attention to:
+- Input validation and sanitization
+- Authentication and authorization checks
+- Data encryption and protection
+- Error handling and information leakage
+- Access control enforcement
+- Injection vulnerabilities (SQL, command, etc.)
+- Cross-site scripting opportunities
+- File operation security"""),
+                ("human", """
+                Data Flow:
+                Source: {source}
+                Function: {function}
+                Parameters: {parameters}
+                Crosses Security Boundary: {crosses_boundary}
+                
+                Context:
+                {context}
+                
+                Please analyze this data flow for security threats, focusing on:
+                1. Data validation
+                2. Authentication
+                3. Authorization
+                4. Encryption
+                5. Error handling
+                
+                For each threat, provide:
+                - Type
+                - Description
+                - Severity (Low/Medium/High)
+                - Impact
+                - Mitigation
+                - Relevant code snippet (if any)
+                
+                Also identify how this data flow interacts with other components and any security boundaries it crosses.
+                """)
+            ])
+            
+            # Create chain and run analysis
+            chain = prompt | self.llm | StrOutputParser()
+            result = chain.invoke({
+                "source": data_flow["source"],
+                "function": data_flow["function"],
+                "parameters": ", ".join(data_flow.get("parameters", [])),
+                "crosses_boundary": str(crosses_boundary),
+                "context": "\n".join(contexts)
+            })
+            
+            # Parse threats from the response
+            threats = self._parse_threats(result)
+            
+            # Clean up memory
+            self._release_gpu_memory()
+            
+            return threats
+            
+        except Exception as e:
+            logger.error(f"Failed to analyze data flow: {str(e)}")
+            # Clean up memory in case of error
+            self._release_gpu_memory()
+            raise LLMProcessorError(f"Data flow analysis failed: {str(e)}")
+    
+    def _analyze_cross_file_vulnerabilities(self, analysis_results: Dict[str, Any], components: List[Dict[str, Any]], data_flows: List[Dict[str, Any]], cross_boundary_flows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Analyze cross-file vulnerabilities.
+        
+        Args:
+            analysis_results: Overall analysis results
+            components: Analyzed components
+            data_flows: Analyzed data flows
+            cross_boundary_flows: Flows that cross security boundaries
+            
+        Returns:
+            List of cross-file vulnerabilities
+        """
+        try:
+            # Clean memory before cross-file analysis
+            self._release_gpu_memory()
+            
+            # Create context with key information
+            context = []
+            
+            # Add high-risk components
+            high_risk_components = []
+            for component in components:
+                for threat in component.get("threats", []):
+                    if threat.get("severity", "").lower() == "high":
+                        high_risk_components.append(component["name"])
+                        break
+            
+            if high_risk_components:
+                context.append(f"High risk components: {', '.join(high_risk_components)}")
+            
+            # Add cross-boundary flows information
+            if cross_boundary_flows:
+                flows_text = []
+                for flow in cross_boundary_flows[:5]:  # Limit to 5 flows
+                    flows_text.append(f"{flow['source']} -> {flow['destination']} (from {flow['source_boundary']} to {flow['destination_boundary']})")
+                context.append("Cross-boundary flows:\n- " + "\n- ".join(flows_text))
+            
+            # Get file relationships
+            file_relationships = analysis_results.get("file_relationships", {})
+            if file_relationships:
+                # Filter to relationships involving high-risk components
+                risky_relationships = {}
+                for comp in high_risk_components:
+                    if comp in file_relationships:
+                        risky_relationships[comp] = file_relationships[comp]
+                
+                if risky_relationships:
+                    rel_text = []
+                    for source, targets in list(risky_relationships.items())[:5]:
+                        rel_text.append(f"{source} -> {', '.join(targets[:3])}" + ("..." if len(targets) > 3 else ""))
+                    context.append("Risky file relationships:\n- " + "\n- ".join(rel_text))
+            
+            # Get entry points
+            entry_points = analysis_results.get("architecture", {}).get("entry_points", [])
+            if entry_points:
+                context.append(f"Entry points: {', '.join(entry_points[:5])}")
+            
+            # Analyze cross-file vulnerabilities
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", "You are a security expert performing cross-file vulnerability analysis. Your task is to identify vulnerabilities that span multiple files and components."),
+                ("human", """
+                Based on the following information about a codebase:
+                
+                {context}
+                
+                Please identify potential cross-file vulnerabilities, focusing on:
+                1. Insecure data passing between components
+                2. Authentication/authorization bypasses
+                3. Cross-boundary data leaks
+                4. End-to-end injection vulnerabilities
+                5. Race conditions
+                
+                For each vulnerability, provide:
+                - Type
+                - Description
+                - Severity (Low/Medium/High)
+                - Components involved
+                - Attack vector
+                - Mitigation
+                
+                Format as JSON:
+                ```json
+                [
+                  {
+                    "type": "vulnerability_type",
+                    "description": "description",
+                    "severity": "severity",
+                    "components": ["component1", "component2"],
+                    "attack_vector": "attack_vector",
+                    "mitigation": "mitigation"
+                  }
+                ]
+                ```
+                
+                Return ONLY the JSON without explanation.
+                """)
+            ])
+            
+            # Get vulnerabilities - Updated for LangChain 0.2.x
+            chain = prompt | self.llm | StrOutputParser()
+            vulnerabilities_response = chain.invoke({
+                "context": "\n\n".join(context)
+            })
+            
+            # Extract JSON response
+            vulnerabilities = self._extract_json(vulnerabilities_response)
+            if not isinstance(vulnerabilities, list):
+                return []
+            
+            # Clean memory after analysis
+            self._release_gpu_memory()
+            
+            return vulnerabilities
+            
+        except Exception as e:
+            logger.error(f"Cross-file vulnerability analysis failed: {str(e)}")
+            # Clean memory
+            self._release_gpu_memory()
+            return []
+    
+    def _calculate_enhanced_risk(self, threat_model: Dict[str, Any]) -> str:
+        """Calculate the overall risk level based on all threats and vulnerabilities."""
+        try:
+            severity_scores = {
+                "Low": 1,
+                "Medium": 2,
+                "High": 3
+            }
+            
+            max_score = 0
+            total_score = 0
+            threat_count = 0
+            
+            # Check component threats
+            for component in threat_model.get("components", []):
+                for threat in component.get("threats", []):
+                    score = severity_scores.get(threat.get("severity", "Low"), 1)
+                    max_score = max(max_score, score)
+                    total_score += score
+                    threat_count += 1
+            
+            # Check data flow threats
+            for flow in threat_model.get("data_flows", []):
+                for threat in flow.get("threats", []):
+                    # Higher weight for boundary-crossing flows
+                    weight = 1.5 if flow.get("crosses_boundary") else 1.0
+                    score = severity_scores.get(threat.get("severity", "Low"), 1) * weight
+                    max_score = max(max_score, score)
+                    total_score += score
+                    threat_count += 1
+            
+            # Check cross-file vulnerabilities
+            for vuln in threat_model.get("vulnerabilities", []):
+                score = severity_scores.get(vuln.get("severity", "Low"), 1) * 2.0  # Higher weight
+                max_score = max(max_score, score)
+                total_score += score
+                threat_count += 1
+            
+            # Calculate average severity (if any threats exist)
+            avg_score = total_score / threat_count if threat_count > 0 else 0
+            
+            # Determine overall risk based on max and average scores
+            if max_score >= 3 or avg_score >= 2.0:
+                return "High"
+            elif max_score >= 2 or avg_score >= 1.5:
+                return "Medium"
+            return "Low"
+            
+        except Exception as e:
+            logger.warning(f"Failed to calculate enhanced risk: {str(e)}")
+            return "Unknown"
+    
+    def _extract_section(self, text: str, section: str) -> str:
+        """Extract a specific section from the LLM response."""
+        try:
+            start = text.find(f"{section}:")
+            if start == -1:
+                return ""
+            start += len(section) + 1
+            end = text.find("\n\n", start)
+            if end == -1:
+                end = len(text)
+            return text[start:end].strip()
+        except Exception as e:
+            logger.warning(f"Failed to extract section {section}: {str(e)}")
+            return ""
+    
+    def _extract_list(self, text: str, section: str) -> List[str]:
+        """Extract a list from the LLM response."""
+        try:
+            section_text = self._extract_section(text, section)
+            if not section_text:
+                return []
+            return [item.strip("- ").strip() for item in section_text.split("\n") if item.strip()]
+        except Exception as e:
+            logger.warning(f"Failed to extract list from {section}: {str(e)}")
+            return []
+    
+    def _parse_threats(self, text: str) -> List[Threat]:
+        """Parse threats from the LLM response."""
+        try:
+            threats = []
+            current_threat = {}
+            
+            for line in text.split("\n"):
+                line = line.strip()
+                if not line:
+                    if current_threat and "type" in current_threat:
+                        try:
+                            # Ensure all required fields are present
+                            required_fields = ["type", "description", "severity", "impact", "mitigation"]
+                            for field in required_fields:
+                                if field not in current_threat:
+                                    current_threat[field] = "Not specified"
+                            
+                            threats.append(Threat(**current_threat))
+                        except Exception as e:
+                            logger.warning(f"Failed to create threat from {current_threat}: {str(e)}")
+                        finally:
+                            current_threat = {}
+                    continue
+                
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    key = key.strip().lower().replace(" ", "_")
+                    if key in ["type", "description", "severity", "impact", "mitigation", "code_snippet"]:
+                        current_threat[key] = value.strip()
+            
+            # Handle last threat if present
+            if current_threat and "type" in current_threat:
+                try:
+                    # Ensure all required fields are present
+                    required_fields = ["type", "description", "severity", "impact", "mitigation"]
+                    for field in required_fields:
+                        if field not in current_threat:
+                            current_threat[field] = "Not specified"
+                    
+                    threats.append(Threat(**current_threat))
+                except Exception as e:
+                    logger.warning(f"Failed to create threat from {current_threat}: {str(e)}")
+            
+            return threats
+            
+        except Exception as e:
+            logger.warning(f"Failed to parse threats: {str(e)}")
+            return []

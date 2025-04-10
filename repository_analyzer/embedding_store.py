@@ -627,13 +627,13 @@ class EmbeddingStore:
                             # Scale batch size based on available memory
                             # Each batch of 8 needs ~0.5GB for CodeBERT
                             if free_memory_gb > 40:  # High-memory GPU (>40GB free)
-                                batch_size = 128
+                                batch_size = 64  # Reduced from 128 to prevent OOM
                             elif free_memory_gb > 20:  # Medium-memory GPU (>20GB free)
-                                batch_size = 64
+                                batch_size = 32  # Reduced from 64 to prevent OOM
                             elif free_memory_gb > 10:  # Standard GPU (>10GB free)
-                                batch_size = 32
+                                batch_size = 16  # Reduced from 32 to prevent OOM
                             elif free_memory_gb > 5:   # Limited memory GPU (>5GB free)
-                                batch_size = 16
+                                batch_size = 8  # Reduced from 16 to prevent OOM
                             # else use default 8
                             
                             info_msg(f"Using batch size {batch_size} for embedding generation ({free_memory_gb:.1f}GB free memory)")
@@ -671,6 +671,10 @@ class EmbeddingStore:
                                 torch.cuda.set_device(current_gpu_id)
                                 info_msg(f"Switched to GPU {current_gpu_id} for batch {i//batch_size + 1}")
                         
+                        # Clean GPU memory before processing batch
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        
                         while retry_count <= max_retries and not batch_success:
                             try:
                                 # Tokenize and extract embeddings
@@ -697,15 +701,36 @@ class EmbeddingStore:
                                 all_embeddings.append(batch_embeddings)
                                 batch_success = True
                                 
-                                # Explicit cleanup to avoid memory leaks
-                                del inputs, outputs, batch_embeddings
+                                # Explicit cleanup to avoid memory leaks - move to CPU first to ensure tensor is completely freed
+                                for k in inputs:
+                                    inputs[k] = inputs[k].cpu()
+                                del inputs
+                                
+                                # Move model outputs to CPU before deleting
+                                outputs_cpu = outputs.last_hidden_state.cpu()
+                                del outputs
+                                del outputs_cpu
+                                
+                                # Move batch embeddings off GPU explicitly
+                                batch_embeddings_copy = batch_embeddings.copy()
+                                del batch_embeddings
+                                
+                                # Ensure tensor memory is released
                                 torch.cuda.empty_cache()
+                                gc.collect()
+                                
+                                # Add the copy to results
+                                all_embeddings[-1] = batch_embeddings_copy
                                 
                             except RuntimeError as cuda_error:
                                 # Handle CUDA-specific errors
                                 error_str = str(cuda_error)
                                 if "CUDA out of memory" in error_str:
                                     warning_msg(f"CUDA OOM in batch {i//batch_size + 1}, retrying with smaller batch")
+                                    # Clean memory before retry
+                                    torch.cuda.empty_cache()
+                                    gc.collect()
+                                    
                                     # Reduce batch size for retry
                                     if len(batch) > 1:
                                         half_point = len(batch) // 2
@@ -721,6 +746,13 @@ class EmbeddingStore:
                                             half_embeddings = outputs_half.last_hidden_state[:, 0, :].cpu().numpy()
                                             
                                             # Process second half
+                                            # Clean GPU memory first before processing second half
+                                            for k in inputs_half:
+                                                inputs_half[k] = inputs_half[k].cpu()
+                                            del inputs_half, outputs_half
+                                            torch.cuda.empty_cache()
+                                            gc.collect()
+                                            
                                             inputs_half2 = self.tokenizer(batch[half_point:], padding=True, truncation=True, 
                                                                 return_tensors="pt", max_length=512)
                                             inputs_half2 = {k: v.to(device_str) for k, v in inputs_half2.items()}
@@ -735,61 +767,78 @@ class EmbeddingStore:
                                             all_embeddings.append(combined_embeddings)
                                             batch_success = True
                                             
-                                            # Cleanup
-                                            del inputs_half, outputs_half, half_embeddings, inputs_half2, outputs_half2, half_embeddings2
+                                            # Cleanup each tensor in sequence
+                                            for k in inputs_half2:
+                                                inputs_half2[k] = inputs_half2[k].cpu()
+                                            del inputs_half2
+                                            
+                                            outputs_half2_cpu = outputs_half2.last_hidden_state.cpu()
+                                            del outputs_half2
+                                            del outputs_half2_cpu
+                                            
+                                            del half_embeddings, half_embeddings2
+                                            
+                                            # Final cleanup
                                             torch.cuda.empty_cache()
+                                            gc.collect()
                                             
                                         except Exception as split_error:
                                             warning_msg(f"Failed to process split batch: {str(split_error)}")
+                                            # Clean memory before continuing
+                                            torch.cuda.empty_cache()
+                                            gc.collect()
                                             # Fall through to retry or zeros
-                                    
-                                    # If split processing didn't work, retry or use zeros
-                                    if not batch_success:
-                                        retry_count += 1
-                                        # Force cleanup
-                                        torch.cuda.empty_cache()
-                                        gc.collect()
-                                else:
-                                    warning_msg(f"CUDA error in batch {i//batch_size + 1}: {error_str}")
+                                
+                                # If split processing didn't work, retry or use zeros
+                                if not batch_success:
                                     retry_count += 1
+                                    # Force cleanup
+                                    torch.cuda.empty_cache()
+                                    gc.collect()
+                            else:
+                                warning_msg(f"CUDA error in batch {i//batch_size + 1}: {error_str}")
+                                retry_count += 1
+                                # Clean before retrying
+                                torch.cuda.empty_cache()
+                                gc.collect()
                         
-                        # If all retries failed, use zeros
-                        if not batch_success:
-                            warning_msg(f"All retries failed for batch {i//batch_size + 1}, using zeros")
-                            batch_zeros = np.zeros((len(batch), self.vector_size), dtype=np.float32)
-                            all_embeddings.append(batch_zeros)
-                        
-                        # Periodic garbage collection and status update
-                        if (i // batch_size) % 10 == 0 and i > 0:
-                            gc.collect()
-                            torch.cuda.empty_cache()
-                            info_msg(f"Processed {i + len(batch)}/{len(valid_texts)} texts")
+                    # If all retries failed, use zeros
+                    if not batch_success:
+                        warning_msg(f"All retries failed for batch {i//batch_size + 1}, using zeros")
+                        batch_zeros = np.zeros((len(batch), self.vector_size), dtype=np.float32)
+                        all_embeddings.append(batch_zeros)
                     
-                    # Combine all batches
-                    if all_embeddings:
-                        result = np.vstack(all_embeddings)
-                    else:
-                        # Fallback if all batches failed
-                        result = np.zeros((len(valid_texts), self.vector_size), dtype=np.float32)
-                        
-                except Exception as gpu_error:
-                    warning_msg(f"GPU encoding with CodeBERT failed: {str(gpu_error)}. Falling back to zeros.")
+                    # Periodic garbage collection and status update
+                    if (i // batch_size) % 5 == 0 and i > 0:  # Increased frequency from 10 to 5
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        info_msg(f"Processed {i + len(batch)}/{len(valid_texts)} texts")
+                
+                # Combine all batches
+                if all_embeddings:
+                    result = np.vstack(all_embeddings)
+                else:
+                    # Fallback if all batches failed
                     result = np.zeros((len(valid_texts), self.vector_size), dtype=np.float32)
-            
-            # Normalize manually (L2 normalization)
-            norms = np.linalg.norm(result, axis=1, keepdims=True)
-            norms[norms == 0] = 1  # Avoid division by zero
-            result = result / norms
-            
-            # Final cleanup
-            gc.collect()
-            if self.device == 'cuda':
-                torch.cuda.empty_cache()
-            
-            return result
-        except Exception as e:
-            error_msg(f"Critical error during encoding: {str(e)}. Using zeros instead.")
-            return np.zeros((len(texts), self.vector_size), dtype=np.float32)
+                    
+            except Exception as gpu_error:
+                warning_msg(f"GPU encoding with CodeBERT failed: {str(gpu_error)}. Falling back to zeros.")
+                result = np.zeros((len(valid_texts), self.vector_size), dtype=np.float32)
+        
+        # Normalize manually (L2 normalization)
+        norms = np.linalg.norm(result, axis=1, keepdims=True)
+        norms[norms == 0] = 1  # Avoid division by zero
+        result = result / norms
+        
+        # Final cleanup
+        gc.collect()
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
+        
+        return result
+    except Exception as e:
+        error_msg(f"Critical error during encoding: {str(e)}. Using zeros instead.")
+        return np.zeros((len(texts), self.vector_size), dtype=np.float32)
     
     def add_file(self, file_path: str, content: str, metadata: Dict[str, Any] = None) -> None:
         """
@@ -835,6 +884,11 @@ class EmbeddingStore:
                     if self.index is None:
                         raise ValueError("Failed to create index after clearing")
                 
+                # Clear GPU memory before starting encoding
+                if self.device == 'cuda':
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                
                 # Dynamically determine batch size based on GPU memory (if using GPU)
                 batch_size = 8  # Default conservative batch size
                 if self.device == 'cuda':
@@ -845,13 +899,13 @@ class EmbeddingStore:
                         free_memory = total_memory - reserved_memory
                         free_memory_gb = free_memory / (1024**3)
                         
-                        # Scale batch size based on available memory
+                        # Scale batch size based on available memory - use more conservative values
                         if free_memory_gb > 40:  # High-memory GPU (>40GB free)
-                            batch_size = 64
+                            batch_size = 32  # Reduced from 64
                         elif free_memory_gb > 20:  # Medium-memory GPU (>20GB free)
-                            batch_size = 32
+                            batch_size = 16  # Reduced from 32
                         elif free_memory_gb > 10:  # Standard GPU (>10GB free)
-                            batch_size = 16
+                            batch_size = 8  # Reduced from 16
                         # Else use default 8
                         
                         info_msg(f"Using batch size {batch_size} for file {file_path} ({free_memory_gb:.1f}GB free memory)")
@@ -888,6 +942,11 @@ class EmbeddingStore:
                 for i in range(0, len(chunks), batch_size):
                     batch_chunks = chunks[i:i+batch_size]
                     
+                    # Clean GPU memory before processing batch
+                    if self.device == 'cuda':
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                    
                     # Select GPU for this batch if using multi-GPU
                     current_gpu_id = self.gpu_id if hasattr(self, 'gpu_id') else 0
                     if use_multi_gpu:
@@ -904,76 +963,90 @@ class EmbeddingStore:
                     
                     # Create embeddings for this batch
                     try:
-                        batch_embeddings = self._encode_text(batch_chunks)
-                        
-                        # Verify embeddings shape
-                        if batch_embeddings.shape[0] != len(batch_chunks):
-                            warning_msg(f"Embedding count mismatch: got {batch_embeddings.shape[0]}, expected {len(batch_chunks)}")
-                            # Create correct shaped embeddings with zeros
-                            batch_embeddings = np.zeros((len(batch_chunks), self.vector_size), dtype=np.float32)
-                        
-                        # Add to index
-                        self.index.add(np.array(batch_embeddings).astype('float32'))
-                        
-                        # Map file path to indices
-                        for j, chunk in enumerate(batch_chunks):
-                            idx = start_idx + i + j
+                        embeddings = self._encode_text(batch_chunks)
+                        if embeddings.shape[0] != len(batch_chunks):
+                            warning_msg(f"Expected {len(batch_chunks)} embeddings but got {embeddings.shape[0]}, padding with zeros")
+                            # Create zeros with the correct shape
+                            correct_embeddings = np.zeros((len(batch_chunks), self.vector_size), dtype=np.float32)
+                            # Copy as many embeddings as we got
+                            correct_embeddings[:min(embeddings.shape[0], len(batch_chunks))] = embeddings[:min(embeddings.shape[0], len(batch_chunks))]
+                            embeddings = correct_embeddings
                             
+                        # Add embeddings to the index
+                        try:
+                            self.index.add(embeddings)
+                        except Exception as add_error:
+                            error_msg(f"Failed to add embeddings to index: {str(add_error)}")
+                            # Try to re-initialize the index
+                            try:
+                                if hasattr(self, '_setup_index'):
+                                    self._setup_index()
+                                    # Try adding again
+                                    self.index.add(embeddings)
+                            except Exception as init_error:
+                                error_msg(f"Failed to re-initialize index: {str(init_error)}")
+                            raise  # Propagate error
+                        
+                        # Add entries to mapping
+                        chunk_idx = 0
+                        for chunk in batch_chunks:
+                            # Calculate the global index
+                            idx = start_idx + added_chunks + chunk_idx
+                            
+                            # Create mapping entry
                             self.file_mapping.append({
                                 "file_path": file_path,
-                                "content": chunk,
-                                "metadata": metadata.copy()  # Use a copy to avoid shared references
+                                "chunk_idx": chunk_idx,
+                                "chunk_text": chunk,
+                                "embedding_idx": idx,
+                                "metadata": metadata.copy() if metadata else {}
                             })
                             
-                            added_chunks += 1
+                            # Each index corresponds to a mapping entry
+                            chunk_idx += 1
                         
-                        # Explicit cleanup to reduce memory usage
-                        del batch_embeddings
+                        added_chunks += len(batch_chunks)
                         
-                    except Exception as batch_error:
-                        error_msg(f"Error processing batch for {file_path}: {str(batch_error)}")
-                        # Continue with next batch rather than failing entire file
-                    
-                    # Force garbage collection more frequently
-                    gc.collect()
-                    if self.device == 'cuda':
-                        torch.cuda.empty_cache()
-                    
-                    # Periodic save for very large files and status updates
-                    if i > 0 and i % (batch_size * 10) == 0:
-                        info_msg(f"Processed {i}/{len(chunks)} chunks for {file_path}")
-                        try:
-                            self.save()
-                            info_msg(f"Saved intermediate progress for {file_path}")
-                        except Exception as save_err:
-                            warning_msg(f"Failed intermediate save: {str(save_err)}")
+                        # Clean up memory
+                        del embeddings
+                        if self.device == 'cuda':
+                            torch.cuda.empty_cache()
+                        
+                    except Exception as chunk_error:
+                        error_msg(f"Error encoding chunk batch for {file_path}: {str(chunk_error)}")
+                        raise  # Propagate to retry
                 
-                # Save after processing all chunks
-                try:
-                    self.save()
-                    success_msg(f"Added {added_chunks} chunks from {file_path} to embedding store")
-                    # Successfully added the file, return
-                    return
-                except Exception as save_error:
-                    error_msg(f"Failed to save after adding {file_path}: {str(save_error)}")
-                    # Try again if save failed
-                    retry_count += 1
+                if added_chunks > 0:
+                    info_msg(f"Added {added_chunks} chunks for {file_path}")
+                    
+                    # Save after each file to ensure changes are persisted
+                    # But only if we've processed at least some chunks
+                    try:
+                        self.save()
+                    except Exception as save_error:
+                        error_msg(f"Warning: Failed to save embeddings after adding {file_path}: {str(save_error)}")
+                else:
+                    warning_msg(f"No chunks were successfully added for {file_path}")
+                
+                # Final memory cleanup at the end of the file
+                if self.device == 'cuda':
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                
+                # Return success
+                return
                 
             except Exception as e:
-                error_msg(f"Failed to add file {file_path} to embedding store: {str(e)}")
                 retry_count += 1
+                error_msg(f"Error adding file {file_path}, retry {retry_count}/{max_retries}: {str(e)}")
                 
-                if retry_count < max_retries:
-                    warning_msg(f"Retrying ({retry_count}/{max_retries})...")
-                    # Clean up and try again
+                # Clean GPU memory before retrying
+                if self.device == 'cuda':
+                    torch.cuda.empty_cache()
                     gc.collect()
-                    if self.device == 'cuda':
-                        try:
-                            torch.cuda.empty_cache()
-                        except:
-                            pass
-                else:
-                    error_msg(f"Failed to add {file_path} after {max_retries} attempts, giving up")
+                
+                if retry_count >= max_retries:
+                    error_msg(f"Failed to add file {file_path} after {max_retries} retries")
                     return
     
     def _split_content(self, content: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
