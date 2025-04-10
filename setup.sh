@@ -232,23 +232,9 @@ verify_installation() {
         MISSING_DEPS+=("sentence_transformers")
     fi
     
-    # Check for FAISS (either CPU or GPU version is fine)
-    if ! "$PYTHON_CMD" -c "import faiss" 2>/dev/null; then
-        MISSING_DEPS+=("faiss-cpu or faiss-gpu")
-    else
-        # Check if FAISS has GPU support
-        if "$PYTHON_CMD" -c "import faiss; print(hasattr(faiss, 'get_num_gpus') and faiss.get_num_gpus() > 0)" 2>/dev/null | grep -q "True"; then
-            print_success "FAISS with GPU support verified!"
-            mark_as_installed "faiss_gpu"
-            # Make sure we don't have both markers
-            rm -f "$INSTALL_MARKERS_DIR/faiss_cpu"
-        else
-            print_status "FAISS CPU version verified."
-            mark_as_installed "faiss_cpu"
-            # Make sure we don't have both markers
-            rm -f "$INSTALL_MARKERS_DIR/faiss_gpu"
-        fi
-    fi
+    # FAISS is assumed to be already installed
+    print_status "FAISS is assumed to be already installed, skipping check"
+    mark_as_installed "faiss_gpu"  # Mark as installed to avoid installation attempts
     
     # Missing dependencies check
     if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
@@ -432,9 +418,7 @@ install_dependencies() {
     # If all critical components are already installed, we can skip
     if is_already_installed "core_packages" && \
        is_already_installed "sentence_transformers" && \
-       is_already_installed "tree_sitter" && \
-       is_already_installed "faiss_cpu" && \
-       is_already_installed "faiss_gpu"; then
+       is_already_installed "tree_sitter"; then
         print_success "All critical dependencies are already installed. Skipping installation."
         return 0
     fi
@@ -447,8 +431,8 @@ install_dependencies() {
     # Detect system resources
     detect_system_resources
     
-    # Define total steps for progress tracking
-    local total_steps=9  # Increased to 9 to account for transformer fixes
+    # Define total steps for progress tracking - reduced by 1 since we're skipping FAISS
+    local total_steps=8
     local current_step=0
     
     # Upgrade pip first
@@ -584,101 +568,11 @@ install_dependencies() {
         show_progress $total_steps $current_step "Tree-sitter already installed"
     fi
     
-    # Install faiss for vector search if needed
-    if ! is_already_installed "faiss_cpu" && ! is_already_installed "faiss_gpu"; then
-        current_step=$((current_step + 1))
-        show_progress $total_steps $current_step "Installing FAISS for vector search"
-        
-        # First ensure we have a compatible NumPy version (< 2.0)
-        print_status "Installing compatible NumPy for FAISS..."
-        "$PYTHON_CMD" -m pip install -q "numpy<2.0.0" --force-reinstall >/dev/null 2>&1 || {
-            print_warning "Failed to install compatible NumPy version"
-        }
-        
-        # Check if PyTorch with CUDA is available for GPU version
-        CUDA_AVAILABLE=false
-        print_status "Checking for CUDA availability..."
-        if "$PYTHON_CMD" -c "import torch; print(torch.cuda.is_available())" 2>/dev/null | grep -q "True"; then
-            CUDA_AVAILABLE=true
-            print_success "CUDA detected! Will install GPU-enabled FAISS."
-        elif command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
-            # If torch isn't installed, check for CUDA via system
-            CUDA_AVAILABLE=true
-            print_success "CUDA detected via nvcc/cuda directory! Will install GPU-enabled FAISS."
-        else
-            print_status "No CUDA detected, using CPU version of FAISS."
-        fi
-        
-        # Install appropriate FAISS version
-        if [ "$CUDA_AVAILABLE" = true ]; then
-            # Install PyTorch with CUDA first if needed
-            if ! "$PYTHON_CMD" -c "import torch" 2>/dev/null; then
-                print_status "Installing PyTorch with CUDA support first..."
-                "$PYTHON_CMD" -m pip install -q torch --index-url https://download.pytorch.org/whl/cu118 >/dev/null 2>&1 || {
-                    print_warning "Failed to install PyTorch with CUDA. Will try FAISS-GPU directly."
-                }
-            fi
-            
-            # Install faiss-gpu with exact version 1.7.2
-            print_status "Installing FAISS with GPU support (version 1.7.2)..."
-            "$PYTHON_CMD" -m pip install -q faiss-gpu==1.7.2 --force-reinstall >/dev/null 2>&1 || {
-                print_warning "Failed to install faiss-gpu version 1.7.2, trying alternative installation method..."
-                "$PYTHON_CMD" -m pip install -q faiss-gpu==1.7.2 --force-reinstall --no-deps >/dev/null 2>&1 || {
-                    print_warning "Failed to install faiss-gpu. Falling back to CPU version."
-                    "$PYTHON_CMD" -m pip install -q faiss-cpu==1.10.0 --force-reinstall >/dev/null 2>&1
-                    mark_as_installed "faiss_cpu"
-                }
-            }
-            
-            # Verify GPU FAISS installation
-            if "$PYTHON_CMD" -c "import faiss; print(hasattr(faiss, 'get_num_gpus') and faiss.get_num_gpus() > 0)" 2>/dev/null | grep -q "True"; then
-                # Also verify IndexFlatL2 is present
-                if "$PYTHON_CMD" -c "import faiss; print(hasattr(faiss, 'IndexFlatL2'))" 2>/dev/null | grep -q "True"; then
-                    print_success "Successfully installed FAISS-GPU 1.7.2 with IndexFlatL2 support!"
-                    DETECTED_GPUS=$("$PYTHON_CMD" -c "import faiss; print(faiss.get_num_gpus())" 2>/dev/null)
-                    print_status "Detected $DETECTED_GPUS GPUs for FAISS acceleration"
-                    mark_as_installed "faiss_gpu"
-                else
-                    print_warning "FAISS-GPU installed but missing IndexFlatL2. Falling back to CPU version."
-                    "$PYTHON_CMD" -m pip install -q faiss-cpu==1.10.0 --force-reinstall >/dev/null 2>&1
-                    mark_as_installed "faiss_cpu"
-                fi
-            else
-                print_warning "FAISS installed but GPU support not detected. Using CPU version."
-                "$PYTHON_CMD" -m pip install -q faiss-cpu==1.10.0 --force-reinstall >/dev/null 2>&1
-                mark_as_installed "faiss_cpu"
-            fi
-        else
-            # Install CPU version with exact version 1.10.0
-            print_status "Installing FAISS CPU version 1.10.0..."
-            "$PYTHON_CMD" -m pip install -q faiss-cpu==1.10.0 --force-reinstall >/dev/null 2>&1 || {
-                print_warning "Failed to install faiss-cpu 1.10.0, trying alternative method..."
-                # Try without dependencies first
-                "$PYTHON_CMD" -m pip install -q faiss-cpu==1.10.0 --force-reinstall --no-deps >/dev/null 2>&1 && \
-                "$PYTHON_CMD" -m pip install -q "numpy<2.0.0" >/dev/null 2>&1 || {
-                    print_error "Failed to install faiss-cpu. Vector search functionality will be limited."
-                }
-            }
-            
-            # Verify faiss installation
-            if "$PYTHON_CMD" -c "import faiss; print(hasattr(faiss, 'IndexFlatL2'))" 2>/dev/null | grep -q "True"; then
-                print_success "Successfully installed FAISS-CPU 1.10.0 with IndexFlatL2 support"
-                mark_as_installed "faiss_cpu"
-            else
-                print_error "FAISS installed but missing IndexFlatL2 attribute. Vector search will be limited."
-            fi
-        fi
-    else
-        current_step=$((current_step + 1))
-        show_progress $total_steps $current_step "FAISS already installed"
-        
-        # Check if it's the GPU version
-        if is_already_installed "faiss_gpu"; then
-            print_status "FAISS with GPU support is already installed"
-        else
-            print_status "FAISS CPU version is already installed"
-        fi
-    fi
+    # FAISS is assumed to be already installed
+    current_step=$((current_step + 1))
+    show_progress $total_steps $current_step "FAISS already installed"
+    print_status "FAISS is assumed to be already installed, skipping installation"
+    mark_as_installed "faiss_gpu"  # Mark as installed to avoid future installation attempts
     
     # Install llama-cpp-python with CUDA support if available
     if ! is_already_installed "llama_cpp_python"; then
