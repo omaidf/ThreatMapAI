@@ -95,9 +95,11 @@ class EmbeddingStore:
             else:
                 device_str = 'cpu'
             
-            self.model = SentenceTransformer('all-MiniLM-L6-v2', device=device_str)
+            # Get embedding model name from environment or use default
+            embedding_model = get_env_variable("EMBEDDING_MODEL", "microsoft/codebert-base")
+            self.model = SentenceTransformer(embedding_model, device=device_str)
             self.vector_size = self.model.get_sentence_embedding_dimension()
-            info_msg(f"Embedding model initialized with dimension {self.vector_size} on {device_str}")
+            info_msg(f"Embedding model initialized with {embedding_model}, dimension {self.vector_size} on {device_str}")
         except Exception as e:
             warning_msg(f"Failed to initialize SentenceTransformer: {str(e)}")
             self.model = None
@@ -474,9 +476,11 @@ class EmbeddingStore:
                     if self.device == 'cuda' and hasattr(self, 'gpu_id'):
                         device_str = f"cuda:{self.gpu_id}"
                     
-                    self.model = SentenceTransformer('all-MiniLM-L6-v2', device=device_str)
+                    # Get embedding model name from environment or use default
+                    embedding_model = get_env_variable("EMBEDDING_MODEL", "microsoft/codebert-base")
+                    self.model = SentenceTransformer(embedding_model, device=device_str)
                     self.vector_size = self.model.get_sentence_embedding_dimension()
-                    info_msg(f"Reinitialized model on {device_str}")
+                    info_msg(f"Reinitialized model with {embedding_model} on {device_str}")
                 except Exception as e:
                     logger.warning(f"Failed to initialize SentenceTransformer: {str(e)}")
                     self.model = None
@@ -541,8 +545,10 @@ class EmbeddingStore:
                 if self.device == 'cuda' and hasattr(self, 'gpu_id'):
                     device_str = f"cuda:{self.gpu_id}"
                 
-                self.model = SentenceTransformer('all-MiniLM-L6-v2', device=device_str)
-                info_msg(f"Successfully reinitialized model on {device_str}")
+                # Get embedding model name from environment or use default
+                embedding_model = get_env_variable("EMBEDDING_MODEL", "microsoft/codebert-base")
+                self.model = SentenceTransformer(embedding_model, device=device_str)
+                info_msg(f"Successfully reinitialized model with {embedding_model} on {device_str}")
             except Exception as e:
                 error_msg(f"Failed to reinitialize model: {str(e)}")
                 
