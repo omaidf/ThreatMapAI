@@ -567,7 +567,6 @@ class EmbeddingStore:
             # Still return zeros this time
             return np.zeros((len(texts), self.vector_size), dtype=np.float32)
         
-        # Model exists, try to encode
         try:
             # Make sure all text chunks are valid strings
             valid_texts = []
@@ -580,6 +579,8 @@ class EmbeddingStore:
                     valid_texts.append(" ")
                 else:
                     valid_texts.append(text)
+            
+            result = None
             
             # CodeBERT specific encoding
             if self.device == 'cpu':
@@ -610,13 +611,15 @@ class EmbeddingStore:
                 
             else:
                 # GPU processing with dynamically sized batches
+                all_embeddings = []
+                
                 try:
                     # Dynamically adjust batch size based on available GPU memory
                     batch_size = 8  # Default small batch size
                     
                     # Get current GPU memory status
+                    free_memory_gb = 0
                     try:
-                        free_memory_gb = 0
                         if hasattr(torch.cuda, 'get_device_properties') and hasattr(torch.cuda, 'memory_reserved'):
                             device_id = self.gpu_id if hasattr(self, 'gpu_id') and self.gpu_id is not None else 0
                             total_memory = torch.cuda.get_device_properties(device_id).total_memory
@@ -648,11 +651,10 @@ class EmbeddingStore:
                             gpu_count = torch.cuda.device_count()
                             use_multi_gpu = True
                             info_msg(f"Using {gpu_count} GPUs for embedding generation")
-                    except:
+                    except Exception:
                         use_multi_gpu = False
                     
                     # Process in batches with improved error handling
-                    all_embeddings = []
                     max_retries = 2  # Allow retries for CUDA errors
                     
                     for i in range(0, len(valid_texts), batch_size):
@@ -788,57 +790,62 @@ class EmbeddingStore:
                                             torch.cuda.empty_cache()
                                             gc.collect()
                                             # Fall through to retry or zeros
-                                
-                                # If split processing didn't work, retry or use zeros
-                                if not batch_success:
+                                    
+                                    # If split processing didn't work, retry or use zeros
+                                    if not batch_success:
+                                        retry_count += 1
+                                        # Force cleanup
+                                        torch.cuda.empty_cache()
+                                        gc.collect()
+                                else:
+                                    warning_msg(f"CUDA error in batch {i//batch_size + 1}: {error_str}")
                                     retry_count += 1
-                                    # Force cleanup
+                                    # Clean before retrying
                                     torch.cuda.empty_cache()
                                     gc.collect()
-                            else:
-                                warning_msg(f"CUDA error in batch {i//batch_size + 1}: {error_str}")
-                                retry_count += 1
-                                # Clean before retrying
-                                torch.cuda.empty_cache()
-                                gc.collect()
                         
-                    # If all retries failed, use zeros
-                    if not batch_success:
-                        warning_msg(f"All retries failed for batch {i//batch_size + 1}, using zeros")
-                        batch_zeros = np.zeros((len(batch), self.vector_size), dtype=np.float32)
-                        all_embeddings.append(batch_zeros)
+                        # If all retries failed, use zeros
+                        if not batch_success:
+                            warning_msg(f"All retries failed for batch {i//batch_size + 1}, using zeros")
+                            batch_zeros = np.zeros((len(batch), self.vector_size), dtype=np.float32)
+                            all_embeddings.append(batch_zeros)
+                        
+                        # Periodic garbage collection and status update
+                        if (i // batch_size) % 5 == 0 and i > 0:  # Increased frequency from 10 to 5
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                            info_msg(f"Processed {i + len(batch)}/{len(valid_texts)} texts")
                     
-                    # Periodic garbage collection and status update
-                    if (i // batch_size) % 5 == 0 and i > 0:  # Increased frequency from 10 to 5
-                        gc.collect()
-                        torch.cuda.empty_cache()
-                        info_msg(f"Processed {i + len(batch)}/{len(valid_texts)} texts")
-                
-                # Combine all batches
-                if all_embeddings:
-                    result = np.vstack(all_embeddings)
-                else:
-                    # Fallback if all batches failed
+                    # Combine all batches
+                    if all_embeddings:
+                        result = np.vstack(all_embeddings)
+                    else:
+                        # Fallback if all batches failed
+                        result = np.zeros((len(valid_texts), self.vector_size), dtype=np.float32)
+                        
+                except Exception as gpu_error:
+                    warning_msg(f"GPU encoding with CodeBERT failed: {str(gpu_error)}. Falling back to zeros.")
                     result = np.zeros((len(valid_texts), self.vector_size), dtype=np.float32)
-                    
-            except Exception as gpu_error:
-                warning_msg(f"GPU encoding with CodeBERT failed: {str(gpu_error)}. Falling back to zeros.")
+            
+            # If result wasn't set in any branch, create a default
+            if result is None:
                 result = np.zeros((len(valid_texts), self.vector_size), dtype=np.float32)
-        
-        # Normalize manually (L2 normalization)
-        norms = np.linalg.norm(result, axis=1, keepdims=True)
-        norms[norms == 0] = 1  # Avoid division by zero
-        result = result / norms
-        
-        # Final cleanup
-        gc.collect()
-        if self.device == 'cuda':
-            torch.cuda.empty_cache()
-        
-        return result
-    except Exception as e:
-        error_msg(f"Critical error during encoding: {str(e)}. Using zeros instead.")
-        return np.zeros((len(texts), self.vector_size), dtype=np.float32)
+                
+            # Normalize manually (L2 normalization)
+            norms = np.linalg.norm(result, axis=1, keepdims=True)
+            norms[norms == 0] = 1  # Avoid division by zero
+            result = result / norms
+            
+            # Final cleanup
+            gc.collect()
+            if self.device == 'cuda':
+                torch.cuda.empty_cache()
+            
+            return result
+            
+        except Exception as e:
+            error_msg(f"Critical error during encoding: {str(e)}. Using zeros instead.")
+            return np.zeros((len(texts), self.vector_size), dtype=np.float32)
     
     def add_file(self, file_path: str, content: str, metadata: Dict[str, Any] = None) -> None:
         """
