@@ -2725,9 +2725,8 @@ Pay special attention to:
                     free_memory_bytes = total_memory - reserved_memory
                     free_memory_gb = free_memory_bytes / (1024**3)
                     
-                    # Dynamically scale tensor size based on available free memory
-                    # Use approximately 80% of available free memory for tensor allocation
-                    memory_bytes_to_use = free_memory_bytes * 0.8
+                    # Target a much higher memory utilization (75%)
+                    memory_bytes_to_use = free_memory_bytes * 0.95  # Using 95% of free memory to approach 75% total utilization
                     
                     # Calculate tensor size as sqrt of total elements (since we're creating square tensors)
                     # 4 bytes per float32 element
@@ -2736,8 +2735,8 @@ Pay special attention to:
                     
                     # Round to nearest 1000 for cleaner reporting
                     tensor_size = (tensor_side // 1000) * 1000
-                    # Ensure minimum size and avoid too large tensors that might cause issues
-                    tensor_size = max(5000, min(tensor_size, 25000))  # Reduced max size to 25000
+                    # Ensure minimum size and allow much larger tensors to achieve higher utilization
+                    tensor_size = max(5000, min(tensor_size, 45000))  # Increased max size to 45000
                     
                     info_msg(f"GPU {i} has {memory_gb:.1f} GB total memory, {free_memory_gb:.1f} GB free, allocating tensor of size {tensor_size}x{tensor_size} (~{tensor_size*tensor_size*4/1024/1024:.1f} MB)")
                     
@@ -2746,24 +2745,25 @@ Pay special attention to:
                         dummy_tensor = torch.rand(tensor_size, tensor_size, device=device)
                         
                         # For secondary GPUs, create additional tensors to utilize more memory
-                        if i > 0 and free_memory_gb > 10:  # Only create additional tensors if we have >10GB free
-                            # Number of additional tensors scales with memory size
-                            num_additional = 1
+                        if i > 0:  # Only create additional tensors if we have >5GB free
+                            # Number of additional tensors increased to achieve higher utilization
+                            num_additional = 3  # Default to 3 additional tensors
                             if free_memory_gb >= 20:
-                                num_additional = 2
+                                num_additional = 4
+                            if free_memory_gb >= 35:
+                                num_additional = 5
                             
                             additional_tensors = []
                             for j in range(num_additional):
                                 info_msg(f"Creating additional tensor {j+1}/{num_additional} on GPU {i}")
-                                # Use half the tensor size for additional tensors
-                                additional_size = tensor_size // 2
+                                # Use larger additional tensors - 60% of main tensor size
+                                additional_size = int(tensor_size * 0.6)
                                 additional_tensors.append(torch.rand(additional_size, additional_size, device=device))
                                 # Force memory allocation through operations
                                 _ = torch.matmul(dummy_tensor[:additional_size, :additional_size], additional_tensors[j])
                         else:
-                            # For GPU 0, just one additional tensor with smaller size
-                            # GPU 0 needs more memory available for model loading
-                            secondary_size = tensor_size // 3
+                            # For GPU 0, still create substantial tensor but leave more room for model
+                            secondary_size = tensor_size // 2
                             dummy_tensor2 = torch.rand(secondary_size, secondary_size, device=device)
                             _ = torch.matmul(dummy_tensor[:secondary_size, :secondary_size], dummy_tensor2)
                     
