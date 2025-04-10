@@ -1265,6 +1265,8 @@ Pay special attention to:
             
             # Report GPU usage before component analysis
             self._log_gpu_status("Before component analysis")
+            # Release memory before component analysis
+            self._release_gpu_memory()
                 
             # With 100K context window, we can analyze more components
             max_components = 500 if large_repo else 1000  # Previously 100/200
@@ -1315,7 +1317,7 @@ Pay special attention to:
             components_analyzed = 0
             
             # Analyze components with RAG for dynamic context
-            for component in priority_components:
+            for i, component in enumerate(priority_components):
                 component_threats = self._analyze_component_with_exploration(component, analysis_results)
                 threat_model["components"].append({
                     "name": component["name"],
@@ -1324,6 +1326,11 @@ Pay special attention to:
                     "priority": True,
                     "threats": [threat.dict() for threat in component_threats]
                 })
+                
+                # Release memory every 10 components to avoid accumulation
+                if (i + 1) % 10 == 0:
+                    info_msg(f"Processed {i + 1}/{len(priority_components)} components, releasing GPU memory")
+                    self._release_gpu_memory()
             
             # Analyze data flows with enhanced focus on security boundaries
             logger.info("Analyzing data flows with focus on security boundaries")
@@ -1337,7 +1344,10 @@ Pay special attention to:
             # Process data flows by component for better context
             # Report GPU usage before data flow analysis
             self._log_gpu_status("Before data flow analysis")
+            # Release memory before data flow analysis
+            self._release_gpu_memory()
             
+            flow_count = 0
             for source, flows in data_flows_by_component.items():
                 # Get combined context for all flows from this source
                 contexts = []
@@ -1376,11 +1386,22 @@ Pay special attention to:
                         "crosses_boundary": crosses_boundary,
                         "threats": [threat.dict() for threat in flow_threats]
                     })
+                    
+                    flow_count += 1
+                    # Release memory every 5 flows
+                    if flow_count % 5 == 0:
+                        info_msg(f"Processed {flow_count} data flows, releasing GPU memory")
+                        self._release_gpu_memory()
+            
+            # Release memory after all data flow analysis
+            self._release_gpu_memory()
             
             # Perform cross-file vulnerability analysis
             logger.info("Performing cross-file vulnerability analysis")
             # Report GPU usage before vulnerability analysis
             self._log_gpu_status("Before vulnerability analysis")
+            # Release memory before vulnerability analysis
+            self._release_gpu_memory()
             
             vulnerabilities = self._analyze_cross_file_vulnerabilities(
                 analysis_results, 
@@ -1396,6 +1417,8 @@ Pay special attention to:
             
             # Report final GPU status
             self._log_gpu_status("Completed threat model generation")
+            # Final memory cleanup
+            self._release_gpu_memory()
             
             # Save threat model to file
             output_dir = Path(os.getenv("OUTPUT_DIR", "output"))
@@ -1843,6 +1866,9 @@ Pay special attention to:
                             logger.error("Even smallest batch size failed, skipping problematic batch")
                             batch_idx += batch_size  # Skip this problematic batch
                             retry_count = 0  # Reset retry counter
+                
+                # Aggressively release GPU memory after each batch
+                self._release_gpu_memory()
             
             # Create architecture result
             architecture = {
@@ -1859,7 +1885,10 @@ Pay special attention to:
                     "description": "Default security boundary for all components",
                     "files": file_list[:30]  # Limit to 30 files for default boundary
                 }]
-                
+            
+            # Aggressively release memory before returning
+            self._release_gpu_memory()
+            
             return architecture
             
         except Exception as e:
@@ -2646,6 +2675,9 @@ Pay special attention to:
         This helps with multi-GPU operations and ensures GPU cores are warmed up for operations
         like architecture analysis, which would otherwise be CPU-bound.
         """
+        # VERY DISTINCTIVE MESSAGE FOR DEBUGGING - APRIL 2025
+        info_msg("!!! UPDATED GPU ACCELERATION FUNCTION !!! April 2025 version")
+        
         try:
             # Set PyTorch memory allocation configuration to help with fragmentation
             os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -2858,3 +2890,61 @@ Pay special attention to:
                 
         except Exception as e:
             warning_msg(f"Failed to log GPU status: {str(e)}")
+
+    def _release_gpu_memory(self):
+        """
+        Aggressively release GPU memory, including both allocated memory and reserved cache.
+        """
+        try:
+            # Only proceed if torch.cuda is available
+            if not hasattr(torch, 'cuda') or not torch.cuda.is_available():
+                return
+            
+            # Force Python garbage collection first
+            import gc
+            gc.collect()
+            
+            # Log current GPU status before cleaning
+            info_msg("GPU memory status before cleanup:")
+            for i in range(torch.cuda.device_count()):
+                try:
+                    mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
+                    mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
+                    info_msg(f"  GPU {i}: {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved")
+                except:
+                    pass
+            
+            # Empty CUDA cache to free memory
+            torch.cuda.empty_cache()
+            
+            # Try a more aggressive approach
+            for i in range(torch.cuda.device_count()):
+                try:
+                    # Reset the current device to clear its cache
+                    device = torch.device(f"cuda:{i}")
+                    torch.cuda.set_device(device)
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats(i)
+                except Exception as e:
+                    warning_msg(f"Error resetting GPU {i} memory: {str(e)}")
+            
+            # Try using nvidia-smi to release memory (system-level)
+            try:
+                import subprocess
+                # This doesn't actually release memory but can help diagnose
+                subprocess.run("nvidia-smi", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except:
+                pass
+                
+            # Log GPU status after cleanup
+            info_msg("GPU memory status after cleanup:")
+            for i in range(torch.cuda.device_count()):
+                try:
+                    mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
+                    mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
+                    info_msg(f"  GPU {i}: {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved")
+                except:
+                    pass
+                    
+        except Exception as e:
+            warning_msg(f"Error during GPU memory release: {str(e)}")
