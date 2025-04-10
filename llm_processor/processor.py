@@ -107,6 +107,9 @@ class LLMProcessor:
         self.max_context_size = 2048
         self.max_tokens_out = 41024
         
+        # Check for high-memory GPUs and load environment settings
+        self._check_for_high_memory_gpus()
+        
         # Handle model path or embedding store
         if isinstance(model_path_or_embedding_store, str):
             self.embedding_store = EmbeddingStore()
@@ -117,7 +120,87 @@ class LLMProcessor:
         
         self.llm = None
         self._setup_llm()
+    
+    def _check_for_high_memory_gpus(self) -> bool:
+        """
+        Check if the system has high-memory GPUs (50GB+) and set appropriate environment variables.
         
+        Returns:
+            bool: True if high-memory GPUs were detected
+        """
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return False
+                
+            gpu_count = torch.cuda.device_count()
+            if gpu_count == 0:
+                return False
+                
+            # Create dotenv file if it doesn't exist
+            from dotenv import load_dotenv
+            import os
+            load_dotenv()
+            
+            # Check if we already have the HIGH_MEM_GPUS flag set
+            if os.environ.get("HIGH_MEM_GPUS", "0") == "1":
+                return True
+                
+            # Check each GPU for high memory
+            high_memory_gpus = []
+            for i in range(gpu_count):
+                memory_gb = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+                if memory_gb >= 50:
+                    high_memory_gpus.append(i)
+            
+            if high_memory_gpus:
+                info_msg(f"Detected {len(high_memory_gpus)} high-memory GPUs with 50GB+ VRAM")
+                
+                # Update environment variables if .env exists
+                if os.path.exists(".env"):
+                    updated_env = False
+                    env_lines = []
+                    
+                    # Read and update existing .env file
+                    with open(".env", "r") as f:
+                        env_lines = f.readlines()
+                        
+                    with open(".env", "w") as f:
+                        for line in env_lines:
+                            # Skip existing high memory GPU settings
+                            if any(key in line for key in ["HIGH_MEM_GPUS", "TENSOR_SIZE_MULTIPLIER", "MODEL_PARALLEL"]):
+                                continue
+                            f.write(line)
+                        
+                        # Add high-memory GPU settings
+                        f.write("\n# High-memory GPU optimization\n")
+                        f.write("HIGH_MEM_GPUS=1\n")
+                        f.write("TENSOR_SIZE_MULTIPLIER=10\n")
+                        f.write("MODEL_PARALLEL=1\n")
+                        f.write("KV_CACHE_ENABLED=1\n")
+                        f.write("BATCH_SIZE=64\n")
+                        f.write(f"EMBEDDING_DIMENSION=4096\n")
+                        f.write(f"CONTEXT_SIZE=32768\n")
+                    
+                    # Set environment variables for current session
+                    os.environ["HIGH_MEM_GPUS"] = "1"
+                    os.environ["TENSOR_SIZE_MULTIPLIER"] = "10"
+                    os.environ["MODEL_PARALLEL"] = "1"
+                    os.environ["KV_CACHE_ENABLED"] = "1"
+                    os.environ["BATCH_SIZE"] = "64"
+                    os.environ["EMBEDDING_DIMENSION"] = "4096"
+                    os.environ["CONTEXT_SIZE"] = "32768"
+                    
+                    info_msg("Updated .env file with high-memory GPU settings")
+                
+                return True
+            
+            return False
+            
+        except Exception as e:
+            warning_msg(f"Failed to check for high-memory GPUs: {str(e)}")
+            return False
+
     def _setup_llm(self) -> None:
         """Set up the local LLM with appropriate configuration."""
         try:
@@ -127,6 +210,9 @@ class LLMProcessor:
             # Get model info to determine context size
             model_info = get_model_info()
             model_ctx_size = model_info.get("context_length", 4096)
+            
+            # Check for high-memory mode in environment
+            is_high_memory = os.environ.get("HIGH_MEM_GPUS", "0") == "1"
             
             # Get environment variable for force GPU usage (override auto-detection)
             force_gpu = os.environ.get("FORCE_GPU", "").lower() in ["true", "1", "yes"]
@@ -148,10 +234,22 @@ class LLMProcessor:
                 
                 # Configure LlamaCpp options
                 # Use model context size from configuration, override with environment if specified
-                n_ctx = int(get_env_variable("LLM_N_CTX", str(model_ctx_size)))
-                info_msg(f"Using context window size: {n_ctx}")
+                # For high-memory systems, use a much larger context window
+                if is_high_memory:
+                    env_ctx_size = int(get_env_variable("CONTEXT_SIZE", "32768"))
+                    n_ctx = max(model_ctx_size, env_ctx_size)
+                    info_msg(f"High-memory mode: Using expanded context window of {n_ctx} tokens")
+                else:
+                    n_ctx = int(get_env_variable("LLM_N_CTX", str(model_ctx_size)))
+                    info_msg(f"Using context window size: {n_ctx}")
                 
-                n_batch = int(get_env_variable("LLM_N_BATCH", "512"))  # Batch size
+                # For high-memory GPUs, use a much larger batch size
+                if is_high_memory:
+                    n_batch = int(get_env_variable("BATCH_SIZE", "64"))
+                    info_msg(f"High-memory mode: Using increased batch size of {n_batch}")
+                else:
+                    n_batch = int(get_env_variable("LLM_N_BATCH", "512"))
+                
                 n_gpu_layers = gpu_config['n_gpu_layers']  # Use detected GPU layers
                 
                 # Special handling for -1 value (all layers)
@@ -173,7 +271,7 @@ class LLMProcessor:
                     memory_limit_mb = int(self.memory_limit * 1024)
                     info_msg(f"Using user-specified memory limit: {self.memory_limit:.2f} GB ({memory_limit_mb} MiB)")
                 elif n_gpu_layers > 0 and gpu_config['use_gpu']:
-                    # Dynamically detect available GPU memory and use 80% of it
+                    # Dynamically detect available GPU memory and use more aggressive allocation for high-memory GPUs
                     try:
                         import torch
                         gpu_id = 0  # Default to first GPU
@@ -183,8 +281,14 @@ class LLMProcessor:
                             gpu_id = self.gpu_ids[0]  # Use first GPU in the list
                             
                         total_memory = torch.cuda.get_device_properties(gpu_id).total_memory / (1024 * 1024)  # Convert to MiB
-                        memory_limit_mb = int(total_memory * 0.8)  # Use 80% of available memory
-                        info_msg(f"Setting memory limit to 80% of detected GPU memory: {memory_limit_mb} MiB (Total: {int(total_memory)} MiB)")
+                        
+                        # For high-memory GPUs, use 90% of memory
+                        if is_high_memory:
+                            memory_limit_mb = int(total_memory * 0.9)  # Use 90% of available memory
+                            info_msg(f"High-memory mode: Setting memory limit to 90% of detected GPU memory: {memory_limit_mb} MiB (Total: {int(total_memory)} MiB)")
+                        else:
+                            memory_limit_mb = int(total_memory * 0.8)  # Use 80% of available memory
+                            info_msg(f"Setting memory limit to 80% of detected GPU memory: {memory_limit_mb} MiB (Total: {int(total_memory)} MiB)")
                     except Exception as e:
                         # Fallback to default if detection fails
                         rtx_a5000_memory = 24564  # MiB default for RTX A5000
@@ -194,10 +298,22 @@ class LLMProcessor:
                     
                     # In multi-GPU setups, we'll allocate the same percentage to each GPU
                     if self.gpu_ids and len(self.gpu_ids) > 1:
-                        info_msg(f"Using 80% memory allocation for each of the {len(self.gpu_ids)} GPUs")
+                        memory_util = 0.9 if is_high_memory else 0.8
+                        info_msg(f"Using {int(memory_util*100)}% memory allocation for each of the {len(self.gpu_ids)} GPUs")
                 
-                temperature = float(get_env_variable("LLM_TEMPERATURE", "0.7"))
-                max_tokens = int(get_env_variable("LLM_MAX_TOKENS", "4096"))
+                # For high-memory mode, adjust temperature to be more deterministic
+                if is_high_memory:
+                    temperature = float(get_env_variable("LLM_TEMPERATURE", "0.6"))  # Lower temperature for larger models
+                else:
+                    temperature = float(get_env_variable("LLM_TEMPERATURE", "0.7"))
+                
+                # For high-memory mode, we can generate more tokens
+                if is_high_memory:
+                    max_tokens = int(get_env_variable("LLM_MAX_TOKENS", "8192"))  # Doubled for high-memory GPUs
+                    info_msg(f"High-memory mode: Using increased max tokens: {max_tokens}")
+                else:
+                    max_tokens = int(get_env_variable("LLM_MAX_TOKENS", "4096"))
+                
                 top_p = float(get_env_variable("LLM_TOP_P", "0.95"))
                 
                 # Detect architecture (x86 vs ARM)
@@ -239,7 +355,6 @@ class LLMProcessor:
                     if is_arm:
                         # For ARM architectures, Metal might be better than CUDA
                         success_msg(f"Using GPU acceleration: {gpu_config['gpu_info']} with {n_gpu_layers} layers")
-                        # Consider adding Metal-specific options on ARM if needed
                     else:
                         # For x86 architectures with NVIDIA GPUs
                         success_msg(f"Using GPU acceleration: {gpu_config['gpu_info']} with {n_gpu_layers} layers")
@@ -251,6 +366,17 @@ class LLMProcessor:
                 # Save context size for token counting logic
                 self.max_context_size = n_ctx
                 self.max_tokens_out = max_tokens
+                
+                # Additional model_kwargs for high-memory GPUs
+                extra_kwargs = {}
+                if is_high_memory:
+                    # Enable aggressive KV caching for high-memory GPUs
+                    if os.environ.get("KV_CACHE_ENABLED", "0") == "1":
+                        extra_kwargs["cache_capacity"] = int(memory_limit_mb * 0.75)  # 75% of memory for KV cache
+                        info_msg(f"Enabling large KV cache with capacity of {extra_kwargs['cache_capacity']} MiB")
+                    
+                    # Enable tensor computation mode for large models
+                    extra_kwargs["tensor_split"] = "1" if not self.gpu_ids else ",".join(["1"] * len(self.gpu_ids))
                 
                 # Create LlamaCpp instance with proper configuration
                 self.llm = LlamaCpp(
@@ -267,7 +393,7 @@ class LLMProcessor:
                     seed=42,  # Set a fixed seed for reproducibility
                     use_mlock=True,  # Use mlock to keep the model in memory
                     n_threads=int(os.cpu_count() * 0.75) if os.cpu_count() else 4,  # Use 75% of available CPU cores
-                    model_kwargs={"gpu_vram_limited": memory_limit_mb} if memory_limit_mb else {}  # Add memory limit properly via model_kwargs
+                    model_kwargs={"gpu_vram_limited": memory_limit_mb, **extra_kwargs} if memory_limit_mb else extra_kwargs
                 )
                 
                 success_msg("Successfully loaded model using LlamaCpp")
@@ -2495,8 +2621,8 @@ Pay special attention to:
     
     def _ensure_gpu_acceleration(self) -> None:
         """
-        Ensure GPU acceleration is enabled for text processing operations.
-        This method forces active GPU usage during non-inference operations
+        Ensure GPU acceleration is activated by allocating tensors on all GPUs.
+        This helps with multi-GPU operations and ensures GPU cores are warmed up for operations
         like architecture analysis, which would otherwise be CPU-bound.
         """
         try:
@@ -2517,23 +2643,42 @@ Pay special attention to:
                 device = torch.device(f"cuda:{i}")
                 # Get available memory for this GPU
                 total_memory = torch.cuda.get_device_properties(i).total_memory
-                # Calculate 80% of available memory for our dummy tensor (in bytes)
-                # We'll use 80% instead of 90% to reduce chances of OOM errors
-                mem_to_use = int(total_memory * 0.8)
+                memory_gb = total_memory / (1024**3)
                 
-                # Use a smaller fixed tensor size for faster initialization
-                tensor_size = 10000  # Much faster than 40000
+                # Use larger tensors for high-memory GPUs (50GB+)
+                tensor_size = 10000  # Default size
+                if memory_gb >= 45:  # High-memory GPU (approximately 50GB)
+                    tensor_size = 30000  # Significantly larger tensor for high-memory GPUs
+                    info_msg(f"Detected high-memory GPU {i} ({memory_gb:.1f}GB), using larger tensors")
                 
                 info_msg(f"Creating tensor of size {tensor_size}x{tensor_size} on GPU {i} (~{tensor_size*tensor_size*4/1024/1024:.2f} MB)")
                 
-                # Create a random tensor instead of zeros (faster for allocation)
-                dummy_tensor = torch.rand(tensor_size, tensor_size, device=device)
+                try:
+                    # Create a random tensor
+                    dummy_tensor = torch.rand(tensor_size, tensor_size, device=device)
+                    
+                    # For high-memory GPUs, create more tensors on GPUs 1 and 2
+                    if memory_gb >= 45 and i > 0:  # Skip GPU 0 for model loading
+                        # Create additional tensors on secondary GPUs
+                        dummy_tensor2 = torch.rand(tensor_size, tensor_size, device=device)
+                        dummy_tensor3 = torch.rand(tensor_size, tensor_size, device=device)
+                        
+                        # Force memory allocation through operations
+                        _ = torch.matmul(dummy_tensor, dummy_tensor2)
+                        _ = torch.matmul(dummy_tensor, dummy_tensor3)
+                    else:
+                        # For regular GPUs or GPU 0, just one additional tensor
+                        dummy_tensor2 = torch.rand(tensor_size, tensor_size, device=device)
+                        _ = torch.matmul(dummy_tensor, dummy_tensor2)
                 
-                # Create a second tensor to utilize even more memory
-                dummy_tensor2 = torch.rand(tensor_size, tensor_size, device=device)
-                
-                # Perform an efficient operation that forces memory allocation
-                _ = torch.matmul(dummy_tensor, dummy_tensor2)
+                except RuntimeError as e:
+                    # If we run out of memory, try with a smaller tensor
+                    warning_msg(f"Failed to allocate {tensor_size}x{tensor_size} tensor on GPU {i}: {e}")
+                    tensor_size = tensor_size // 2
+                    info_msg(f"Retrying with tensor size {tensor_size}x{tensor_size}")
+                    dummy_tensor = torch.rand(tensor_size, tensor_size, device=device)
+                    dummy_tensor2 = torch.rand(tensor_size, tensor_size, device=device)
+                    _ = torch.matmul(dummy_tensor, dummy_tensor2)
                 
                 # Force sync on this specific GPU
                 torch.cuda.synchronize(device)
@@ -2546,15 +2691,15 @@ Pay special attention to:
                 # Free the tensors for the first GPU after activation to avoid huge memory usage
                 # when the actual model loads (which will be on GPU 0)
                 if i == 0:
-                    del dummy_tensor, dummy_tensor2
+                    del dummy_tensor
+                    if 'dummy_tensor2' in locals():
+                        del dummy_tensor2
                     torch.cuda.empty_cache()
                     info_msg("Freed initial tensors on GPU 0 to prepare for model loading")
             
             # Additional operations on GPU 0 to ensure layers are loaded
             device = torch.device("cuda:0")
-            
-            # Create another substantial tensor
-            large_tensor = torch.rand(4000, 4000, device=device)
+            large_tensor = torch.rand(10000, 10000, device=device)
             _ = torch.nn.functional.relu(large_tensor)
             
             # Force sync to ensure GPU operations complete

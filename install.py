@@ -850,11 +850,18 @@ def setup_multi_gpu():
         # Get GPU information
         gpu_info = []
         total_memory_gb = 0
+        gpu_memory_allocation = []
+        
         for i in range(gpu_count):
             name = torch.cuda.get_device_name(i)
             memory_gb = torch.cuda.get_device_properties(i).total_memory / (1024**3)
             total_memory_gb += memory_gb
-            gpu_info.append(f"GPU {i}: {name} ({memory_gb:.1f} GB)")
+            
+            # Calculate memory allocation - use 80% of available memory by default
+            allocation_gb = int(memory_gb * 0.8)
+            gpu_memory_allocation.append(allocation_gb)
+            
+            gpu_info.append(f"GPU {i}: {name} ({memory_gb:.1f} GB, allocating {allocation_gb} GB)")
         
         print_status("\n".join(gpu_info))
         print_status(f"Total GPU memory: {total_memory_gb:.1f} GB")
@@ -866,11 +873,31 @@ def setup_multi_gpu():
             f.write("DISTRIBUTED=1\n")
             f.write(f"GPU_IDS={','.join([str(i) for i in range(gpu_count)])}\n")
             
+            # Add GPU memory allocation settings
+            f.write(f"GPU_MEMORY_ALLOCATION={','.join([str(mem) for mem in gpu_memory_allocation])}\n")
+            f.write("TENSOR_PARALLEL=1\n")
+            f.write("MAX_BATCH_SIZE=32\n")
+            f.write("GPU_MEMORY_UTILIZATION=0.8\n")
+            
+            # Add tensor dimensions for large models
+            f.write("EMBEDDING_DIMENSION=4096\n")
+            f.write("CONTEXT_SIZE=32768\n")
+            
             # If we have more than 32GB total, suggest 70B model
             if total_memory_gb > 32:
                 print_status("Detected sufficient GPU memory for CodeLlama-70B model")
                 f.write("# Uncomment to use 70B model\n")
-                f.write("# LLM_MODEL=codellama-70b-instruct\n")
+                f.write("LLM_MODEL=codellama-70b-instruct\n")
+            
+            # For 50GB+ GPUs, enable more aggressive memory allocation
+            if any(torch.cuda.get_device_properties(i).total_memory / (1024**3) >= 50 for i in range(gpu_count)):
+                print_status("Detected high-memory GPUs (50GB+), enabling optimized memory settings")
+                f.write("\n# High-memory GPU optimization\n")
+                f.write("HIGH_MEM_GPUS=1\n")
+                f.write("TENSOR_SIZE_MULTIPLIER=10\n")  # 10x larger tensors as requested
+                f.write("MODEL_PARALLEL=1\n")
+                f.write("KV_CACHE_ENABLED=1\n")
+                f.write("BATCH_SIZE=64\n")  # Increase batch size for processing
         
         print_success("Multi-GPU configuration set up successfully")
         return True, gpu_count
