@@ -12,7 +12,11 @@ import sys
 import subprocess
 import platform
 import math
-from typing import Dict, List, Optional, Any, Union
+import time
+import re
+import importlib
+import traceback
+from typing import Dict, List, Optional, Any, Union, Tuple
 from pathlib import Path
 from tqdm import tqdm
 from pydantic import BaseModel
@@ -381,19 +385,33 @@ class LLMProcessor:
                 # Create LlamaCpp instance with proper configuration
                 self.llm = LlamaCpp(
                     model_path=model_path,
-                    n_ctx=n_ctx,
-                    n_batch=n_batch,
-                    n_gpu_layers=n_gpu_layers,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     top_p=top_p,
-                    verbose=True,
-                    f16_kv=True,  # Use half-precision for key/value cache
+                    verbose=True,  # Disable streaming for now as it can cause issues
                     streaming=False,  # Disable streaming for now as it can cause issues
                     seed=42,  # Set a fixed seed for reproducibility
                     use_mlock=True,  # Use mlock to keep the model in memory
-                    n_threads=int(os.cpu_count() * 0.75) if os.cpu_count() else 4,  # Use 75% of available CPU cores
-                    model_kwargs={"gpu_vram_limited": memory_limit_mb, **extra_kwargs} if memory_limit_mb else extra_kwargs
+                    model_kwargs={
+                        "n_gpu_layers": -1,              # Offload all layers to GPUs
+                        "gpu_memory_limit": 150000,      # Total VRAM across all GPUs (150GB = 3x50GB)
+                        "tensor_split": [16.6, 16.6, 16.6],  # Equal memory allocation per GPU (in GB)
+                        "main_gpu": 0,                   # Primary GPU for initial processing
+                        
+                        # Performance Optimization
+                        "n_ctx": 8192,                   # Large context window for code analysis
+                        "n_batch": 4096,                 # Increased batch size for throughput
+                        "n_threads": 12,                 # CPU threads for I/O bound operations
+                        "offload_kqv": True,             # Offload attention matrices
+                        
+                        # Quantization/Precision
+                        "f16_kv": True,                  # Half-precision key/value cache
+                        
+                        # Multi-GPU Specific
+                        "mul_mat_q": True,               # Optimize matrix multiplication
+                        "rms_norm_eps": 1e-6,            # Stability for large models
+                        "flash_attn": True               # Use flash attention
+                    }
                 )
                 
                 success_msg("Successfully loaded model using LlamaCpp")
@@ -2645,31 +2663,50 @@ Pay special attention to:
                 total_memory = torch.cuda.get_device_properties(i).total_memory
                 memory_gb = total_memory / (1024**3)
                 
-                # Use larger tensors for high-memory GPUs (50GB+)
-                tensor_size = 10000  # Default size
-                if memory_gb >= 45:  # High-memory GPU (approximately 50GB)
-                    tensor_size = 30000  # Significantly larger tensor for high-memory GPUs
-                    info_msg(f"Detected high-memory GPU {i} ({memory_gb:.1f}GB), using larger tensors")
+                # Dynamically scale tensor size based on available memory
+                # Use approximately 40% of available memory for tensor allocation
+                # Each float32 element is 4 bytes, so calculate how many elements we can fit
+                memory_bytes_to_use = total_memory * 0.4  # 40% of memory for GPU 0, more for others
+                if i > 0:  # For secondary GPUs, we can use more memory
+                    memory_bytes_to_use = total_memory * 0.7  # 70% of memory
                 
-                info_msg(f"Creating tensor of size {tensor_size}x{tensor_size} on GPU {i} (~{tensor_size*tensor_size*4/1024/1024:.2f} MB)")
+                # Calculate tensor size as sqrt of total elements (since we're creating square tensors)
+                # 4 bytes per float32 element
+                elements_possible = memory_bytes_to_use / 4
+                tensor_side = int(math.sqrt(elements_possible))
+                
+                # Round to nearest 1000 for cleaner reporting
+                tensor_size = (tensor_side // 1000) * 1000
+                # Ensure minimum size and avoid too large tensors that might cause issues
+                tensor_size = max(5000, min(tensor_size, 50000))
+                
+                info_msg(f"GPU {i} has {memory_gb:.1f} GB memory, allocating tensor of size {tensor_size}x{tensor_size} (~{tensor_size*tensor_size*4/1024/1024:.1f} MB)")
                 
                 try:
                     # Create a random tensor
                     dummy_tensor = torch.rand(tensor_size, tensor_size, device=device)
                     
-                    # For high-memory GPUs, create more tensors on GPUs 1 and 2
-                    if memory_gb >= 45 and i > 0:  # Skip GPU 0 for model loading
-                        # Create additional tensors on secondary GPUs
-                        dummy_tensor2 = torch.rand(tensor_size, tensor_size, device=device)
-                        dummy_tensor3 = torch.rand(tensor_size, tensor_size, device=device)
-                        
-                        # Force memory allocation through operations
-                        _ = torch.matmul(dummy_tensor, dummy_tensor2)
-                        _ = torch.matmul(dummy_tensor, dummy_tensor3)
+                    # For secondary GPUs, create additional tensors to utilize more memory
+                    if i > 0:  # Skip GPU 0 for model loading
+                        # Number of additional tensors scales with memory size
+                        num_additional = 1
+                        if memory_gb >= 40:
+                            num_additional = 2
+                        if memory_gb >= 80:
+                            num_additional = 3
+                            
+                        additional_tensors = []
+                        for j in range(num_additional):
+                            info_msg(f"Creating additional tensor {j+1}/{num_additional} on GPU {i}")
+                            additional_tensors.append(torch.rand(tensor_size, tensor_size, device=device))
+                            # Force memory allocation through operations
+                            _ = torch.matmul(dummy_tensor, additional_tensors[j])
                     else:
-                        # For regular GPUs or GPU 0, just one additional tensor
-                        dummy_tensor2 = torch.rand(tensor_size, tensor_size, device=device)
-                        _ = torch.matmul(dummy_tensor, dummy_tensor2)
+                        # For GPU 0, just one additional tensor with smaller size
+                        # GPU 0 needs more memory available for model loading
+                        secondary_size = tensor_size // 2
+                        dummy_tensor2 = torch.rand(secondary_size, secondary_size, device=device)
+                        _ = torch.matmul(dummy_tensor[:secondary_size, :secondary_size], dummy_tensor2)
                 
                 except RuntimeError as e:
                     # If we run out of memory, try with a smaller tensor
@@ -2686,7 +2723,8 @@ Pay special attention to:
                 # Log allocation
                 mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
                 mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
-                info_msg(f"GPU {i} activated with {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved")
+                percent_used = (mem_reserved / (total_memory / 1024**2)) * 100
+                info_msg(f"GPU {i} activated with {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved ({percent_used:.1f}% of total)")
                 
                 # Free the tensors for the first GPU after activation to avoid huge memory usage
                 # when the actual model loads (which will be on GPU 0)
@@ -2699,7 +2737,7 @@ Pay special attention to:
             
             # Additional operations on GPU 0 to ensure layers are loaded
             device = torch.device("cuda:0")
-            large_tensor = torch.rand(10000, 10000, device=device)
+            large_tensor = torch.rand(5000, 5000, device=device)
             _ = torch.nn.functional.relu(large_tensor)
             
             # Force sync to ensure GPU operations complete
