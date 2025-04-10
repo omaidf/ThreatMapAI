@@ -40,7 +40,7 @@ from utils.common import success_msg, error_msg, warning_msg, info_msg
 from utils.env_utils import get_env_variable
 from utils.model_utils import download_model, validate_model_path, check_model_file
 from utils.model_config import get_default_model_path, get_model_info
-from utils.gpu_utils import detect_gpu_capabilities
+from utils.gpu_utils import detect_gpu_capabilities, ensure_gpu_acceleration, release_gpu_memory, log_gpu_status, start_gpu_monitoring
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +109,7 @@ class LLMProcessor:
         
         # Set a default max_context_size to prevent errors
         self.max_context_size = 2048
-        self.max_tokens_out = 41024
+        self.max_tokens_out = 4096
         
         # Check for high-memory GPUs and load environment settings
         self._check_for_high_memory_gpus()
@@ -385,30 +385,30 @@ class LLMProcessor:
                 # Create LlamaCpp instance with proper configuration
                 self.llm = LlamaCpp(
                     model_path=model_path,
-                    n_ctx=8192,                   # Large context window for code analysis
-                    n_batch=4096,                 # Increased batch size for throughput
-                    n_gpu_layers=-1,              # Offload all layers to GPUs
-                    n_threads=12,                 # CPU threads for I/O bound operations
-                    f16_kv=True,                  # Half-precision key/value cache
+                    n_ctx=n_ctx,                   # Large context window for code analysis
+                    n_batch=n_batch,               # Increased batch size for throughput
+                    n_gpu_layers=n_gpu_layers,     # Offload all layers to GPUs
+                    n_threads=12,                  # CPU threads for I/O bound operations
+                    f16_kv=True,                   # Half-precision key/value cache
                     temperature=temperature,
                     max_tokens=max_tokens,
                     top_p=top_p,
                     verbose=True,
                     streaming=False,
-                    seed=42,                      # Set a fixed seed for reproducibility
-                    use_mlock=True,               # Use mlock to keep the model in memory
+                    seed=42,                       # Set a fixed seed for reproducibility
+                    use_mlock=True,                # Use mlock to keep the model in memory
                     model_kwargs={
-                        "gpu_memory_limit": 150000,      # Total VRAM across all GPUs (150GB = 3x50GB)
-                        "tensor_split": [16.6, 16.6, 16.6],  # Equal memory allocation per GPU (in GB)
-                        "main_gpu": 0,                   # Primary GPU for initial processing
+                        "gpu_memory_limit": memory_limit_mb,  # Total VRAM across all GPUs
+                        "tensor_split": [0.33, 0.33, 0.34] if self.gpu_ids and len(self.gpu_ids) == 3 else None,  # Memory allocation per GPU
+                        "main_gpu": 0,             # Primary GPU for initial processing
                         
                         # Performance Optimization
-                        "offload_kqv": True,             # Offload attention matrices
+                        "offload_kqv": True,       # Offload attention matrices
                         
                         # Multi-GPU Specific
-                        "mul_mat_q": True,               # Optimize matrix multiplication
-                        "rms_norm_eps": 1e-6,            # Stability for large models
-                        "flash_attn": True               # Use flash attention
+                        "mul_mat_q": True,         # Optimize matrix multiplication
+                        "flash_attn": True,        # Use flash attention
+                        **extra_kwargs
                     }
                 )
                 
@@ -1647,78 +1647,78 @@ Pay special attention to:
                     
                     # Create the prompt - modified for incremental analysis
                     system_prompt = """You are an expert in software architecture and security analysis.
-    Your task is to identify the architecture layers and security boundaries in a codebase.
-    Be concise and focus on the most important security boundaries."""
+Your task is to identify the architecture layers and security boundaries in a codebase.
+Be concise and focus on the most important security boundaries."""
                     
                     # Modify human prompt based on whether this is the first batch
                     if is_first_batch:
                         human_prompt = """
-    I need you to analyze the architecture of a software project.
-    
-    Technology stack: {tech_stack}
-    
-    Key entry points:
-    {entry_points}
-    
-    Here are some key files:
-    {file_list}
-    
-    Some important file relationships:
-    {file_relationships}
-    
-    Please identify:
-    1. The overall architecture description (1-2 sentences)
-    2. 2-4 key security boundaries/zones (e.g., frontend/backend, authenticated/unauthenticated, admin/user)
-    3. Which files belong in which security boundaries
-    
-    Return your analysis in this format:
-    DESCRIPTION:
-    <1-2 sentence description>
-    
-    SECURITY_BOUNDARIES:
-    - <boundary name>: <description>
-    - <boundary name>: <description>
-    
-    FILES_BY_BOUNDARY:
-    - <boundary name>: <comma-separated file list>
-    - <boundary name>: <comma-separated file list>
-    """
+I need you to analyze the architecture of a software project.
+
+Technology stack: {tech_stack}
+
+Key entry points:
+{entry_points}
+
+Here are some key files:
+{file_list}
+
+Some important file relationships:
+{file_relationships}
+
+Please identify:
+1. The overall architecture description (1-2 sentences)
+2. 2-4 key security boundaries/zones (e.g., frontend/backend, authenticated/unauthenticated, admin/user)
+3. Which files belong in which security boundaries
+
+Return your analysis in this format:
+DESCRIPTION:
+<1-2 sentence description>
+
+SECURITY_BOUNDARIES:
+- <boundary name>: <description>
+- <boundary name>: <description>
+
+FILES_BY_BOUNDARY:
+- <boundary name>: <comma-separated file list>
+- <boundary name>: <comma-separated file list>
+"""
                     else:
                         # For subsequent batches, include previous findings and focus on new files
                         human_prompt = """
-    I need you to continue analyzing the architecture of a software project. 
-    I've already analyzed some files and identified initial boundaries. Now I need you to look at additional files.
-    
-    Technology stack: {tech_stack}
-    
-    Previous findings:
-    {previous_description}
-    
-    Previously identified security boundaries:
-    {previous_boundaries}
-    
-    Additional files to analyze:
-    {file_list}
-    
-    Some important file relationships:
-    {file_relationships}
-    
-    Please:
-    1. Update or refine the architecture description if needed
-    2. Assign these additional files to existing boundaries or create new boundaries if necessary
-    
-    Return your analysis in this format:
-    DESCRIPTION:
-    <1-2 sentence updated description>
-    
-    SECURITY_BOUNDARIES:
-    - <boundary name>: <description>
-    - <boundary name>: <description>
-    
-    FILES_BY_BOUNDARY:
-    - <boundary name>: <comma-separated file list>
-    - <boundary name>: <comma-separated file list>
-    """
+I need you to continue analyzing the architecture of a software project. 
+I've already analyzed some files and identified initial boundaries. Now I need you to look at additional files.
+
+Technology stack: {tech_stack}
+
+Previous findings:
+{previous_description}
+
+Previously identified security boundaries:
+{previous_boundaries}
+
+Additional files to analyze:
+{file_list}
+
+Some important file relationships:
+{file_relationships}
+
+Please:
+1. Update or refine the architecture description if needed
+2. Assign these additional files to existing boundaries or create new boundaries if necessary
+
+Return your analysis in this format:
+DESCRIPTION:
+<1-2 sentence updated description>
+
+SECURITY_BOUNDARIES:
+- <boundary name>: <description>
+- <boundary name>: <description>
+
+FILES_BY_BOUNDARY:
+- <boundary name>: <comma-separated file list>
+- <boundary name>: <comma-separated file list>
+"""
                     
                     # Prepare the prompt based on batch
                     prompt_template = system_prompt if is_first_batch else system_prompt
@@ -2675,297 +2675,16 @@ Pay special attention to:
         This helps with multi-GPU operations and ensures GPU cores are warmed up for operations
         like architecture analysis, which would otherwise be CPU-bound.
         """
-        # VERY DISTINCTIVE MESSAGE FOR DEBUGGING - APRIL 2025
-        info_msg("!!! UPDATED GPU ACCELERATION FUNCTION !!! April 2025 version")
-        
-        try:
-            # Set PyTorch memory allocation configuration to help with fragmentation
-            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-            
-            # Only proceed if we have GPU capabilities
-            if not hasattr(torch, 'cuda') or not torch.cuda.is_available():
-                info_msg("No CUDA capabilities detected - running on CPU only")
-                return
-                
-            # Get number of GPUs
-            gpu_count = torch.cuda.device_count()
-            if gpu_count == 0:
-                info_msg("No GPUs detected - running on CPU only")
-                return
-                
-            # Log that we're activating GPUs for processing
-            info_msg(f"Activating {gpu_count} GPUs for text embedding and processing")
-            
-            # FIRST PHASE: Collect all GPU statistics
-            gpu_stats = []
-            total_system_memory = 0
-            
-            for i in range(gpu_count):
-                try:
-                    device_name = torch.cuda.get_device_name(i)
-                    total_memory = torch.cuda.get_device_properties(i).total_memory
-                    reserved_memory = torch.cuda.memory_reserved(i)
-                    allocated_memory = torch.cuda.memory_allocated(i)
-                    
-                    free_memory_bytes = total_memory - reserved_memory
-                    
-                    memory_gb = total_memory / (1024**3)
-                    reserved_gb = reserved_memory / (1024**3)
-                    allocated_gb = allocated_memory / (1024**3)
-                    free_memory_gb = free_memory_bytes / (1024**3)
-                    
-                    # Store stats for this GPU
-                    gpu_stats.append({
-                        'index': i,
-                        'device_name': device_name,
-                        'total_memory': total_memory,
-                        'total_memory_gb': memory_gb,
-                        'reserved_memory': reserved_memory,
-                        'reserved_memory_gb': reserved_gb,
-                        'allocated_memory': allocated_memory,
-                        'allocated_memory_gb': allocated_gb,
-                        'free_memory': free_memory_bytes,
-                        'free_memory_gb': free_memory_gb,
-                        'target_use_percent': 0.75,  # Default target
-                    })
-                    
-                    total_system_memory += total_memory
-                    
-                    info_msg(f"Found GPU {i}: {device_name} with {memory_gb:.1f} GB total memory, {free_memory_gb:.1f} GB free ({reserved_gb:.1f} GB reserved, {allocated_gb:.1f} GB allocated)")
-                except Exception as e:
-                    warning_msg(f"Error getting info for GPU {i}: {str(e)}")
-                    # Add fallback stats
-                    gpu_stats.append({
-                        'index': i,
-                        'device_name': 'Unknown',
-                        'total_memory': 0,
-                        'total_memory_gb': 0,
-                        'free_memory': 0,
-                        'free_memory_gb': 0,
-                        'has_error': True,
-                    })
-            
-            # SECOND PHASE: Determine optimal allocation strategy based on all GPU stats
-            
-            # Sort GPUs by free memory (descending) for optimal allocation
-            gpu_stats.sort(key=lambda x: x.get('free_memory', 0), reverse=True)
-            
-            # Special case: Adjust allocation for model-hosting GPU (usually GPU 0)
-            model_gpu_index = 0  # Default to first GPU for model
-            
-            # Adjust target usage percentages
-            for i, gpu in enumerate(gpu_stats):
-                if gpu.get('has_error', False):
-                    continue
-                    
-                if gpu['index'] == model_gpu_index:
-                    # Model GPU gets lower target to leave room for model
-                    gpu['target_use_percent'] = 0.6  # 60% for GPU hosting model
-                elif gpu['free_memory_gb'] > 35:
-                    # High-memory GPUs can use more
-                    gpu['target_use_percent'] = 0.85  # 85% for high-memory GPUs
-                elif gpu['free_memory_gb'] > 20:
-                    # Medium-memory GPUs
-                    gpu['target_use_percent'] = 0.8  # 80% for medium-memory GPUs
-                else:
-                    # Low-memory GPUs
-                    gpu['target_use_percent'] = 0.75  # 75% for low-memory GPUs
-                
-                # Calculate additional tensors based on memory
-                if gpu['index'] == model_gpu_index:
-                    gpu['num_additional_tensors'] = 1  # Minimum for model GPU
-                else:
-                    # Scale additional tensors based on available memory
-                    mem_gb = gpu['free_memory_gb']
-                    if mem_gb > 40:
-                        gpu['num_additional_tensors'] = 5
-                    elif mem_gb > 30:
-                        gpu['num_additional_tensors'] = 4
-                    elif mem_gb > 20:
-                        gpu['num_additional_tensors'] = 3
-                    elif mem_gb > 10:
-                        gpu['num_additional_tensors'] = 2
-                    else:
-                        gpu['num_additional_tensors'] = 1
-                
-                # Calculate tensor size to achieve target memory usage
-                target_memory_bytes = gpu['free_memory'] * gpu['target_use_percent']
-                gpu['target_memory_bytes'] = target_memory_bytes
-                
-                # Calculate primary tensor size (will be adjusted for additional tensors)
-                # Assuming 4 bytes per float32 element and additional tensors
-                # Primary tensor gets 60% of target memory, the rest is for additional tensors
-                primary_tensor_bytes = target_memory_bytes * 0.6
-                elements = primary_tensor_bytes / 4  # 4 bytes per float32
-                tensor_side = int(math.sqrt(elements))
-                # Round to nearest 1000 for cleaner reporting
-                tensor_side = (tensor_side // 1000) * 1000
-                # Ensure minimum and maximum sizes
-                tensor_side = max(5000, min(tensor_side, 45000))
-                gpu['primary_tensor_size'] = tensor_side
-                
-                # Calculate additional tensor sizes based on remaining target memory
-                remaining_bytes = target_memory_bytes * 0.4  # 40% for additional tensors
-                if gpu['num_additional_tensors'] > 0:
-                    bytes_per_tensor = remaining_bytes / gpu['num_additional_tensors']
-                    elements_per_tensor = bytes_per_tensor / 4
-                    additional_side = int(math.sqrt(elements_per_tensor))
-                    # Round to nearest 1000
-                    additional_side = (additional_side // 1000) * 1000
-                    # Ensure minimum size
-                    additional_side = max(3000, additional_side)
-                    gpu['additional_tensor_size'] = additional_side
-            
-            # THIRD PHASE: Allocate memory on each GPU according to the optimized plan
-            for gpu in gpu_stats:
-                if gpu.get('has_error', False):
-                    warning_msg(f"Skipping GPU {gpu['index']} due to previous errors")
-                    continue
-                
-                i = gpu['index']
-                device = torch.device(f"cuda:{i}")
-                
-                # Use the calculated tensor sizes for optimal allocation
-                tensor_size = gpu['primary_tensor_size']
-                info_msg(f"GPU {i} has {gpu['total_memory_gb']:.1f} GB total memory, {gpu['free_memory_gb']:.1f} GB free, allocating tensor of size {tensor_size}x{tensor_size} (~{tensor_size*tensor_size*4/1024/1024:.1f} MB)")
-                
-                try:
-                    # Create primary tensor
-                    dummy_tensor = torch.rand(tensor_size, tensor_size, device=device)
-                    
-                    # Create additional tensors if needed
-                    additional_tensors = []
-                    num_additional = gpu['num_additional_tensors']
-                    additional_size = gpu.get('additional_tensor_size', tensor_size // 2)
-                    
-                    if i != model_gpu_index:  # Skip extra tensors for model GPU
-                        for j in range(num_additional):
-                            info_msg(f"Creating additional tensor {j+1}/{num_additional} on GPU {i} (size: {additional_size}x{additional_size})")
-                            additional_tensors.append(torch.rand(additional_size, additional_size, device=device))
-                            # Force memory allocation through operations
-                            _ = torch.matmul(dummy_tensor[:additional_size, :additional_size], additional_tensors[j])
-                    else:
-                        # For model GPU, just create one smaller tensor
-                        secondary_size = min(additional_size, tensor_size // 2)
-                        dummy_tensor2 = torch.rand(secondary_size, secondary_size, device=device)
-                        _ = torch.matmul(dummy_tensor[:secondary_size, :secondary_size], dummy_tensor2)
-                
-                except RuntimeError as e:
-                    # If we run out of memory, try with a smaller tensor
-                    error_msg(f"Failed to allocate {tensor_size}x{tensor_size} tensor on GPU {i}: {e}")
-                    tensor_size = tensor_size // 2
-                    info_msg(f"Retrying with tensor size {tensor_size}x{tensor_size}")
-                    try:
-                        dummy_tensor = torch.rand(tensor_size, tensor_size, device=device)
-                        dummy_tensor2 = torch.rand(tensor_size // 2, tensor_size // 2, device=device)
-                        _ = torch.matmul(dummy_tensor[:tensor_size//2, :tensor_size//2], dummy_tensor2)
-                    except Exception as retry_e:
-                        error_msg(f"Even retry with smaller tensor failed on GPU {i}: {retry_e}")
-                        # Try one last time with a very small tensor
-                        try:
-                            info_msg(f"Final attempt with minimal tensor size on GPU {i}")
-                            dummy_tensor = torch.rand(1000, 1000, device=device)
-                            _ = torch.nn.functional.relu(dummy_tensor)
-                        except Exception as final_e:
-                            error_msg(f"Could not allocate even minimal tensor on GPU {i}: {final_e}")
-                        continue
-                
-                # Force sync on this specific GPU
-                torch.cuda.synchronize(device)
-                
-                # Log allocation
-                mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
-                mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
-                percent_used = (mem_reserved / (gpu['total_memory'] / 1024**2)) * 100
-                info_msg(f"GPU {i} activated with {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved ({percent_used:.1f}% of total)")
-                
-                # Free the tensors for the model GPU after activation to avoid huge memory usage
-                # when the actual model loads
-                if i == model_gpu_index:
-                    del dummy_tensor
-                    if 'dummy_tensor2' in locals():
-                        del dummy_tensor2
-                    torch.cuda.empty_cache()
-                    info_msg(f"Freed initial tensors on GPU {model_gpu_index} to prepare for model loading")
-                else:
-                    # For secondary GPUs, free the tensors after measuring memory usage
-                    # This was missing in the previous version
-                    if 'additional_tensors' in locals() and additional_tensors:
-                        for tensor in additional_tensors:
-                            del tensor
-                        additional_tensors = []
-                    if 'dummy_tensor' in locals():
-                        del dummy_tensor
-                    # Don't empty cache for secondary GPUs - keep the memory reserved
-            
-            # Final operations on model GPU to ensure layers are loaded
-            try:
-                device = torch.device(f"cuda:{model_gpu_index}")
-                large_tensor = torch.rand(3000, 3000, device=device)
-                _ = torch.nn.functional.relu(large_tensor)
-                
-                # Force sync to ensure GPU operations complete
-                torch.cuda.synchronize()
-                info_msg("Successfully completed GPU activation")
-                
-                # Delete the tensor after use
-                del large_tensor
-            except Exception as final_e:
-                error_msg(f"Error in final GPU operations: {str(final_e)}")
-            
-            # Final memory cleanup
-            # Force Python garbage collection first
-            import gc
-            gc.collect()
-            
-            # Final memory status report
-            info_msg("Final GPU memory status after activation:")
-            for i in range(torch.cuda.device_count()):
-                try:
-                    mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
-                    mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
-                    total_memory = torch.cuda.get_device_properties(i).total_memory / (1024**2)
-                    percent_used = (mem_reserved / total_memory) * 100
-                    info_msg(f"  GPU {i}: {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved ({percent_used:.1f}% of total)")
-                except Exception as e:
-                    pass
-            
-        except Exception as e:
-            error_msg(f"Failed to ensure GPU acceleration: {str(e)}")
-            # Print traceback for better debugging
-            import traceback
-            error_msg(f"Traceback: {traceback.format_exc()}")
+        # Call the centralized function in gpu_utils
+        ensure_gpu_acceleration()
     
     def _start_gpu_monitoring(self) -> None:
         """
         Start monitoring GPU utilization in a separate thread.
         This helps track GPU usage during various processing phases.
         """
-        try:
-            # Only monitor if we have GPUs
-            if not hasattr(torch, 'cuda') or not torch.cuda.is_available():
-                return
-                
-            # Get number of GPUs
-            gpu_count = torch.cuda.device_count()
-            if gpu_count == 0:
-                return
-                
-            # Log initial GPU state
-            for i in range(gpu_count):
-                if torch.cuda.memory_allocated(i) > 0:
-                    mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
-                    mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
-                    info_msg(f"GPU {i} memory state: {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved")
-                    
-            # Force garbage collection to get accurate reading
-            import gc
-            gc.collect()
-            if hasattr(torch.cuda, 'empty_cache'):
-                torch.cuda.empty_cache()
-                
-        except Exception as e:
-            warning_msg(f"Failed to start GPU monitoring: {str(e)}")
+        # Call the centralized function in gpu_utils
+        start_gpu_monitoring()
 
     def _log_gpu_status(self, phase: str) -> None:
         """
@@ -2974,87 +2693,12 @@ Pay special attention to:
         Args:
             phase: Description of the current processing phase
         """
-        try:
-            if not hasattr(torch, 'cuda') or not torch.cuda.is_available():
-                return
-                
-            gpu_count = torch.cuda.device_count()
-            if gpu_count == 0:
-                return
-                
-            logger.info(f"GPU status at phase: {phase}")
-            
-            for i in range(gpu_count):
-                mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
-                mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
-                util_percent = 0
-                
-                try:
-                    # Try to get actual GPU utilization if available
-                    if hasattr(torch.cuda, 'utilization'):
-                        util_percent = torch.cuda.utilization(i)
-                except:
-                    pass
-                    
-                logger.info(f"  GPU {i}: {mem_allocated:.1f}MB allocated, {mem_reserved:.1f}MB reserved, {util_percent}% utilization")
-                
-        except Exception as e:
-            warning_msg(f"Failed to log GPU status: {str(e)}")
+        # Call the centralized function in gpu_utils
+        log_gpu_status(phase)
 
     def _release_gpu_memory(self):
         """
         Aggressively release GPU memory, including both allocated memory and reserved cache.
         """
-        try:
-            # Only proceed if torch.cuda is available
-            if not hasattr(torch, 'cuda') or not torch.cuda.is_available():
-                return
-            
-            # Force Python garbage collection first
-            import gc
-            gc.collect()
-            
-            # Log current GPU status before cleaning
-            info_msg("GPU memory status before cleanup:")
-            for i in range(torch.cuda.device_count()):
-                try:
-                    mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
-                    mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
-                    info_msg(f"  GPU {i}: {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved")
-                except:
-                    pass
-            
-            # Empty CUDA cache to free memory
-            torch.cuda.empty_cache()
-            
-            # Try a more aggressive approach
-            for i in range(torch.cuda.device_count()):
-                try:
-                    # Reset the current device to clear its cache
-                    device = torch.device(f"cuda:{i}")
-                    torch.cuda.set_device(device)
-                    torch.cuda.empty_cache()
-                    torch.cuda.reset_peak_memory_stats(i)
-                except Exception as e:
-                    warning_msg(f"Error resetting GPU {i} memory: {str(e)}")
-            
-            # Try using nvidia-smi to release memory (system-level)
-            try:
-                import subprocess
-                # This doesn't actually release memory but can help diagnose
-                subprocess.run("nvidia-smi", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            except:
-                pass
-                
-            # Log GPU status after cleanup
-            info_msg("GPU memory status after cleanup:")
-            for i in range(torch.cuda.device_count()):
-                try:
-                    mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
-                    mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
-                    info_msg(f"  GPU {i}: {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved")
-                except:
-                    pass
-                    
-        except Exception as e:
-            warning_msg(f"Error during GPU memory release: {str(e)}")
+        # Call the centralized function in gpu_utils
+        release_gpu_memory()

@@ -15,6 +15,7 @@ import importlib.util
 from typing import Tuple, List, Dict, Optional, Union, Any
 from pathlib import Path
 import numpy as np
+import math
 
 # Import internal utilities
 from utils.common import success_msg, error_msg, warning_msg, info_msg
@@ -827,4 +828,414 @@ def get_gpu_memory_limit() -> Optional[float]:
         warning_msg(f"Invalid GPU memory limit: {limit_str}")
         return None
     except Exception:
-        return None 
+        return None
+
+def ensure_gpu_acceleration() -> None:
+    """
+    Ensure GPU acceleration is activated by allocating tensors on all GPUs.
+    This helps with multi-GPU operations and ensures GPU cores are warmed up for operations
+    like architecture analysis, which would otherwise be CPU-bound.
+    """
+    try:
+        # Set PyTorch memory allocation configuration to help with fragmentation
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        
+        # Only proceed if we have GPU capabilities
+        if not HAS_TORCH or not torch.cuda.is_available():
+            info_msg("No CUDA capabilities detected - running on CPU only")
+            return
+            
+        # Get number of GPUs
+        gpu_count = torch.cuda.device_count()
+        if gpu_count == 0:
+            info_msg("No GPUs detected - running on CPU only")
+            return
+            
+        # Log that we're activating GPUs for processing
+        info_msg(f"Activating {gpu_count} GPUs for text embedding and processing")
+        
+        # FIRST PHASE: Collect all GPU statistics
+        gpu_stats = []
+        total_system_memory = 0
+        
+        for i in range(gpu_count):
+            try:
+                device_name = torch.cuda.get_device_name(i)
+                total_memory = torch.cuda.get_device_properties(i).total_memory
+                reserved_memory = torch.cuda.memory_reserved(i)
+                allocated_memory = torch.cuda.memory_allocated(i)
+                
+                free_memory_bytes = total_memory - reserved_memory
+                
+                memory_gb = total_memory / (1024**3)
+                reserved_gb = reserved_memory / (1024**3)
+                allocated_gb = allocated_memory / (1024**3)
+                free_memory_gb = free_memory_bytes / (1024**3)
+                
+                # Store stats for this GPU
+                gpu_stats.append({
+                    'index': i,
+                    'device_name': device_name,
+                    'total_memory': total_memory,
+                    'total_memory_gb': memory_gb,
+                    'reserved_memory': reserved_memory,
+                    'reserved_memory_gb': reserved_gb,
+                    'allocated_memory': allocated_memory,
+                    'allocated_memory_gb': allocated_gb,
+                    'free_memory': free_memory_bytes,
+                    'free_memory_gb': free_memory_gb,
+                    'target_use_percent': 0.75,  # Default target
+                })
+                
+                total_system_memory += total_memory
+                
+                info_msg(f"Found GPU {i}: {device_name} with {memory_gb:.1f} GB total memory, {free_memory_gb:.1f} GB free ({reserved_gb:.1f} GB reserved, {allocated_gb:.1f} GB allocated)")
+            except Exception as e:
+                warning_msg(f"Error getting info for GPU {i}: {str(e)}")
+                # Add fallback stats
+                gpu_stats.append({
+                    'index': i,
+                    'device_name': 'Unknown',
+                    'total_memory': 0,
+                    'total_memory_gb': 0,
+                    'free_memory': 0,
+                    'free_memory_gb': 0,
+                    'has_error': True,
+                })
+        
+        # SECOND PHASE: Determine optimal allocation strategy based on all GPU stats
+        
+        # Sort GPUs by free memory (descending) for optimal allocation
+        gpu_stats.sort(key=lambda x: x.get('free_memory', 0), reverse=True)
+        
+        # Special case: Adjust allocation for model-hosting GPU (usually GPU 0)
+        model_gpu_index = 0  # Default to first GPU for model
+        
+        # Adjust target usage percentages
+        for i, gpu in enumerate(gpu_stats):
+            if gpu.get('has_error', False):
+                continue
+                
+            if gpu['index'] == model_gpu_index:
+                # Model GPU gets lower target to leave room for model
+                gpu['target_use_percent'] = 0.6  # 60% for GPU hosting model
+            elif gpu['free_memory_gb'] > 35:
+                # High-memory GPUs can use more
+                gpu['target_use_percent'] = 0.8  # Reduced from 0.85 to prevent OOM
+            elif gpu['free_memory_gb'] > 20:
+                # Medium-memory GPUs
+                gpu['target_use_percent'] = 0.75  # Reduced from 0.8 to prevent OOM
+            else:
+                # Low-memory GPUs
+                gpu['target_use_percent'] = 0.7  # Reduced from 0.75 to prevent OOM
+            
+            # Calculate additional tensors based on memory
+            if gpu['index'] == model_gpu_index:
+                gpu['num_additional_tensors'] = 1  # Minimum for model GPU
+            else:
+                # Scale additional tensors based on available memory - using fewer tensors
+                mem_gb = gpu['free_memory_gb']
+                if mem_gb > 40:
+                    gpu['num_additional_tensors'] = 3  # Reduced from 5
+                elif mem_gb > 30:
+                    gpu['num_additional_tensors'] = 2  # Reduced from 4
+                elif mem_gb > 20:
+                    gpu['num_additional_tensors'] = 2  # Reduced from 3
+                elif mem_gb > 10:
+                    gpu['num_additional_tensors'] = 1  # Reduced from 2
+                else:
+                    gpu['num_additional_tensors'] = 1
+            
+            # Calculate tensor size to achieve target memory usage
+            target_memory_bytes = gpu['free_memory'] * gpu['target_use_percent']
+            gpu['target_memory_bytes'] = target_memory_bytes
+            
+            # Calculate primary tensor size (will be adjusted for additional tensors)
+            # Assuming 4 bytes per float32 element and additional tensors
+            # Primary tensor gets 60% of target memory, the rest is for additional tensors
+            primary_tensor_bytes = target_memory_bytes * 0.6
+            elements = primary_tensor_bytes / 4  # 4 bytes per float32
+            tensor_side = int(math.sqrt(elements))
+            # Round to nearest 1000 for cleaner reporting
+            tensor_side = (tensor_side // 1000) * 1000
+            # Ensure minimum and maximum sizes - REDUCED MAXIMUM FROM 45000 to 35000
+            tensor_side = max(5000, min(tensor_side, 35000))
+            gpu['primary_tensor_size'] = tensor_side
+            
+            # Calculate additional tensor sizes based on remaining target memory
+            remaining_bytes = target_memory_bytes * 0.4  # 40% for additional tensors
+            if gpu['num_additional_tensors'] > 0:
+                bytes_per_tensor = remaining_bytes / gpu['num_additional_tensors']
+                elements_per_tensor = bytes_per_tensor / 4
+                additional_side = int(math.sqrt(elements_per_tensor))
+                # Round to nearest 1000
+                additional_side = (additional_side // 1000) * 1000
+                # Ensure minimum size and maximum size - added maximum of 25000
+                additional_side = max(3000, min(additional_side, 25000))
+                gpu['additional_tensor_size'] = additional_side
+        
+        # THIRD PHASE: Allocate memory on each GPU according to the optimized plan
+        for gpu in gpu_stats:
+            if gpu.get('has_error', False):
+                warning_msg(f"Skipping GPU {gpu['index']} due to previous errors")
+                continue
+            
+            i = gpu['index']
+            device = torch.device(f"cuda:{i}")
+            
+            # Use the calculated tensor sizes for optimal allocation
+            tensor_size = gpu['primary_tensor_size']
+            info_msg(f"GPU {i} has {gpu['total_memory_gb']:.1f} GB total memory, {gpu['free_memory_gb']:.1f} GB free, allocating tensor of size {tensor_size}x{tensor_size} (~{tensor_size*tensor_size*4/1024/1024:.1f} MB)")
+            
+            dummy_tensor = None
+            additional_tensors = []
+            
+            try:
+                # Create primary tensor
+                dummy_tensor = torch.rand(tensor_size, tensor_size, device=device)
+                
+                # Create additional tensors if needed
+                num_additional = gpu['num_additional_tensors']
+                additional_size = gpu.get('additional_tensor_size', tensor_size // 2)
+                
+                if i != model_gpu_index:  # Skip extra tensors for model GPU
+                    for j in range(num_additional):
+                        info_msg(f"Creating additional tensor {j+1}/{num_additional} on GPU {i} (size: {additional_size}x{additional_size})")
+                        additional_tensors.append(torch.rand(additional_size, additional_size, device=device))
+                        # Force memory allocation through operations
+                        _ = torch.matmul(dummy_tensor[:additional_size, :additional_size], additional_tensors[j])
+                        
+                        # Delete tensor immediately if we're over 80% memory utilization
+                        mem_reserved = torch.cuda.memory_reserved(i) / (1024**3)
+                        if mem_reserved / gpu['total_memory_gb'] > 0.8:
+                            info_msg(f"Memory utilization over 80%, stopping additional tensor creation on GPU {i}")
+                            # Delete the most recent tensor
+                            del additional_tensors[-1]
+                            additional_tensors = additional_tensors[:-1]
+                            torch.cuda.empty_cache()
+                            break
+                else:
+                    # For model GPU, just create one smaller tensor
+                    secondary_size = min(additional_size, tensor_size // 2)
+                    dummy_tensor2 = torch.rand(secondary_size, secondary_size, device=device)
+                    _ = torch.matmul(dummy_tensor[:secondary_size, :secondary_size], dummy_tensor2)
+                    # Delete immediately after use
+                    del dummy_tensor2
+                    torch.cuda.empty_cache()
+            
+            except RuntimeError as e:
+                # If we run out of memory, try with a smaller tensor
+                error_msg(f"Failed to allocate {tensor_size}x{tensor_size} tensor on GPU {i}: {e}")
+                tensor_size = tensor_size // 2
+                info_msg(f"Retrying with tensor size {tensor_size}x{tensor_size}")
+                try:
+                    # Clean up previous attempt first
+                    if dummy_tensor is not None:
+                        del dummy_tensor
+                    for tensor in additional_tensors:
+                        del tensor
+                    additional_tensors = []
+                    torch.cuda.empty_cache()
+                    
+                    # Try with smaller tensor
+                    dummy_tensor = torch.rand(tensor_size, tensor_size, device=device)
+                    dummy_tensor2 = torch.rand(tensor_size // 2, tensor_size // 2, device=device)
+                    _ = torch.matmul(dummy_tensor[:tensor_size//2, :tensor_size//2], dummy_tensor2)
+                    del dummy_tensor2
+                except Exception as retry_e:
+                    error_msg(f"Even retry with smaller tensor failed on GPU {i}: {retry_e}")
+                    # Try one last time with a very small tensor
+                    try:
+                        # Clean up previous attempt first
+                        if dummy_tensor is not None:
+                            del dummy_tensor
+                        torch.cuda.empty_cache()
+                        
+                        info_msg(f"Final attempt with minimal tensor size on GPU {i}")
+                        dummy_tensor = torch.rand(1000, 1000, device=device)
+                        _ = torch.nn.functional.relu(dummy_tensor)
+                    except Exception as final_e:
+                        error_msg(f"Could not allocate even minimal tensor on GPU {i}: {final_e}")
+                    continue
+            
+            # Force sync on this specific GPU
+            torch.cuda.synchronize(device)
+            
+            # Log allocation
+            mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
+            mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
+            percent_used = (mem_reserved / (gpu['total_memory'] / 1024**2)) * 100
+            info_msg(f"GPU {i} activated with {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved ({percent_used:.1f}% of total)")
+            
+            # Free the tensors immediately after measuring memory usage
+            for tensor in additional_tensors:
+                del tensor
+            if dummy_tensor is not None:
+                del dummy_tensor
+                
+            # Free memory on model GPU or if we're using over 50% of memory
+            if i == model_gpu_index or percent_used > 50:
+                torch.cuda.empty_cache()
+                info_msg(f"Freed tensors on GPU {i}")
+        
+        # Final operations on model GPU to ensure layers are loaded
+        try:
+            device = torch.device(f"cuda:{model_gpu_index}")
+            large_tensor = torch.rand(3000, 3000, device=device)
+            _ = torch.nn.functional.relu(large_tensor)
+            
+            # Force sync to ensure GPU operations complete
+            torch.cuda.synchronize()
+            info_msg("Successfully completed GPU activation")
+            
+            # Delete the tensor after use
+            del large_tensor
+            torch.cuda.empty_cache()
+        except Exception as final_e:
+            error_msg(f"Error in final GPU operations: {str(final_e)}")
+        
+        # Final memory cleanup
+        # Force Python garbage collection first
+        import gc
+        gc.collect()
+        
+        # Final memory status report
+        info_msg("Final GPU memory status after activation:")
+        for i in range(torch.cuda.device_count()):
+            try:
+                mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
+                mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
+                total_memory = torch.cuda.get_device_properties(i).total_memory / (1024**2)
+                percent_used = (mem_reserved / total_memory) * 100
+                info_msg(f"  GPU {i}: {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved ({percent_used:.1f}% of total)")
+            except Exception as e:
+                pass
+        
+    except Exception as e:
+        error_msg(f"Failed to ensure GPU acceleration: {str(e)}")
+        # Print traceback for better debugging
+        import traceback
+        error_msg(f"Traceback: {traceback.format_exc()}")
+
+def release_gpu_memory():
+    """
+    Aggressively release GPU memory, including both allocated memory and reserved cache.
+    """
+    try:
+        # Only proceed if torch.cuda is available
+        if not HAS_TORCH or not torch.cuda.is_available():
+            return
+        
+        # Force Python garbage collection first
+        import gc
+        gc.collect()
+        
+        # Log current GPU status before cleaning
+        info_msg("GPU memory status before cleanup:")
+        for i in range(torch.cuda.device_count()):
+            try:
+                mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
+                mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
+                info_msg(f"  GPU {i}: {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved")
+            except:
+                pass
+        
+        # Empty CUDA cache to free memory
+        torch.cuda.empty_cache()
+        
+        # Try a more aggressive approach
+        for i in range(torch.cuda.device_count()):
+            try:
+                # Reset the current device to clear its cache
+                device = torch.device(f"cuda:{i}")
+                torch.cuda.set_device(device)
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats(i)
+            except Exception as e:
+                warning_msg(f"Error resetting GPU {i} memory: {str(e)}")
+        
+        # Try using nvidia-smi to release memory (system-level)
+        try:
+            import subprocess
+            # This doesn't actually release memory but can help diagnose
+            subprocess.run("nvidia-smi", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except:
+            pass
+            
+        # Log GPU status after cleanup
+        info_msg("GPU memory status after cleanup:")
+        for i in range(torch.cuda.device_count()):
+            try:
+                mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
+                mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
+                info_msg(f"  GPU {i}: {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved")
+            except:
+                pass
+                
+    except Exception as e:
+        warning_msg(f"Error during GPU memory release: {str(e)}")
+
+def log_gpu_status(phase: str) -> None:
+    """
+    Log current GPU memory allocation status.
+    
+    Args:
+        phase: Description of the current processing phase
+    """
+    try:
+        if not HAS_TORCH or not torch.cuda.is_available():
+            return
+            
+        gpu_count = torch.cuda.device_count()
+        if gpu_count == 0:
+            return
+            
+        logger.info(f"GPU status at phase: {phase}")
+        
+        for i in range(gpu_count):
+            mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
+            mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
+            util_percent = 0
+            
+            try:
+                # Try to get actual GPU utilization if available
+                if hasattr(torch.cuda, 'utilization'):
+                    util_percent = torch.cuda.utilization(i)
+            except:
+                pass
+                
+            logger.info(f"  GPU {i}: {mem_allocated:.1f}MB allocated, {mem_reserved:.1f}MB reserved, {util_percent}% utilization")
+            
+    except Exception as e:
+        warning_msg(f"Failed to log GPU status: {str(e)}")
+
+def start_gpu_monitoring() -> None:
+    """
+    Start monitoring GPU utilization.
+    This helps track GPU usage during various processing phases.
+    """
+    try:
+        # Only monitor if we have GPUs
+        if not HAS_TORCH or not torch.cuda.is_available():
+            return
+            
+        # Get number of GPUs
+        gpu_count = torch.cuda.device_count()
+        if gpu_count == 0:
+            return
+            
+        # Log initial GPU state
+        for i in range(gpu_count):
+            if torch.cuda.memory_allocated(i) > 0:
+                mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
+                mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
+                info_msg(f"GPU {i} memory state: {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved")
+                
+        # Force garbage collection to get accurate reading
+        import gc
+        gc.collect()
+        if hasattr(torch.cuda, 'empty_cache'):
+            torch.cuda.empty_cache()
+                
+    except Exception as e:
+        warning_msg(f"Failed to start GPU monitoring: {str(e)}") 
