@@ -591,7 +591,7 @@ install_dependencies() {
         
         # First ensure we have a compatible NumPy version (< 2.0)
         print_status "Installing compatible NumPy for FAISS..."
-        "$PYTHON_CMD" -m pip install "numpy<2.0.0" >/dev/null 2>&1 || {
+        "$PYTHON_CMD" -m pip install -q "numpy<2.0.0" --force-reinstall >/dev/null 2>&1 || {
             print_warning "Failed to install compatible NumPy version"
         }
         
@@ -614,19 +614,19 @@ install_dependencies() {
             # Install PyTorch with CUDA first if needed
             if ! "$PYTHON_CMD" -c "import torch" 2>/dev/null; then
                 print_status "Installing PyTorch with CUDA support first..."
-                "$PYTHON_CMD" -m pip install torch --index-url https://download.pytorch.org/whl/cu118 >/dev/null 2>&1 || {
+                "$PYTHON_CMD" -m pip install -q torch --index-url https://download.pytorch.org/whl/cu118 >/dev/null 2>&1 || {
                     print_warning "Failed to install PyTorch with CUDA. Will try FAISS-GPU directly."
                 }
             fi
             
-            # Install faiss-gpu
-            print_status "Installing FAISS with GPU support..."
-            "$PYTHON_CMD" -m pip install -q faiss-gpu >/dev/null 2>&1 || {
-                print_warning "Failed to install faiss-gpu, trying with specific CUDA version..."
-                # Try with specific pinned version
-                "$PYTHON_CMD" -m pip install -q "faiss-gpu>=1.7.0" >/dev/null 2>&1 || {
+            # Install faiss-gpu with exact version 1.7.2
+            print_status "Installing FAISS with GPU support (version 1.7.2)..."
+            "$PYTHON_CMD" -m pip install -q faiss-gpu==1.7.2 --force-reinstall >/dev/null 2>&1 || {
+                print_warning "Failed to install faiss-gpu version 1.7.2, trying alternative installation method..."
+                "$PYTHON_CMD" -m pip install -q faiss-gpu==1.7.2 --force-reinstall --no-deps >/dev/null 2>&1 || {
                     print_warning "Failed to install faiss-gpu. Falling back to CPU version."
-                    "$PYTHON_CMD" -m pip install -q faiss-cpu >/dev/null 2>&1 || {
+                    # Install specific version of faiss-cpu (1.10.0)
+                    "$PYTHON_CMD" -m pip install -q faiss-cpu==1.10.0 --force-reinstall >/dev/null 2>&1 || {
                         print_error "Failed to install FAISS. Vector search functionality will be limited."
                     }
                 }
@@ -634,37 +634,40 @@ install_dependencies() {
             
             # Verify GPU FAISS installation
             if "$PYTHON_CMD" -c "import faiss; print(hasattr(faiss, 'get_num_gpus') and faiss.get_num_gpus() > 0)" 2>/dev/null | grep -q "True"; then
-                print_success "Successfully installed FAISS with GPU support!"
-                DETECTED_GPUS=$("$PYTHON_CMD" -c "import faiss; print(faiss.get_num_gpus())" 2>/dev/null)
-                print_status "Detected $DETECTED_GPUS GPUs for FAISS acceleration"
-                mark_as_installed "faiss_gpu"
-            elif "$PYTHON_CMD" -c "import faiss" 2>/dev/null; then
-                print_warning "FAISS installed but GPU support not detected. Using CPU version."
-                mark_as_installed "faiss_cpu"
+                # Also verify IndexFlatL2 is present
+                if "$PYTHON_CMD" -c "import faiss; print(hasattr(faiss, 'IndexFlatL2'))" 2>/dev/null | grep -q "True"; then
+                    print_success "Successfully installed FAISS-GPU 1.7.2 with IndexFlatL2 support!"
+                    DETECTED_GPUS=$("$PYTHON_CMD" -c "import faiss; print(faiss.get_num_gpus())" 2>/dev/null)
+                    print_status "Detected $DETECTED_GPUS GPUs for FAISS acceleration"
+                    mark_as_installed "faiss_gpu"
+                else
+                    print_warning "FAISS-GPU installed but missing IndexFlatL2. Falling back to CPU version."
+                    "$PYTHON_CMD" -m pip install -q faiss-cpu==1.10.0 --force-reinstall >/dev/null 2>&1
+                    mark_as_installed "faiss_cpu"
+                }
             else
-                print_error "Failed to import FAISS after installation. Vector search will be limited."
+                print_warning "FAISS installed but GPU support not detected. Using CPU version."
+                "$PYTHON_CMD" -m pip install -q faiss-cpu==1.10.0 --force-reinstall >/dev/null 2>&1
+                mark_as_installed "faiss_cpu"
             fi
         else
-            # Now install faiss-cpu
-            print_status "Installing FAISS CPU version..."
-            "$PYTHON_CMD" -m pip install -q faiss-cpu >/dev/null 2>&1 || {
-                print_warning "Failed to install faiss-cpu, trying alternative method..."
-                # Try with specific pinned version
-                "$PYTHON_CMD" -m pip install -q "faiss-cpu==1.7.4" >/dev/null 2>&1 || {
-                    # Try with known-compatible versions
-                    "$PYTHON_CMD" -m pip install -q "numpy==1.24.3" >/dev/null 2>&1 && \
-                    "$PYTHON_CMD" -m pip install -q "faiss-cpu==1.7.4" >/dev/null 2>&1 || {
-                        print_error "Failed to install faiss-cpu. Vector search functionality will be limited."
-                    }
+            # Install CPU version with exact version 1.10.0
+            print_status "Installing FAISS CPU version 1.10.0..."
+            "$PYTHON_CMD" -m pip install -q faiss-cpu==1.10.0 --force-reinstall >/dev/null 2>&1 || {
+                print_warning "Failed to install faiss-cpu 1.10.0, trying alternative method..."
+                # Try without dependencies first
+                "$PYTHON_CMD" -m pip install -q faiss-cpu==1.10.0 --force-reinstall --no-deps >/dev/null 2>&1 && \
+                "$PYTHON_CMD" -m pip install -q "numpy<2.0.0" >/dev/null 2>&1 || {
+                    print_error "Failed to install faiss-cpu. Vector search functionality will be limited."
                 }
             }
             
             # Verify faiss installation
-            if "$PYTHON_CMD" -c "import faiss" 2>/dev/null; then
-                print_success "Successfully installed FAISS CPU version"
+            if "$PYTHON_CMD" -c "import faiss; print(hasattr(faiss, 'IndexFlatL2'))" 2>/dev/null | grep -q "True"; then
+                print_success "Successfully installed FAISS-CPU 1.10.0 with IndexFlatL2 support"
                 mark_as_installed "faiss_cpu"
             else
-                print_error "Failed to import FAISS after installation. Vector search will be limited."
+                print_error "FAISS installed but missing IndexFlatL2 attribute. Vector search will be limited."
             fi
         fi
     else

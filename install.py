@@ -411,69 +411,44 @@ def install_faiss():
             print_status("Installing PyTorch with CUDA support first...")
             run_command(f"{PYTHON_CMD} -m pip install torch --index-url https://download.pytorch.org/whl/cu118")
         
-        # Install faiss-gpu with appropriate version
-        print_status("Installing FAISS with GPU support...")
+        # Install faiss-gpu with specific version 1.7.2
+        print_status("Installing FAISS with GPU support (version 1.7.2)...")
         
-        # Try multiple install strategies in order of preference
-        strategies = [
-            f"{PYTHON_CMD} -m pip install -q faiss-gpu --no-deps",
-            f"{PYTHON_CMD} -m pip install -q 'faiss-gpu>=1.10.0' --no-deps",
-            f"{PYTHON_CMD} -m pip install -q faiss-gpu",
-            f"{PYTHON_CMD} -m pip install -q 'faiss-gpu==1.10.0'"
-        ]
-        
-        success = False
-        for strategy in strategies:
-            print_status(f"Trying FAISS install: {strategy}")
-            success, _ = run_command(strategy)
-            if success:
-                # Verify FAISS has expected attributes
-                try:
-                    import faiss
-                    if hasattr(faiss, 'IndexFlatL2'):
-                        print_success("FAISS GPU installation successful and verified!")
-                        break
-                    else:
-                        print_warning("FAISS installed but missing IndexFlatL2. Trying another method...")
-                        success = False
-                except:
-                    success = False
-        
-        if not success:
-            print_warning("All GPU installation methods failed. Falling back to CPU version.")
-            cuda_available = False
-    
-    if mps_available and not cuda_available:
-        print_status("Installing FAISS for Apple Silicon...")
-        success, _ = run_command(f"{PYTHON_CMD} -m pip install -q faiss-cpu")
-        
-        # Set environment variable for MPS
-        with open(".env", "a") as f:
-            f.write("USE_MPS=1\n")
-        
-        if success:
-            try:
-                import faiss
-                if hasattr(faiss, 'IndexFlatL2'):
-                    print_success("FAISS CPU installation successful for Apple Silicon!")
-                else:
-                    print_warning("FAISS installed but missing IndexFlatL2. May not work correctly.")
-            except:
-                print_error("FAISS installation verification failed.")
-    
-    if not cuda_available and not mps_available:
-        # Install CPU version
-        print_status("Installing FAISS CPU version...")
-        success, _ = run_command(f"{PYTHON_CMD} -m pip install -q faiss-cpu --no-deps")
+        # Try installation with --no-deps first to avoid dependency issues
+        success, _ = run_command(f"{PYTHON_CMD} -m pip install -q faiss-gpu==1.7.2 --no-deps")
         if not success:
             print_status("Trying alternative installation method...")
-            run_command(f"{PYTHON_CMD} -m pip install -q faiss-cpu")
+            success, _ = run_command(f"{PYTHON_CMD} -m pip install -q faiss-gpu==1.7.2")
+        
+        # Verify FAISS has expected attributes
+        try:
+            import faiss
+            if hasattr(faiss, 'IndexFlatL2'):
+                print_success("FAISS GPU installation successful and verified!")
+            else:
+                print_warning("FAISS installed but missing IndexFlatL2. Falling back to CPU version.")
+                cuda_available = False
+        except ImportError:
+            print_warning("Failed to import FAISS-GPU. Falling back to CPU version.")
+            cuda_available = False
     
-    # Verify FAISS installation
+    if not cuda_available or not hasattr(faiss, 'IndexFlatL2'):
+        # Install CPU version at specific version 1.10.0
+        print_status("Installing FAISS CPU version 1.10.0...")
+        success, _ = run_command(f"{PYTHON_CMD} -m pip install -q faiss-cpu==1.10.0 --force-reinstall")
+        if not success:
+            print_status("Trying alternative installation method...")
+            run_command(f"{PYTHON_CMD} -m pip install -q faiss-cpu==1.10.0 --force-reinstall --no-deps")
+            run_command(f"{PYTHON_CMD} -m pip install 'numpy<2.0.0'")  # Ensure numpy is installed
+            
+    # Final verification
     try:
         import faiss
         if hasattr(faiss, 'IndexFlatL2'):
-            print_success("FAISS installation verified successfully!")
+            if cuda_available:
+                print_success("FAISS-GPU 1.7.2 installation verified successfully!")
+            else:
+                print_success("FAISS-CPU 1.10.0 installation verified successfully!")
             
             # Set up FAISS multi-GPU support if available
             if multi_gpu:
@@ -486,6 +461,11 @@ def install_faiss():
             return True
         else:
             print_error("FAISS installation is incomplete (missing IndexFlatL2)")
+            print_status("Attempting one more installation with exact version...")
+            if cuda_available:
+                run_command(f"{PYTHON_CMD} -m pip install -q faiss-gpu==1.7.2 --force-reinstall")
+            else:
+                run_command(f"{PYTHON_CMD} -m pip install -q faiss-cpu==1.10.0 --force-reinstall")
             return False
     except ImportError as e:
         print_error(f"FAISS installation failed: {str(e)}")
