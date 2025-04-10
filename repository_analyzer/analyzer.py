@@ -368,40 +368,49 @@ class RepositoryAnalyzer:
     
     def _parse_file(self, file_path: str) -> Optional[Dict[str, Any]]:
         """
-        Parse a file using tree-sitter and extract relevant information.
+        Parse a file using tree-sitter to extract abstract syntax tree information.
         
         Args:
             file_path: Path to the file to parse
             
         Returns:
-            Dictionary containing parsed information or None if parsing fails
+            Dictionary containing AST information or None if parsing failed
         """
         try:
+            # Skip if file doesn't exist
+            if not os.path.exists(file_path):
+                logger.debug(f"File does not exist: {file_path}")
+                return None
+            
+            # Get language based on file extension
             language = self._get_language(file_path)
             if not language:
                 return None
             
-            # Read file with explicit resource management
+            # Read file content
             content = None
             try:
                 with open(file_path, 'rb') as f:
-                    content = f.read()
-                    
-                self.parser.set_language(language)
-                tree = self.parser.parse(content)
-                
-                # Extract information and return result
-                result = self._extract_ast_info(tree.root_node, content)
-                
-                # Explicitly delete large objects to help garbage collection
-                del tree
-                content = None
-                
-                return result
-            except (IOError, OSError) as e:
-                self._safe_exception_handler("_parse_file:file_io", e, "warning")
+                    content_bytes = f.read()
+                    content = self._safe_decode(content_bytes)
+            except (FileNotFoundError, IOError, PermissionError) as read_error:
+                warning_msg(f"Cannot access file {file_path}: {str(read_error)}")
+                return None
+            except Exception as read_error:
+                warning_msg(f"Error reading {file_path}: {str(read_error)}")
                 return None
                 
+            self.parser.set_language(language)
+            tree = self.parser.parse(content)
+            
+            # Extract information and return result
+            result = self._extract_ast_info(tree.root_node, content)
+            
+            # Explicitly delete large objects to help garbage collection
+            del tree
+            content = None
+            
+            return result
         except Exception as e:
             self._safe_exception_handler("_parse_file", e, "warning")
             return None
@@ -1048,9 +1057,18 @@ class RepositoryAnalyzer:
                         # Read file content
                         content = ""
                         try:
+                            if not os.path.exists(file_path):
+                                warning_msg(f"File does not exist: {file_path}")
+                                pbar.update(1)
+                                continue
+                                
                             with open(file_path, 'rb') as f:
                                 content_bytes = f.read()
                                 content = self._safe_decode(content_bytes)
+                        except (FileNotFoundError, IOError, PermissionError) as read_error:
+                            warning_msg(f"Cannot access file {file_path}: {str(read_error)}")
+                            pbar.update(1)
+                            continue
                         except Exception as read_error:
                             warning_msg(f"Error reading {file_path}: {str(read_error)}")
                             pbar.update(1)
@@ -1506,17 +1524,101 @@ class RepositoryAnalyzer:
                 
                 # Skip binary files and files that are too large
                 try:
+                    # First check if the file exists to avoid unnecessary errors
+                    if not os.path.exists(file_path):
+                        continue
+                        
                     if os.path.getsize(file_path) > self.max_file_size:
                         continue
                         
                     # Try to read the first few bytes to check if it's a text file
-                    with open(file_path, 'rb') as f:
-                        content = f.read(min(1024, os.path.getsize(file_path)))
-                        if b'\0' in content:  # Binary file check
-                            continue
+                    try:
+                        with open(file_path, 'rb') as f:
+                            # Check if file is readable
+                            content = f.read(min(1024, os.path.getsize(file_path)))
+                            if b'\0' in content:  # Binary file check
+                                continue
+                    except (IOError, PermissionError) as e:
+                        # Log access errors but continue processing other files
+                        logger.debug(f"Cannot read file {rel_path}: {str(e)}")
+                        continue
+                    except Exception as e:
+                        logger.debug(f"Error reading file {rel_path}: {str(e)}")
+                        continue
                             
                     all_files.append(rel_path)
                 except Exception as e:
-                    logger.warning(f"Error processing file {rel_path}: {str(e)}")
+                    logger.debug(f"Error processing file {rel_path}: {str(e)}")
                     
-        return all_files 
+        return all_files
+
+    def _analyze_architecture(self, architecture_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Analyze the architecture of the codebase.
+        
+        Args:
+            architecture_data: Dictionary containing architecture information
+            
+        Returns:
+            Dictionary with enhanced architecture information
+        """
+        try:
+            # Extract architecture data
+            file_types = architecture_data.get("file_types", {})
+            directory_structure = architecture_data.get("directory_structure", {})
+            entry_points = architecture_data.get("entry_points", [])
+            
+            # Create base architecture object
+            architecture = {
+                "file_types": file_types,
+                "directory_structure": directory_structure,
+                "entry_points": entry_points,
+            }
+            
+            # Determine dominant language based on file types
+            dominant_language = None
+            max_count = 0
+            for ext, count in file_types.items():
+                if count > max_count:
+                    max_count = count
+                    dominant_language = self._get_language_name(ext)
+            
+            if dominant_language:
+                architecture["dominant_language"] = dominant_language
+            
+            # Identify key directories
+            key_directories = []
+            for dir_path, files in directory_structure.items():
+                # Skip empty directories or those with just one file
+                if len(files) <= 1:
+                    continue
+                    
+                # Check if directory contains entry points
+                contains_entry_point = any(file["is_entry_point"] for file in files)
+                
+                # Check for directories that might indicate architectural significance
+                significant_name = any(name in dir_path.lower() for name in [
+                    "src", "lib", "core", "api", "controller", "model", "view", "service",
+                    "util", "common", "main", "app", "module", "component"
+                ])
+                
+                if contains_entry_point or significant_name:
+                    key_directories.append({
+                        "path": dir_path,
+                        "file_count": len(files),
+                        "languages": list(set(file["language"] for file in files)),
+                        "contains_entry_point": contains_entry_point
+                    })
+            
+            architecture["key_directories"] = key_directories
+            
+            return architecture
+            
+        except Exception as e:
+            self._safe_exception_handler("analyze_architecture", e, severity="warning")
+            # Return minimal architecture data to prevent further errors
+            return {
+                "file_types": architecture_data.get("file_types", {}),
+                "directory_structure": architecture_data.get("directory_structure", {}),
+                "entry_points": architecture_data.get("entry_points", [])
+            } 
