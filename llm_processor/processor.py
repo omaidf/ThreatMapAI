@@ -385,27 +385,25 @@ class LLMProcessor:
                 # Create LlamaCpp instance with proper configuration
                 self.llm = LlamaCpp(
                     model_path=model_path,
+                    n_ctx=8192,                   # Large context window for code analysis
+                    n_batch=4096,                 # Increased batch size for throughput
+                    n_gpu_layers=-1,              # Offload all layers to GPUs
+                    n_threads=12,                 # CPU threads for I/O bound operations
+                    f16_kv=True,                  # Half-precision key/value cache
                     temperature=temperature,
                     max_tokens=max_tokens,
                     top_p=top_p,
-                    verbose=True,  # Disable streaming for now as it can cause issues
-                    streaming=False,  # Disable streaming for now as it can cause issues
-                    seed=42,  # Set a fixed seed for reproducibility
-                    use_mlock=True,  # Use mlock to keep the model in memory
+                    verbose=True,
+                    streaming=False,
+                    seed=42,                      # Set a fixed seed for reproducibility
+                    use_mlock=True,               # Use mlock to keep the model in memory
                     model_kwargs={
-                        "n_gpu_layers": -1,              # Offload all layers to GPUs
                         "gpu_memory_limit": 150000,      # Total VRAM across all GPUs (150GB = 3x50GB)
                         "tensor_split": [16.6, 16.6, 16.6],  # Equal memory allocation per GPU (in GB)
                         "main_gpu": 0,                   # Primary GPU for initial processing
                         
                         # Performance Optimization
-                        "n_ctx": 8192,                   # Large context window for code analysis
-                        "n_batch": 4096,                 # Increased batch size for throughput
-                        "n_threads": 12,                 # CPU threads for I/O bound operations
                         "offload_kqv": True,             # Offload attention matrices
-                        
-                        # Quantization/Precision
-                        "f16_kv": True,                  # Half-precision key/value cache
                         
                         # Multi-GPU Specific
                         "mul_mat_q": True,               # Optimize matrix multiplication
