@@ -2716,6 +2716,10 @@ Pay special attention to:
     def _parse_threats(self, text: str) -> List[Threat]:
         """Parse threats from the LLM response."""
         try:
+            if not text or not isinstance(text, str):
+                logger.warning(f"Invalid input to _parse_threats: {type(text)}")
+                return []
+                
             threats = []
             current_threat = {}
             
@@ -2756,8 +2760,16 @@ Pay special attention to:
                 except Exception as e:
                     logger.warning(f"Failed to create threat from {current_threat}: {str(e)}")
             
+            # Validate severity levels
+            for threat in threats:
+                if threat.severity.lower() not in ["low", "medium", "high"]:
+                    # Default to Medium if invalid severity
+                    logger.warning(f"Invalid severity '{threat.severity}' for threat type '{threat.type}', defaulting to 'Medium'")
+                    threat.severity = "Medium"
+            
             return threats
             
         except Exception as e:
-            logger.warning(f"Failed to parse threats: {str(e)}")
+            logger.error(f"Failed to parse threats: {str(e)}\nStacktrace: {traceback.format_exc()}")
+            # Return an empty list rather than raising exception to allow processing to continue
             return []

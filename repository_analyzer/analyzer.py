@@ -368,51 +368,63 @@ class RepositoryAnalyzer:
     
     def _parse_file(self, file_path: str) -> Optional[Dict[str, Any]]:
         """
-        Parse a file using tree-sitter to extract abstract syntax tree information.
+        Parse a file for AST and extract information.
         
         Args:
             file_path: Path to the file to parse
             
         Returns:
-            Dictionary containing AST information or None if parsing failed
+            Dictionary with parsed information or None if parsing failed
         """
         try:
-            # Skip if file doesn't exist
-            if not os.path.exists(file_path):
-                logger.debug(f"File does not exist: {file_path}")
-                return None
-            
-            # Get language based on file extension
-            language = self._get_language(file_path)
-            if not language:
-                return None
-            
-            # Read file content
-            content = None
-            try:
-                with open(file_path, 'rb') as f:
-                    content_bytes = f.read()
-                    content = self._safe_decode(content_bytes)
-            except (FileNotFoundError, IOError, PermissionError) as read_error:
-                warning_msg(f"Cannot access file {file_path}: {str(read_error)}")
-                return None
-            except Exception as read_error:
-                warning_msg(f"Error reading {file_path}: {str(read_error)}")
+            # Ensure file_path is absolute and relative paths are properly converted
+            if not os.path.isabs(file_path):
+                full_path = os.path.join(self.repo_path, file_path)
+            else:
+                full_path = file_path
+                
+            # Check if file exists
+            if not os.path.isfile(full_path):
+                logger.warning(f"File does not exist: {full_path}")
                 return None
                 
-            self.parser.set_language(language)
-            tree = self.parser.parse(content)
-            
-            # Extract information and return result
-            result = self._extract_ast_info(tree.root_node, content)
-            
-            # Explicitly delete large objects to help garbage collection
-            del tree
-            content = None
-            
-            return result
+            # Get file language
+            language = self._get_language(full_path)
+            if not language:
+                logger.debug(f"Unsupported language for file: {full_path}")
+                return None
+                
+            # Read file content
+            try:
+                with open(full_path, 'rb') as f:
+                    content = f.read()
+            except (IOError, PermissionError) as e:
+                logger.warning(f"Cannot read file {full_path}: {str(e)}")
+                return None
+                
+            # Parse AST
+            try:
+                tree = language.parse(content)
+                root_node = tree.root_node
+                
+                # Extract AST information
+                ast_info = self._extract_ast_info(root_node, content)
+                
+                # Add file name
+                ast_info["name"] = os.path.basename(full_path)
+                
+                # Add entry point information
+                file_ext = os.path.splitext(full_path)[1]
+                content_str = self._safe_decode(content)
+                ast_info["is_entry_point"] = self._detect_entry_point(full_path, content_str, file_ext)
+                
+                return ast_info
+            except Exception as e:
+                logger.warning(f"Failed to parse AST for {full_path}: {str(e)}")
+                return None
+                
         except Exception as e:
-            self._safe_exception_handler("_parse_file", e, "warning")
+            self._safe_exception_handler("_parse_file", e)
             return None
     
     def _extract_ast_info(self, node: tree_sitter.Node, content: bytes) -> Dict[str, Any]:
@@ -984,14 +996,14 @@ class RepositoryAnalyzer:
             ]
             
             # Get all code files using a generator to avoid loading all files in memory at once
-            all_files = self._get_all_files(str(self.repo_path), ignore_patterns)
+            files_to_analyze = self._get_all_files(str(self.repo_path), ignore_patterns)
             
             # Count total files for progress tracking
             file_count = sum(1 for f in self._get_all_files(str(self.repo_path), ignore_patterns))
             info_msg(f"Found {file_count} files to analyze")
             
             # Reinitialize all_files generator
-            all_files = self._get_all_files(str(self.repo_path), ignore_patterns)
+            files_to_analyze = self._get_all_files(str(self.repo_path), ignore_patterns)
             
             # Skip empty repositories
             if file_count == 0:
@@ -1033,123 +1045,94 @@ class RepositoryAnalyzer:
             batch_count = (file_count + batch_size - 1) // batch_size
             info_msg(f"Processing in {batch_count} batches of up to {batch_size} files each")
             
-            # Process files in batches
-            current_batch = []
-            current_batch_size = 0
+            # Process each batch of files
             with tqdm(total=file_count, desc="Analyzing code files") as pbar:
-                for file_path in all_files:
-                    try:
-                        # Skip very large files
-                        file_size = os.path.getsize(file_path)
-                        if file_size > self.max_file_size:
-                            warning_msg(f"Skipping very large file {file_path} ({file_size/(1024*1024):.1f} MB)")
-                            pbar.update(1)
-                            continue
-                        
-                        # Only process files with supported extensions
-                        ext = Path(file_path).suffix.lower()
-                        language = self._get_language_name(ext)
-                        if not language:
-                            # Skip unsupported file types silently
-                            pbar.update(1)
-                            continue
-                            
-                        # Read file content
-                        content = ""
+                for i in range(0, len(files_to_analyze), batch_size):
+                    batch_files = files_to_analyze[i:i+batch_size]
+                    current_batch = []
+                    
+                    # Process each file in the batch
+                    for file_path in batch_files:
                         try:
-                            if not os.path.exists(file_path):
-                                warning_msg(f"File does not exist: {file_path}")
+                            # Convert to absolute path if necessary
+                            if not os.path.isabs(file_path):
+                                abs_file_path = os.path.join(self.repo_path, file_path)
+                            else:
+                                abs_file_path = file_path
+                                
+                            # Verify the file exists before processing
+                            if not os.path.isfile(abs_file_path):
+                                logger.warning(f"File does not exist: {abs_file_path}")
                                 pbar.update(1)
                                 continue
                                 
-                            with open(file_path, 'rb') as f:
-                                content_bytes = f.read()
-                                content = self._safe_decode(content_bytes)
-                        except (FileNotFoundError, IOError, PermissionError) as read_error:
-                            warning_msg(f"Cannot access file {file_path}: {str(read_error)}")
-                            pbar.update(1)
-                            continue
-                        except Exception as read_error:
-                            warning_msg(f"Error reading {file_path}: {str(read_error)}")
-                            pbar.update(1)
-                            continue
-                        
-                        # Skip empty files or those that couldn't be decoded
-                        if not content:
-                            pbar.update(1)
-                            continue
-                        
-                        # Check if this is an entry point (main file)
-                        is_entry_point = self._detect_entry_point(file_path, content, ext)
-                        if is_entry_point:
-                            entry_points.append(file_path)
-                        
-                        # Parse AST
-                        file_info = self._parse_file(file_path)
-                        
-                        # Process only if parsing succeeded
-                        if file_info:
-                            # Create component object
-                            component = {
-                                "path": file_path,
-                                "name": os.path.basename(file_path),
-                                "type": language,
-                                "classes": file_info.get("classes", []),
-                                "functions": file_info.get("functions", []),
-                                "imports": file_info.get("imports", []),
-                                "dependencies": file_info.get("dependencies", []),
-                                "metadata": {
-                                    "is_entry_point": is_entry_point
-                                }
-                            }
-                            
-                            current_batch.append((component, file_info, content))
-                            current_batch_size += 1
-                            
-                            # Add to directory structure for architecture analysis
-                            rel_path = os.path.relpath(file_path, str(self.repo_path))
-                            dir_path = os.path.dirname(rel_path)
-                            if dir_path not in directory_structure:
-                                directory_structure[dir_path] = []
-                            directory_structure[dir_path].append({
-                                "file": os.path.basename(file_path),
-                                "language": language,
-                                "is_entry_point": is_entry_point
-                            })
-                            
-                            # Check if we've reached batch size or it's the last file
-                            if current_batch_size >= batch_size:
-                                # Process batch and add to embedding store
-                                self._process_file_batch(current_batch, components, data_flows, file_relationships)
-                                current_batch = []
-                                current_batch_size = 0
+                            # Read file content - needed for embedding and entry point detection
+                            content = None
+                            try:
+                                with open(abs_file_path, 'rb') as f:
+                                    file_bytes = f.read()
+                                    content = self._safe_decode(file_bytes)
+                            except Exception as file_error:
+                                logger.warning(f"Error reading file {abs_file_path}: {str(file_error)}")
+                                pbar.update(1)
+                                continue
                                 
-                                # Release GPU memory after each batch
-                                if self.embedding_store and hasattr(self.embedding_store, 'device') and self.embedding_store.device == 'cuda':
-                                    import torch
-                                    import gc
-                                    gc.collect()
-                                    torch.cuda.empty_cache()
+                            # Parse file AST
+                            file_info = self._parse_file(abs_file_path)
+                            if file_info:
+                                # Create component from file info
+                                component = {
+                                    "name": os.path.basename(file_path),
+                                    "path": file_path,  # Keep relative path for output
+                                    "type": self._get_language_name(os.path.splitext(file_path)[1]),
+                                    "classes": file_info.get("classes", []),
+                                    "functions": file_info.get("functions", []),
+                                    "imports": file_info.get("imports", []),
+                                    "dependencies": file_info.get("dependencies", []),
+                                    "metadata": {
+                                        "is_entry_point": file_info.get("is_entry_point", False),
+                                        "is_critical": False  # Will be updated later
+                                    }
+                                }
+                                
+                                current_batch.append((component, file_info, content))
+                                
+                                # Store entry points
+                                if file_info.get("is_entry_point", False):
+                                    entry_points.append(file_path)
+                                    
+                                # Add to directory structure for architecture analysis
+                                rel_path = os.path.relpath(file_path, str(self.repo_path))
+                                dir_path = os.path.dirname(rel_path)
+                                if dir_path not in directory_structure:
+                                    directory_structure[dir_path] = []
+                                directory_structure[dir_path].append({
+                                    "file": os.path.basename(file_path),
+                                    "language": component["type"],
+                                    "is_entry_point": file_info.get("is_entry_point", False)
+                                })
+                                
+                            # Update progress bar
+                            pbar.update(1)
+                                
+                        except Exception as e:
+                            self._safe_exception_handler("analyze_file", e, severity="warning")
+                            pbar.update(1)
+                            continue
                     
-                        # Update progress bar
-                        pbar.update(1)
-                        
-                    except Exception as e:
-                        self._safe_exception_handler("analyze_file", e, severity="warning")
-                        pbar.update(1)
-                        continue
+                    # Process the batch
+                    self._process_file_batch(current_batch, components, data_flows, file_relationships)
+                    
+                    # Memory cleanup for GPU accelerated code
+                    if self.embedding_store and hasattr(self.embedding_store, 'device') and self.embedding_store.device == 'cuda':
+                        try:
+                            import torch
+                            import gc
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                        except:
+                            pass
             
-            # Process final batch if any
-            if current_batch:
-                self._process_file_batch(current_batch, components, data_flows, file_relationships)
-                
-                # Final memory cleanup
-                if self.embedding_store and hasattr(self.embedding_store, 'device') and self.embedding_store.device == 'cuda':
-                    import torch
-                    import gc
-                    gc.collect()
-                    torch.cuda.empty_cache()
-        
             # Add enhanced architecture information
             architecture = self._analyze_architecture({
                 "file_types": file_types,
@@ -1506,7 +1489,13 @@ class RepositoryAnalyzer:
                 
         all_files = []
         
-        for root, dirs, files in os.walk(repo_path):
+        # Ensure repo_path is an absolute path
+        abs_repo_path = os.path.abspath(repo_path)
+        if not os.path.exists(abs_repo_path):
+            logger.warning(f"Repository path does not exist: {abs_repo_path}")
+            return all_files
+            
+        for root, dirs, files in os.walk(abs_repo_path):
             # Skip ignored directories
             dirs[:] = [d for d in dirs if not any(fnmatch.fnmatch(d, pattern) for pattern in ignore_patterns)]
             
@@ -1516,7 +1505,15 @@ class RepositoryAnalyzer:
                     continue
                     
                 file_path = os.path.join(root, file)
-                rel_path = os.path.relpath(file_path, repo_path)
+                # Convert to absolute path if not already
+                if not os.path.isabs(file_path):
+                    file_path = os.path.abspath(file_path)
+                
+                # Check if file exists
+                if not os.path.isfile(file_path):
+                    continue
+                    
+                rel_path = os.path.relpath(file_path, abs_repo_path)
                 
                 # Filter out test files
                 if 'test' in rel_path.lower():
@@ -1524,31 +1521,25 @@ class RepositoryAnalyzer:
                 
                 # Skip binary files and files that are too large
                 try:
-                    # First check if the file exists to avoid unnecessary errors
-                    if not os.path.exists(file_path):
+                    if os.path.getsize(file_path) > 10 * 1024 * 1024:  # 10 MB
+                        logger.info(f"Skipping large file: {rel_path} ({os.path.getsize(file_path) / 1024 / 1024:.2f} MB)")
                         continue
                         
-                    if os.path.getsize(file_path) > self.max_file_size:
-                        continue
-                        
-                    # Try to read the first few bytes to check if it's a text file
+                    # Check if file is binary
+                    is_binary = False
                     try:
-                        with open(file_path, 'rb') as f:
-                            # Check if file is readable
-                            content = f.read(min(1024, os.path.getsize(file_path)))
-                            if b'\0' in content:  # Binary file check
-                                continue
-                    except (IOError, PermissionError) as e:
-                        # Log access errors but continue processing other files
-                        logger.debug(f"Cannot read file {rel_path}: {str(e)}")
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            f.read(1024)  # Try to read as text
+                    except UnicodeDecodeError:
+                        is_binary = True
+                    
+                    if is_binary:
                         continue
-                    except Exception as e:
-                        logger.debug(f"Error reading file {rel_path}: {str(e)}")
-                        continue
-                            
+                        
                     all_files.append(rel_path)
-                except Exception as e:
-                    logger.debug(f"Error processing file {rel_path}: {str(e)}")
+                except (IOError, OSError) as e:
+                    logger.warning(f"Error checking file {rel_path}: {str(e)}")
+                    continue
                     
         return all_files
 
