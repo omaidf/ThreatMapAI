@@ -625,10 +625,8 @@ install_dependencies() {
                 print_warning "Failed to install faiss-gpu version 1.7.2, trying alternative installation method..."
                 "$PYTHON_CMD" -m pip install -q faiss-gpu==1.7.2 --force-reinstall --no-deps >/dev/null 2>&1 || {
                     print_warning "Failed to install faiss-gpu. Falling back to CPU version."
-                    # Install specific version of faiss-cpu (1.10.0)
-                    "$PYTHON_CMD" -m pip install -q faiss-cpu==1.10.0 --force-reinstall >/dev/null 2>&1 || {
-                        print_error "Failed to install FAISS. Vector search functionality will be limited."
-                    }
+                    "$PYTHON_CMD" -m pip install -q faiss-cpu==1.10.0 --force-reinstall >/dev/null 2>&1
+                    mark_as_installed "faiss_cpu"
                 }
             }
             
@@ -644,7 +642,7 @@ install_dependencies() {
                     print_warning "FAISS-GPU installed but missing IndexFlatL2. Falling back to CPU version."
                     "$PYTHON_CMD" -m pip install -q faiss-cpu==1.10.0 --force-reinstall >/dev/null 2>&1
                     mark_as_installed "faiss_cpu"
-                }
+                fi
             else
                 print_warning "FAISS installed but GPU support not detected. Using CPU version."
                 "$PYTHON_CMD" -m pip install -q faiss-cpu==1.10.0 --force-reinstall >/dev/null 2>&1
@@ -907,3 +905,5 @@ print_status "You can create a simple alias in your shell config (~/.bashrc or ~
 print_status "  alias aithreatmap='cd $(pwd) && source $VENV_NAME/bin/activate && python -m cli'"
 print_status ""
 print_status "Then use it like: aithreatmap analyze <repository_url>" 
+
+# End of script 
