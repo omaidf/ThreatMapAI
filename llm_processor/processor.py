@@ -1485,7 +1485,12 @@ Pay special attention to:
             Dictionary with architecture information
         """
         try:
-            # Ensure we're utilizing GPU for text embedding if available
+            # Log initial GPU status explicitly
+            logger.info("Starting architecture exploration - GPU status:")
+            self._log_gpu_status("Starting architecture exploration")
+            
+            # Explicitly activate GPUs and log status
+            info_msg("Explicitly ensuring GPU acceleration for architecture analysis")
             self._ensure_gpu_acceleration()
             
             # Filter out test files from file list
@@ -2644,105 +2649,131 @@ Pay special attention to:
         try:
             # Only proceed if we have GPU capabilities
             if not hasattr(torch, 'cuda') or not torch.cuda.is_available():
+                info_msg("No CUDA capabilities detected - running on CPU only")
                 return
                 
             # Get number of GPUs
             gpu_count = torch.cuda.device_count()
             if gpu_count == 0:
+                info_msg("No GPUs detected - running on CPU only")
                 return
                 
             # Log that we're activating GPUs for processing
             info_msg(f"Activating {gpu_count} GPUs for text embedding and processing")
             
+            # Log detailed GPU information first
+            for i in range(gpu_count):
+                try:
+                    device_name = torch.cuda.get_device_name(i)
+                    memory_gb = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+                    info_msg(f"Found GPU {i}: {device_name} with {memory_gb:.1f} GB memory")
+                except Exception as e:
+                    warning_msg(f"Error getting info for GPU {i}: {str(e)}")
+            
             # Create more substantial tensors on all available GPUs to ensure they're utilized
             for i in range(gpu_count):
-                device = torch.device(f"cuda:{i}")
-                # Get available memory for this GPU
-                total_memory = torch.cuda.get_device_properties(i).total_memory
-                memory_gb = total_memory / (1024**3)
-                
-                # Dynamically scale tensor size based on available memory
-                # Use approximately 40% of available memory for tensor allocation
-                # Each float32 element is 4 bytes, so calculate how many elements we can fit
-                memory_bytes_to_use = total_memory * 0.4  # 40% of memory for GPU 0, more for others
-                if i > 0:  # For secondary GPUs, we can use more memory
-                    memory_bytes_to_use = total_memory * 0.7  # 70% of memory
-                
-                # Calculate tensor size as sqrt of total elements (since we're creating square tensors)
-                # 4 bytes per float32 element
-                elements_possible = memory_bytes_to_use / 4
-                tensor_side = int(math.sqrt(elements_possible))
-                
-                # Round to nearest 1000 for cleaner reporting
-                tensor_size = (tensor_side // 1000) * 1000
-                # Ensure minimum size and avoid too large tensors that might cause issues
-                tensor_size = max(5000, min(tensor_size, 50000))
-                
-                info_msg(f"GPU {i} has {memory_gb:.1f} GB memory, allocating tensor of size {tensor_size}x{tensor_size} (~{tensor_size*tensor_size*4/1024/1024:.1f} MB)")
-                
                 try:
-                    # Create a random tensor
-                    dummy_tensor = torch.rand(tensor_size, tensor_size, device=device)
+                    device = torch.device(f"cuda:{i}")
+                    # Get available memory for this GPU
+                    total_memory = torch.cuda.get_device_properties(i).total_memory
+                    memory_gb = total_memory / (1024**3)
                     
-                    # For secondary GPUs, create additional tensors to utilize more memory
-                    if i > 0:  # Skip GPU 0 for model loading
-                        # Number of additional tensors scales with memory size
-                        num_additional = 1
-                        if memory_gb >= 40:
-                            num_additional = 2
-                        if memory_gb >= 80:
-                            num_additional = 3
-                            
-                        additional_tensors = []
-                        for j in range(num_additional):
-                            info_msg(f"Creating additional tensor {j+1}/{num_additional} on GPU {i}")
-                            additional_tensors.append(torch.rand(tensor_size, tensor_size, device=device))
-                            # Force memory allocation through operations
-                            _ = torch.matmul(dummy_tensor, additional_tensors[j])
-                    else:
-                        # For GPU 0, just one additional tensor with smaller size
-                        # GPU 0 needs more memory available for model loading
-                        secondary_size = tensor_size // 2
-                        dummy_tensor2 = torch.rand(secondary_size, secondary_size, device=device)
-                        _ = torch.matmul(dummy_tensor[:secondary_size, :secondary_size], dummy_tensor2)
-                
-                except RuntimeError as e:
-                    # If we run out of memory, try with a smaller tensor
-                    warning_msg(f"Failed to allocate {tensor_size}x{tensor_size} tensor on GPU {i}: {e}")
-                    tensor_size = tensor_size // 2
-                    info_msg(f"Retrying with tensor size {tensor_size}x{tensor_size}")
-                    dummy_tensor = torch.rand(tensor_size, tensor_size, device=device)
-                    dummy_tensor2 = torch.rand(tensor_size, tensor_size, device=device)
-                    _ = torch.matmul(dummy_tensor, dummy_tensor2)
-                
-                # Force sync on this specific GPU
-                torch.cuda.synchronize(device)
-                
-                # Log allocation
-                mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
-                mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
-                percent_used = (mem_reserved / (total_memory / 1024**2)) * 100
-                info_msg(f"GPU {i} activated with {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved ({percent_used:.1f}% of total)")
-                
-                # Free the tensors for the first GPU after activation to avoid huge memory usage
-                # when the actual model loads (which will be on GPU 0)
-                if i == 0:
-                    del dummy_tensor
-                    if 'dummy_tensor2' in locals():
-                        del dummy_tensor2
-                    torch.cuda.empty_cache()
-                    info_msg("Freed initial tensors on GPU 0 to prepare for model loading")
+                    # Dynamically scale tensor size based on available memory
+                    # Use approximately 40% of available memory for tensor allocation
+                    # Each float32 element is 4 bytes, so calculate how many elements we can fit
+                    memory_bytes_to_use = total_memory * 0.4  # 40% of memory for GPU 0, more for others
+                    if i > 0:  # For secondary GPUs, we can use more memory
+                        memory_bytes_to_use = total_memory * 0.7  # 70% of memory
+                    
+                    # Calculate tensor size as sqrt of total elements (since we're creating square tensors)
+                    # 4 bytes per float32 element
+                    elements_possible = memory_bytes_to_use / 4
+                    tensor_side = int(math.sqrt(elements_possible))
+                    
+                    # Round to nearest 1000 for cleaner reporting
+                    tensor_size = (tensor_side // 1000) * 1000
+                    # Ensure minimum size and avoid too large tensors that might cause issues
+                    tensor_size = max(5000, min(tensor_size, 50000))
+                    
+                    info_msg(f"GPU {i} has {memory_gb:.1f} GB memory, allocating tensor of size {tensor_size}x{tensor_size} (~{tensor_size*tensor_size*4/1024/1024:.1f} MB)")
+                    
+                    try:
+                        # Create a random tensor
+                        dummy_tensor = torch.rand(tensor_size, tensor_size, device=device)
+                        
+                        # For secondary GPUs, create additional tensors to utilize more memory
+                        if i > 0:  # Skip GPU 0 for model loading
+                            # Number of additional tensors scales with memory size
+                            num_additional = 1
+                            if memory_gb >= 40:
+                                num_additional = 2
+                            if memory_gb >= 80:
+                                num_additional = 3
+                                
+                            additional_tensors = []
+                            for j in range(num_additional):
+                                info_msg(f"Creating additional tensor {j+1}/{num_additional} on GPU {i}")
+                                additional_tensors.append(torch.rand(tensor_size, tensor_size, device=device))
+                                # Force memory allocation through operations
+                                _ = torch.matmul(dummy_tensor, additional_tensors[j])
+                        else:
+                            # For GPU 0, just one additional tensor with smaller size
+                            # GPU 0 needs more memory available for model loading
+                            secondary_size = tensor_size // 2
+                            dummy_tensor2 = torch.rand(secondary_size, secondary_size, device=device)
+                            _ = torch.matmul(dummy_tensor[:secondary_size, :secondary_size], dummy_tensor2)
+                    
+                    except RuntimeError as e:
+                        # If we run out of memory, try with a smaller tensor
+                        error_msg(f"Failed to allocate {tensor_size}x{tensor_size} tensor on GPU {i}: {e}")
+                        tensor_size = tensor_size // 2
+                        info_msg(f"Retrying with tensor size {tensor_size}x{tensor_size}")
+                        try:
+                            dummy_tensor = torch.rand(tensor_size, tensor_size, device=device)
+                            dummy_tensor2 = torch.rand(tensor_size, tensor_size, device=device)
+                            _ = torch.matmul(dummy_tensor, dummy_tensor2)
+                        except Exception as retry_e:
+                            error_msg(f"Even retry with smaller tensor failed on GPU {i}: {retry_e}")
+                            continue
+                    
+                    # Force sync on this specific GPU
+                    torch.cuda.synchronize(device)
+                    
+                    # Log allocation
+                    mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
+                    mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
+                    percent_used = (mem_reserved / (total_memory / 1024**2)) * 100
+                    info_msg(f"GPU {i} activated with {mem_allocated:.2f} MB allocated, {mem_reserved:.2f} MB reserved ({percent_used:.1f}% of total)")
+                    
+                    # Free the tensors for the first GPU after activation to avoid huge memory usage
+                    # when the actual model loads (which will be on GPU 0)
+                    if i == 0:
+                        del dummy_tensor
+                        if 'dummy_tensor2' in locals():
+                            del dummy_tensor2
+                        torch.cuda.empty_cache()
+                        info_msg("Freed initial tensors on GPU 0 to prepare for model loading")
+                        
+                except Exception as gpu_e:
+                    error_msg(f"Error processing GPU {i}: {str(gpu_e)}")
             
             # Additional operations on GPU 0 to ensure layers are loaded
-            device = torch.device("cuda:0")
-            large_tensor = torch.rand(5000, 5000, device=device)
-            _ = torch.nn.functional.relu(large_tensor)
-            
-            # Force sync to ensure GPU operations complete
-            torch.cuda.synchronize()
+            try:
+                device = torch.device("cuda:0")
+                large_tensor = torch.rand(5000, 5000, device=device)
+                _ = torch.nn.functional.relu(large_tensor)
+                
+                # Force sync to ensure GPU operations complete
+                torch.cuda.synchronize()
+                info_msg("Successfully completed GPU activation")
+            except Exception as final_e:
+                error_msg(f"Error in final GPU operations: {str(final_e)}")
             
         except Exception as e:
-            warning_msg(f"Failed to ensure GPU acceleration: {str(e)}")
+            error_msg(f"Failed to ensure GPU acceleration: {str(e)}")
+            # Print traceback for better debugging
+            import traceback
+            error_msg(f"Traceback: {traceback.format_exc()}")
     
     def _start_gpu_monitoring(self) -> None:
         """
